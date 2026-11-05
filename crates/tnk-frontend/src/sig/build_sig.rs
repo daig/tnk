@@ -153,7 +153,7 @@ pub fn canonical_name(name: &[Token], i: &Interner) -> String {
 /// The inner tokens if `toks` is wrapped in a single balanced `( … )` pair, else `toks` unchanged. The
 /// opening paren must match the *final* token (depth returns to 0 only at the end), so a name that merely
 /// starts and ends with parens — `(a) b (c)` — is left intact.
-fn strip_outer_parens<'a>(toks: &'a [Token], i: &Interner) -> &'a [Token] {
+pub(crate) fn strip_outer_parens<'a>(toks: &'a [Token], i: &Interner) -> &'a [Token] {
     if toks.len() < 2 || i.resolve(toks[0].sym) != "(" || i.resolve(toks[toks.len() - 1].sym) != ")"
     {
         return toks;

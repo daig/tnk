@@ -1558,6 +1558,7 @@ pub fn parse_statement_trace(
 }
 
 /// The connective of a condition fragment.
+#[derive(Clone, Copy)]
 enum Connective {
     /// `pattern := subject` (matching).
     Match,
@@ -1570,9 +1571,9 @@ enum Connective {
 }
 
 /// Parse a condition bubble (the tokens after `if`) into kernel [`ConditionFragment`]s: split on `/\` at
-/// paren-depth 0, then each fragment on its connective. Shares the statement's variable index; a `:=`
-/// fragment's *fresh* variables are the pattern variables not already bound (by the lhs or an earlier
-/// fragment), which the matcher binds.
+/// paren-depth 0, then read each fragment with [`parse_condition_fragment`]. Shares the statement's
+/// variable index; a `:=` fragment's *fresh* variables are the pattern variables not already bound (by
+/// the lhs or an earlier fragment), which the matcher binds.
 pub(crate) fn parse_condition(
     bubble: &[Token],
     g: &CompiledGrammar,
@@ -1583,67 +1584,166 @@ pub(crate) fn parse_condition(
 ) -> Result<Vec<ConditionFragment>, String> {
     let mut frags = Vec::new();
     for ftoks in split_on_text(bubble, "/\\", i) {
-        let Some((left, conn, right)) = split_connective(ftoks, i) else {
-            // A bare boolean fragment `b` abbreviates `b = true`. BOOL supplies the required true anchor.
-            let lhs = parse_build(ftoks, g, m, i, vars)?;
-            let true_sym = m
-                .true_sym
-                .ok_or("bare boolean condition, but no `true` is in scope (import BOOL)")?;
-            frags.push(ConditionFragment::Equality {
-                lhs,
-                rhs: Term::constant(true_sym),
-            });
-            continue;
-        };
-        let frag = match conn {
-            Connective::Match => {
-                let pattern = parse_build(left, g, m, i, vars)?;
-                let subject = parse_build(right, g, m, i, vars)?;
-                let mut pat_vars = Vec::new();
-                term_var_indices(&pattern, &mut pat_vars);
-                let fresh: Vec<u32> = pat_vars
-                    .iter()
-                    .copied()
-                    .filter(|v| !bound.contains(v))
-                    .collect();
-                bound.extend(pat_vars);
-                ConditionFragment::Matching {
-                    pattern,
-                    subject,
-                    fresh_vars: fresh,
-                }
-            }
-            Connective::Eq => ConditionFragment::Equality {
-                lhs: parse_build(left, g, m, i, vars)?,
-                rhs: parse_build(right, g, m, i, vars)?,
-            },
-            Connective::Rewrite => {
-                // `lhs => pattern`: build the left term using existing bindings, then build the target
-                // pattern, whose previously unbound variables become fresh binders for the search.
-                let lhs = parse_build(left, g, m, i, vars)?;
-                let pattern = parse_build(right, g, m, i, vars)?;
-                let mut pat_vars = Vec::new();
-                term_var_indices(&pattern, &mut pat_vars);
-                let fresh: Vec<u32> = pat_vars
-                    .iter()
-                    .copied()
-                    .filter(|v| !bound.contains(v))
-                    .collect();
-                bound.extend(pat_vars);
-                ConditionFragment::Rewrite {
-                    lhs,
-                    pattern,
-                    fresh_vars: fresh,
-                }
-            }
-            Connective::Sort => ConditionFragment::SortTest {
-                term: parse_build(left, g, m, i, vars)?,
-                sort: resolve_sort(right, m, i)?,
-            },
-        };
-        frags.push(frag);
+        frags.push(parse_condition_fragment(ftoks, g, m, i, vars, bound)?);
     }
     Ok(frags)
+}
+
+/// Read one condition fragment. Its connective is a paren-depth-0 `:=`, `=>`, `=`, or `:` token, but an
+/// operator name may contain the same text as a literal fragment (object syntax `< O : C | a : v >`, a
+/// user `<_:_>`), so the connective is chosen by which split builds:
+///
+/// - With no such token, the fragment is a bare Boolean `b`, read as `b = true`.
+/// - The first such token is tried first. When its split builds, it is the reading, so every fragment
+///   that the first-token rule accepted keeps its meaning.
+/// - Otherwise the candidate readings are the later connective tokens (a `:` only before a sort name)
+///   and the whole fragment as a term of `true`'s kind, read as `b = true`. Exactly one of them must
+///   build: with none, the first split's error stands, and several make the fragment ambiguous.
+///
+/// A parse that exceeds the effort limit decides nothing (`TNK-PARSE-003`), so its error ends the
+/// search. On success, `vars` and `bound` record only the chosen reading's variables.
+fn parse_condition_fragment(
+    ftoks: &[Token],
+    g: &CompiledGrammar,
+    m: &BuiltModule,
+    i: &Interner,
+    vars: &mut VarIndex,
+    bound: &mut BTreeSet<u32>,
+) -> Result<ConditionFragment, String> {
+    let candidates = connective_candidates(ftoks, i);
+    let Some((&(left, conn, right), later)) = candidates.split_first() else {
+        // A bare boolean fragment `b` abbreviates `b = true`. BOOL supplies the required true anchor.
+        let lhs = parse_build(ftoks, g, m, i, vars)?;
+        let true_sym = m
+            .true_sym
+            .ok_or("bare boolean condition, but no `true` is in scope (import BOOL)")?;
+        return Ok(ConditionFragment::Equality {
+            lhs,
+            rhs: Term::constant(true_sym),
+        });
+    };
+    let (vars_before, bound_before) = (vars.clone(), bound.clone());
+    let first_error = match build_condition_fragment(left, conn, right, g, m, i, vars, bound) {
+        Ok(fragment) => return Ok(fragment),
+        Err(error) if is_parse_effort_error(&error) => return Err(error),
+        Err(error) => error,
+    };
+    *vars = vars_before;
+    *bound = bound_before;
+
+    let mut readings = Vec::new();
+    for &(left, conn, right) in later {
+        if matches!(conn, Connective::Sort) && resolve_sort(right, m, i).is_err() {
+            continue; // this `:` is not followed by a sort name, so it belongs to a term
+        }
+        let (mut fragment_vars, mut fragment_bound) = (vars.clone(), bound.clone());
+        match build_condition_fragment(
+            left,
+            conn,
+            right,
+            g,
+            m,
+            i,
+            &mut fragment_vars,
+            &mut fragment_bound,
+        ) {
+            Ok(fragment) => readings.push((fragment, fragment_vars, fragment_bound)),
+            Err(error) if is_parse_effort_error(&error) => return Err(error),
+            Err(_) => {}
+        }
+    }
+    if let Some(true_sym) = m.true_sym {
+        let mut fragment_vars = vars.clone();
+        match parse_build(ftoks, g, m, i, &mut fragment_vars) {
+            Ok(lhs) if term_kind(&lhs, m) == Some(m.engine.symbol_kind(true_sym)) => {
+                let fragment = ConditionFragment::Equality {
+                    lhs,
+                    rhs: Term::constant(true_sym),
+                };
+                readings.push((fragment, fragment_vars, bound.clone()));
+            }
+            Err(error) if is_parse_effort_error(&error) => return Err(error),
+            _ => {}
+        }
+    }
+    match readings.len() {
+        0 => Err(first_error),
+        1 => {
+            let (fragment, fragment_vars, fragment_bound) =
+                readings.pop().expect("one condition fragment reading");
+            *vars = fragment_vars;
+            *bound = fragment_bound;
+            Ok(fragment)
+        }
+        _ => Err(format!(
+            "ambiguous condition fragment: `{}`",
+            ftoks
+                .iter()
+                .map(|t| i.resolve(t.sym))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )),
+    }
+}
+
+/// Build one condition fragment from the split at a connective token.
+#[allow(clippy::too_many_arguments)]
+fn build_condition_fragment(
+    left: &[Token],
+    conn: Connective,
+    right: &[Token],
+    g: &CompiledGrammar,
+    m: &BuiltModule,
+    i: &Interner,
+    vars: &mut VarIndex,
+    bound: &mut BTreeSet<u32>,
+) -> Result<ConditionFragment, String> {
+    Ok(match conn {
+        Connective::Match => {
+            let pattern = parse_build(left, g, m, i, vars)?;
+            let subject = parse_build(right, g, m, i, vars)?;
+            let mut pat_vars = Vec::new();
+            term_var_indices(&pattern, &mut pat_vars);
+            let fresh: Vec<u32> = pat_vars
+                .iter()
+                .copied()
+                .filter(|v| !bound.contains(v))
+                .collect();
+            bound.extend(pat_vars);
+            ConditionFragment::Matching {
+                pattern,
+                subject,
+                fresh_vars: fresh,
+            }
+        }
+        Connective::Eq => ConditionFragment::Equality {
+            lhs: parse_build(left, g, m, i, vars)?,
+            rhs: parse_build(right, g, m, i, vars)?,
+        },
+        Connective::Rewrite => {
+            // `lhs => pattern`: build the left term using existing bindings, then build the target
+            // pattern, whose previously unbound variables become fresh binders for the search.
+            let lhs = parse_build(left, g, m, i, vars)?;
+            let pattern = parse_build(right, g, m, i, vars)?;
+            let mut pat_vars = Vec::new();
+            term_var_indices(&pattern, &mut pat_vars);
+            let fresh: Vec<u32> = pat_vars
+                .iter()
+                .copied()
+                .filter(|v| !bound.contains(v))
+                .collect();
+            bound.extend(pat_vars);
+            ConditionFragment::Rewrite {
+                lhs,
+                pattern,
+                fresh_vars: fresh,
+            }
+        }
+        Connective::Sort => ConditionFragment::SortTest {
+            term: parse_build(left, g, m, i, vars)?,
+            sort: resolve_sort(right, m, i)?,
+        },
+    })
 }
 
 /// Split `toks` on the `sep`-text token at paren-depth 0 (e.g. `/\`). Always yields ≥ 1 part.
@@ -1665,12 +1765,13 @@ fn split_on_text<'a>(toks: &'a [Token], sep: &str, i: &Interner) -> Vec<&'a [Tok
     parts
 }
 
-/// Split a top-level condition connective (`:=`, `=`, `:`, or `=>`). A fragment with no connective is
-/// a bare boolean condition and is desugared to `b = true`.
-fn split_connective<'a>(
+/// Every split of a condition fragment at a paren-depth-0 connective token (`:=`, `=`, `:`, or `=>`), in
+/// source order. A fragment with none is a bare boolean condition and is desugared to `b = true`.
+fn connective_candidates<'a>(
     toks: &'a [Token],
     i: &Interner,
-) -> Option<(&'a [Token], Connective, &'a [Token])> {
+) -> Vec<(&'a [Token], Connective, &'a [Token])> {
+    let mut candidates = Vec::new();
     let mut depth = 0i32;
     for (k, t) in toks.iter().enumerate() {
         let conn = match i.resolve(t.sym) {
@@ -1690,10 +1791,10 @@ fn split_connective<'a>(
             _ => None,
         };
         if let Some(conn) = conn {
-            return Some((&toks[..k], conn, &toks[k + 1..]));
+            candidates.push((&toks[..k], conn, &toks[k + 1..]));
         }
     }
-    None
+    candidates
 }
 
 /// Whether a statement is `[nonexec]` (a proof obligation not applied during execution).
@@ -1801,9 +1902,18 @@ fn parse_forest_pick(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Res
     Ok(parse_forest_any(tokens, g, i)?.tree)
 }
 
+/// The leading text of every [`parse_effort_error`] message.
+const PARSE_EFFORT_EXCEEDED: &str = "parse effort limit exceeded";
+
 fn parse_effort_error(at: usize, tokens: &[Token], i: &Interner) -> String {
     let token = tokens.get(at).map(|token| token.text(i)).unwrap_or("<end>");
-    format!("parse effort limit exceeded at token {at} (`{token}`)")
+    format!("{PARSE_EFFORT_EXCEEDED} at token {at} (`{token}`)")
+}
+
+/// Whether a term parse/build error is effort exhaustion (`TNK-PARSE-003`) rather than a malformed term.
+/// Every exhaustion error begins with [`parse_effort_error`]'s text, and no other error does.
+fn is_parse_effort_error(error: &str) -> bool {
+    error.starts_with(PARSE_EFFORT_EXCEEDED)
 }
 
 fn parse_forest_any(
@@ -4863,6 +4973,164 @@ endm
         );
         assert_eq!(module.built.eq_traces.len(), 1, "only `eq f(a) = b` loads");
         check_rendered_results(src, &[e("S", "b", 1), e("S", "c", 0)]);
+    }
+
+    /// The `message` of each of a module's diagnostics.
+    fn diagnostic_messages(module: &LoadedModule) -> Vec<&str> {
+        module
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect()
+    }
+
+    /// An operator name may contain connective text (`<_:_>` and `[_:_]` here, like object syntax), so
+    /// the first connective token of a condition fragment is not necessarily its connective. Every
+    /// fragment form builds over such terms, and so does a Boolean term containing one.
+    #[test]
+    fn condition_fragment_terms_may_contain_connective_text() {
+        let loaded = load_source(
+            r#"
+mod COND-COLON is
+  sorts S S2 T Bool .
+  subsort S2 < S .
+  op true : -> Bool [ctor special (id-hook SystemTrue)] .
+  op <_:_> : S T -> S .
+  op [_:_] : S T -> S .
+  op _~_ : S S -> Bool .
+  ops a b c d e : -> S .
+  op t : -> T .
+  ops f g h k n p : S -> S .
+  crl [eq] : a => b if < a : t > = < a : t > .
+  ceq f(X:S) = b if < X:S : t > = < a : t > .
+  ceq g(X:S) = Y:S if < Y:S : t > := < X:S : t > .
+  crl [rw] : c => d if < c : t > => < Z:S : t > .
+  ceq h(X:S) = b if < X:S : t > : S .
+  ceq k(X:S) = b if [X:S : t] = [a : t] .
+  ceq n(X:S) = b if < X:S : t > ~ < a : t > .
+  cmb p(X:S) : S2 if < X:S : t > = < e : t > .
+endm
+"#,
+        )
+        .expect("load connective-text conditions");
+        let module = &loaded.modules[0];
+        let messages = diagnostic_messages(module);
+        assert!(messages.is_empty(), "no statement is dropped: {messages:?}");
+        let built = &module.built;
+        let only = |condition: &[ConditionFragment]| match condition {
+            [fragment] => fragment.clone(),
+            other => panic!("expected one condition fragment, got {other:?}"),
+        };
+        assert!(matches!(
+            only(&built.rl_traces[0].condition),
+            ConditionFragment::Equality { .. }
+        ));
+        assert!(matches!(
+            only(&built.eq_traces[0].condition),
+            ConditionFragment::Equality { .. }
+        ));
+        match only(&built.eq_traces[1].condition) {
+            ConditionFragment::Matching { fresh_vars, .. } => assert_eq!(fresh_vars, [1]),
+            other => panic!("expected a matching fragment, got {other:?}"),
+        }
+        assert_eq!(built.eq_traces[1].var_names, ["X:S", "Y:S"]);
+        match only(&built.rl_traces[1].condition) {
+            ConditionFragment::Rewrite { fresh_vars, .. } => assert_eq!(fresh_vars, [0]),
+            other => panic!("expected a rewrite fragment, got {other:?}"),
+        }
+        assert!(matches!(
+            only(&built.eq_traces[2].condition),
+            ConditionFragment::SortTest { .. }
+        ));
+        assert!(matches!(
+            only(&built.eq_traces[3].condition),
+            ConditionFragment::Equality { .. }
+        ));
+        let truth = Term::constant(built.true_sym.expect("true is declared"));
+        match only(&built.eq_traces[4].condition) {
+            ConditionFragment::Equality { rhs, .. } => assert_eq!(rhs, truth),
+            other => panic!("expected a bare Boolean fragment, got {other:?}"),
+        }
+        assert!(matches!(
+            only(&built.mb_traces[0].condition),
+            ConditionFragment::Equality { .. }
+        ));
+    }
+
+    /// The first connective token's split is the reading whenever it builds, even when another reading
+    /// also builds. Otherwise a later reading is accepted only when it is the unique one; with none, the
+    /// first split's error is reported as before.
+    #[test]
+    fn condition_connective_keeps_the_first_split_and_requires_a_unique_alternative() {
+        let loaded = load_source(
+            r#"
+fmod COND-POLICY is
+  sorts S T Bool .
+  op true : -> Bool [ctor special (id-hook SystemTrue)] .
+  op <_:_> : S T -> S .
+  op _=_ : S S -> Bool .
+  ops a b : -> S .
+  op t : -> T .
+  ops f g h k : S -> S .
+  ceq f(X:S) = b if X:S = a .
+  ceq g(X:S) = b if < X:S : t > = < a : t > .
+  ceq h(X:S) = b if < X:S : t > .
+  ceq k(X:S) = b if < X:S : t > : Nope .
+endfm
+"#,
+        )
+        .expect("load connective policy");
+        let module = &loaded.modules[0];
+        assert_eq!(
+            diagnostic_messages(module),
+            [
+                "dropped equation: ambiguous condition fragment: `< X:S : t > = < a : t >`",
+                "dropped equation: no parse at token 2 (`<end>`): `< X:S`",
+                "dropped equation: no parse at token 2 (`<end>`): `< X:S`",
+            ]
+        );
+        // `X:S = a` is the `=` split, not the Boolean term `_=_(X:S, a)` read as `... = true`.
+        match module.built.eq_traces.as_slice() {
+            [trace] => assert!(
+                matches!(
+                    trace.condition.as_slice(),
+                    [ConditionFragment::Equality {
+                        lhs: Term::Var(_),
+                        ..
+                    }]
+                ),
+                "{:?}",
+                trace.condition
+            ),
+            other => panic!("expected only `f`'s equation, got {other:?}"),
+        }
+    }
+
+    /// Exceeding the parse effort limit decides no reading (`TNK-PARSE-003`): when a later connective
+    /// split's side exhausts it, the fragment reports that exhaustion rather than the first split's
+    /// malformed-term error or another reading.
+    #[test]
+    fn condition_connective_search_stops_at_parse_effort_exhaustion() {
+        let mut source = String::from(
+            "fmod COND-EFFORT is\n sorts S T .\n op <_:_> : S T -> S .\n op a : -> S .\n \
+             op t : -> T .\n op f : S -> S .\n",
+        );
+        for index in 0..500 {
+            source.push_str(&format!(" op _o{index}_ : S S -> S [assoc] .\n"));
+        }
+        source.push_str(" ceq f(X:S) = a if < X:S : t > = a");
+        for _ in 1..640 {
+            source.push_str(" o0 a");
+        }
+        source.push_str(" o0 bogus .\nendfm\n");
+        let loaded = load_source(&source).expect("load effort module");
+        match diagnostic_messages(&loaded.modules[0]).as_slice() {
+            [message] => assert!(
+                message.starts_with("dropped equation: parse effort limit exceeded at token "),
+                "{message}"
+            ),
+            other => panic!("expected one dropped equation, got {other:?}"),
+        }
     }
 
     /// Load, run, and raw-print every listed frontend fixture. Keeping the fixture list explicit prevents

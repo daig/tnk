@@ -748,3 +748,557 @@ fn meta_smt_search_initial_state_needs_a_satisfiable_constraint() {
         assert_eq!(results[2], failure, "{out}");
     }
 }
+
+// `ops`/`msgs` declare one operator per top-level parenthesized group, so grouped constants,
+// mixfix names, and parameterized constants are usable and instantiate through a view.
+#[test]
+fn ops_and_msgs_declare_one_operator_per_parenthesized_group() {
+    let mut session = Session::new();
+    let plain = session.eval(
+        "fmod OPS-GROUP is
+           sort Bar .
+           ops (m{X}) (n{X}) (p{X,X}) : -> Bar .
+           ops ([_]) (<_>) : Bar -> Bar .
+           op f : Bar -> Bar .
+           eq f(m{X}) = n{X} .
+           eq f(n{X}) = p{X,X} .
+           eq [ m{X} ] = < n{X} > .
+         endfm
+         reduce f(f(m{X})) .
+         reduce [ m{X} ] .",
+        false,
+    );
+    assert!(!plain.output.contains("warning"), "{}", plain.output);
+    assert!(!plain.output.contains("error"), "{}", plain.output);
+    assert!(plain.output.contains("result Bar: p{X"), "{}", plain.output);
+    assert!(
+        plain.output.contains("result Bar: < n{X} >"),
+        "{}",
+        plain.output
+    );
+
+    let messages = session.eval(
+        "omod MSGS-GROUP is
+           msgs (to_hi) (ack{X}) : Oid -> Msg .
+           op o : -> Oid .
+         endom
+         reduce to o hi .
+         reduce ack{X}(o) .",
+        false,
+    );
+    assert!(!messages.output.contains("error"), "{}", messages.output);
+    assert!(
+        messages.output.contains("result Msg: to o hi"),
+        "{}",
+        messages.output
+    );
+    assert!(
+        messages.output.contains("result Msg: ack{X}(o)"),
+        "{}",
+        messages.output
+    );
+
+    let instantiated = session.eval(
+        "fth OPS-T is
+           sort Elt .
+           ops (e1) (e2) : -> Elt [pconst] .
+         endfth
+         fmod OPS-N is
+           sort N .
+           ops z1 z2 : -> N .
+         endfm
+         view OpsV from OPS-T to OPS-N is
+           sort Elt to N .
+           op e1 to z1 .
+           op e2 to z2 .
+         endv
+         fmod OPS-P{X :: OPS-T} is
+           sort Bar{X} .
+           ops (m{X}) (n{X}) : -> Bar{X} .
+           op f : Bar{X} -> Bar{X} .
+           op g : X$Elt -> X$Elt .
+           eq f(m{X}) = n{X} .
+           eq g(X$e1) = X$e2 .
+         endfm
+         fmod OPS-USE is
+           including OPS-P{OpsV} .
+         endfm
+         reduce f(m{OpsV}) .
+         reduce g(z1) .",
+        false,
+    );
+    assert!(
+        !instantiated.output.contains("error"),
+        "{}",
+        instantiated.output
+    );
+    assert!(
+        instantiated.output.contains("result Bar{OpsV}: n{OpsV}"),
+        "{}",
+        instantiated.output
+    );
+    assert!(
+        instantiated.output.contains("result N: z2"),
+        "{}",
+        instantiated.output
+    );
+}
+
+// Renaming a parameterized class (`class Foo{X} to Bar{X}`) or message (`msg m{X} to n{X}`) is a
+// structured renaming item: the importer builds, and the instance sees only the renamed names.
+#[test]
+fn structured_class_and_message_renamings_instantiate() {
+    let mut session = Session::new();
+    let out = session.eval(
+        "fth REN-T is
+           sort Elt .
+         endfth
+         fmod REN-N is
+           sort N .
+         endfm
+         view RenV from REN-T to REN-N is
+           sort Elt to N .
+         endv
+         omod REN-FOO{X :: REN-T} is
+           class Foo{X} .
+           msg m{X} : Oid -> Msg .
+         endom
+         omod REN-BAR{X :: REN-T} is
+           including REN-FOO{X} * (class Foo{X} to Bar{X}, msg m{X} to n{X}) .
+           op className : -> Cid .
+           eq className = Bar{X} .
+         endom
+         omod REN-TEST is
+           including REN-BAR{RenV} .
+           op o : -> Oid .
+         endom
+         reduce className .
+         reduce n{RenV}(o) .
+         reduce m{RenV}(o) .",
+        false,
+    );
+    assert!(!out.output.contains("parse error"), "{}", out.output);
+    assert!(
+        out.output.contains("result Bar{RenV}: Bar{RenV}"),
+        "{}",
+        out.output
+    );
+    assert!(
+        out.output.contains("result Msg: n{RenV}(o)"),
+        "{}",
+        out.output
+    );
+    // The source message name is gone from the renamed instance.
+    assert!(
+        out.output.contains("error: no parse at token 0 (`m`)"),
+        "{}",
+        out.output
+    );
+}
+
+// The documented class qualifier `attr a . C to b` parses in renamings and view maps, including a
+// structured class. Attribute operators are shared by name across classes, so the qualifier does
+// not narrow the map: the same-named attribute of another class is renamed too.
+#[test]
+fn class_qualified_attribute_maps_parse_in_renamings_and_views() {
+    let mut session = Session::new();
+    let renamed = session.eval(
+        "omod ATTR-A is
+           sort V .
+           op v : -> V .
+           class C | x : V .
+           class D | x : V .
+           op o : -> Oid .
+         endom
+         omod ATTR-B is
+           including ATTR-A * (attr x . C to y) .
+         endom
+         reduce in ATTR-B : < o : C | y : v > .
+         reduce in ATTR-B : < o : D | y : v > .
+         oth ATTR-T is
+           sort W .
+           class E | z : W .
+         endoth
+         view AttrV from ATTR-T to ATTR-A is
+           sort W to V .
+           class E to C .
+           attr z . E to x .
+         endv",
+        false,
+    );
+    assert!(!renamed.output.contains("error"), "{}", renamed.output);
+    assert!(
+        renamed.output.contains("result Object: < o : C | y : v >"),
+        "{}",
+        renamed.output
+    );
+    assert!(
+        renamed.output.contains("result Object: < o : D | y : v >"),
+        "{}",
+        renamed.output
+    );
+
+    let structured = session.eval(
+        "fth ATTR-TRIV is
+           sort Elt .
+         endfth
+         fmod ATTR-N is
+           sort N .
+         endfm
+         view AttrN from ATTR-TRIV to ATTR-N is
+           sort Elt to N .
+         endv
+         omod ATTR-P{X :: ATTR-TRIV} is
+           sort U .
+           op u : -> U .
+           class Buf{X} | contents : U .
+         endom
+         omod ATTR-Q{X :: ATTR-TRIV} is
+           including ATTR-P{X} * (attr contents . Buf{X} to items) .
+         endom
+         omod ATTR-R is
+           including ATTR-Q{AttrN} .
+           op o : -> Oid .
+         endom
+         reduce < o : Buf{AttrN} | items : u > .",
+        false,
+    );
+    assert!(
+        !structured.output.contains("error"),
+        "{}",
+        structured.output
+    );
+    assert!(
+        structured
+            .output
+            .contains("result Object: < o : Buf{AttrN} | items : u >"),
+        "{}",
+        structured.output
+    );
+}
+
+/// A minimal truth-value module; its `true` anchors bare Boolean condition fragments.
+const TRUTH_MIN: &str = "fmod TRUTH-MIN is
+  sort Bool .
+  op true : -> Bool [ctor special (id-hook SystemTrue)] .
+  op false : -> Bool [ctor special (id-hook SystemFalse)] .
+endfm
+";
+
+/// Assert that every expected line occurs in `output`.
+fn assert_lines(output: &str, expected: &[&str]) {
+    for line in expected {
+        assert!(output.contains(line), "missing {line:?} in:\n{output}");
+    }
+}
+
+// Operator names may contain connective text (`<_:_>`, object syntax), so a condition fragment is
+// not split at its first `:`. Every fragment form over such terms executes, in statements, a search
+// condition, and object-module rules (object completion then applies to the retained rules).
+#[test]
+fn condition_fragments_may_contain_mixfix_colons() {
+    let mut session = Session::new();
+    let source = format!(
+        "{TRUTH_MIN}
+         mod COND-COLON is
+           protecting TRUTH-MIN .
+           sorts S S2 T .
+           subsort S2 < S .
+           op <_:_> : S T -> S [ctor] .
+           op _~_ : S S -> Bool .
+           ops a b c d e : -> S [ctor] .
+           op t : -> T [ctor] .
+           ops f g h n p : S -> S .
+           eq X:S ~ X:S = true .
+           crl [r1] : a => b if < a : t > = < a : t > .
+           ceq f(X:S) = b if < X:S : t > = < a : t > .
+           ceq g(X:S) = Y:S if < Y:S : t > := < X:S : t > .
+           crl [r2] : c => d if < c : t > => < Z:S : t > .
+           ceq h(X:S) = b if < X:S : t > : S .
+           ceq n(X:S) = b if < X:S : t > ~ < a : t > .
+           cmb p(X:S) : S2 if < X:S : t > = < e : t > .
+           rl [r3] : < a : t > => < b : t > .
+         endm
+         rewrite [1] a .
+         reduce f(a) .
+         reduce g(a) .
+         rewrite [1] c .
+         reduce h(a) .
+         reduce n(a) .
+         reduce n(c) .
+         reduce p(e) .
+         search < a : t > =>* < X:S : t > such that < X:S : t > = < b : t > ."
+    );
+    let plain = session.eval(&source, false);
+    assert!(!plain.output.contains("warning"), "{}", plain.output);
+    assert!(!plain.output.contains("error"), "{}", plain.output);
+    assert_lines(
+        &plain.output,
+        &[
+            "rewrite [1] in COND-COLON : a .\nrewrites: 1\nresult S: b",
+            "reduce in COND-COLON : f(a) .\nrewrites: 1\nresult S: b",
+            "reduce in COND-COLON : g(a) .\nrewrites: 1\nresult S: a",
+            "rewrite [1] in COND-COLON : c .\nrewrites: 1\nresult S: d",
+            "reduce in COND-COLON : h(a) .\nrewrites: 1\nresult S: b",
+            "reduce in COND-COLON : n(a) .\nrewrites: 2\nresult S: b",
+            "reduce in COND-COLON : n(c) .\nrewrites: 0\nresult S: n(c)",
+            "result S2: p(e)",
+            "X:S --> b",
+        ],
+    );
+
+    let objects = session.eval(
+        "set verbose on .
+         omod COND-OBJ is
+           protecting TRUTH-MIN .
+           sort Val .
+           ops v0 v1 v2 : -> Val [ctor] .
+           op next : Val -> Val .
+           eq next(v0) = v1 .
+           eq next(v1) = v2 .
+           class Cell | val : Val .
+           op c1 : -> Oid [ctor] .
+           ops bump copy : Oid -> Msg [ctor] .
+           var O : Oid .
+           vars V W : Val .
+           crl [bump] : bump(O) < O : Cell | val : V > => < O : Cell | val : next(V) >
+             if < O : Cell | val : V > = < O : Cell | val : v0 > .
+           crl [copy] : copy(O) < O : Cell | val : V > => < O : Cell | val : W >
+             if < O : Cell | val : W > := < O : Cell | val : next(V) > .
+         endom
+         set verbose off .
+         rewrite bump(c1) < c1 : Cell | val : v0 > .
+         rewrite bump(c1) < c1 : Cell | val : v1 > .
+         rewrite copy(c1) < c1 : Cell | val : v1 > .",
+        false,
+    );
+    assert!(!objects.output.contains("warning"), "{}", objects.output);
+    assert!(!objects.output.contains("error"), "{}", objects.output);
+    // The retained rule reaches object completion.
+    assert!(
+        objects.output.contains("Transformed rule:\n  crl [bump] :"),
+        "{}",
+        objects.output
+    );
+    assert_lines(
+        &objects.output,
+        &[
+            "result Object: < c1 : Cell | val : v1 >",
+            "result Configuration: bump(c1) < c1 : Cell | val : v1 >",
+            "result Object: < c1 : Cell | val : v2 >",
+        ],
+    );
+}
+
+// A membership's delimiter is the colon before its target sort, so subjects may contain colons
+// (a user `<_:_>`, a `: t [ a ]` subterm, object syntax). An unknown target sort is reported as such.
+#[test]
+fn membership_subjects_may_contain_mixfix_colons() {
+    let mut session = Session::new();
+    let plain = session.eval(
+        "fmod MB-COLON is
+           sorts S S2 T .
+           subsort S2 < S .
+           op <_:_> : S T -> S [ctor] .
+           op _[_] : T S -> T [ctor] .
+           ops a e : -> S [ctor] .
+           op t : -> T [ctor] .
+           mb < e : t > : S2 .
+           cmb < X:S : t > : S2 if X:S = a .
+           mb [bracket] : < e : t [ a ] > : S2 .
+           mb < a : t > : Nope .
+         endfm
+         reduce < e : t > .
+         reduce < a : t > .
+         reduce < e : t [ a ] > .
+         reduce < e : t [ e ] > .",
+        false,
+    );
+    assert!(!plain.output.contains("error"), "{}", plain.output);
+    assert_eq!(
+        plain.output.matches("warning").count(),
+        1,
+        "{}",
+        plain.output
+    );
+    assert_lines(
+        &plain.output,
+        &[
+            "dropped membership: unknown sort `Nope`",
+            "result S2: < e : t >",
+            "result S2: < a : t >",
+            "result S2: < e : t[a] >",
+            "result S: < e : t[e] >",
+        ],
+    );
+
+    let objects = session.eval(
+        "omod MB-OBJ is
+           sorts Val GoodObj .
+           subsort GoodObj < Object .
+           ops v w : -> Val [ctor] .
+           op o : -> Oid [ctor] .
+           class Cell | val : Val .
+           var O : Oid .
+           var V : Val .
+           mb < O : Cell | val : v > : GoodObj .
+           cmb < O : Cell | val : V > : GoodObj if V = w [label cw] .
+         endom
+         reduce < o : Cell | val : v > .
+         reduce < o : Cell | val : w > .",
+        false,
+    );
+    assert!(!objects.output.contains("warning"), "{}", objects.output);
+    assert_lines(
+        &objects.output,
+        &[
+            "result GoodObj: < o : Cell | val : v >",
+            "result GoodObj: < o : Cell | val : w >",
+        ],
+    );
+}
+
+// `if` is not reserved: the `ceq`/`crl` condition keyword is the first top-level `if` that no later
+// top-level `fi` closes, so `if_then_else_fi` may stand unparenthesized on either side of the
+// statement or in its condition.
+#[test]
+fn if_then_else_fi_may_stand_beside_the_condition_keyword() {
+    let mut session = Session::new();
+    let equations = session.eval(
+        "fmod ITE is
+           sorts Bool S .
+           ops true false : -> Bool [ctor] .
+           ops a b c : -> S [ctor] .
+           op if_then_else_fi : Bool S S -> S .
+           op if_then_else_fi : Bool Bool Bool -> Bool .
+           vars X Y : S .
+           vars P Q : Bool .
+           eq if true then X else Y fi = X .
+           eq if false then X else Y fi = Y .
+           eq if true then P else Q fi = P .
+           eq if false then P else Q fi = Q .
+           ops f g k : Bool -> S .
+           ceq f(B:Bool) = if B:Bool then a else b fi if B:Bool = B:Bool .
+           ceq g(B:Bool) = a if if B:Bool then true else false fi = true .
+           ceq k(B:Bool) = if B:Bool then a else b fi if if B:Bool then true else true fi = true .
+         endfm
+         reduce f(true) .
+         reduce f(false) .
+         reduce g(true) .
+         reduce g(false) .
+         reduce k(false) .",
+        false,
+    );
+    assert!(
+        !equations.output.contains("warning"),
+        "{}",
+        equations.output
+    );
+    assert_lines(
+        &equations.output,
+        &[
+            "reduce in ITE : f(true) .\nrewrites: 2\nresult S: a",
+            "reduce in ITE : f(false) .\nrewrites: 2\nresult S: b",
+            "reduce in ITE : g(true) .\nrewrites: 2\nresult S: a",
+            "reduce in ITE : g(false) .\nrewrites: 1\nresult S: g(false)",
+            "reduce in ITE : k(false) .\nrewrites: 3\nresult S: b",
+        ],
+    );
+
+    let rules = session.eval(
+        "mod ITE-R is
+           sorts Bool S .
+           ops true false : -> Bool [ctor] .
+           ops a b : -> S [ctor] .
+           op if_then_else_fi : Bool S S -> S .
+           vars X Y : S .
+           eq if true then X else Y fi = X .
+           eq if false then X else Y fi = Y .
+           op h : Bool -> S .
+           crl [r] : h(B:Bool) => if B:Bool then a else b fi if B:Bool = true .
+         endm
+         rewrite h(true) .
+         rewrite h(false) .",
+        false,
+    );
+    assert!(!rules.output.contains("warning"), "{}", rules.output);
+    assert_lines(
+        &rules.output,
+        &[
+            "rewrite in ITE-R : h(true) .\nrewrites: 2\nresult S: a",
+            "rewrite in ITE-R : h(false) .\nrewrites: 0\nresult S: h(false)",
+        ],
+    );
+
+    // An `if_then_else_fi` left side used to leave no `=` before the first `if`, which rejected the
+    // whole module.
+    let left = session.eval(
+        "fmod ITE-LHS is
+           sorts Bool S .
+           ops true false : -> Bool [ctor] .
+           ops a b c : -> S [ctor] .
+           op if_then_else_fi : Bool S S -> S .
+           ceq if B:Bool then a else b fi = c if B:Bool = true .
+         endfm
+         reduce if true then a else b fi .
+         reduce if false then a else b fi .",
+        false,
+    );
+    assert!(!left.output.contains("error"), "{}", left.output);
+    assert_eq!(session.current(), Some("ITE-LHS"));
+    assert_lines(
+        &left.output,
+        &["result S: c", "result S: if false then a else b fi"],
+    );
+}
+
+/// H.3 lexical/source parse: a summand import with a dangling `+` is a `parse error:` naming the
+/// offending terminator by its source text, at its own line, inside the enclosing module. The prior
+/// definition, the current module, and the saved continuation are unchanged.
+#[test]
+fn dangling_summand_reports_the_terminator_and_keeps_session_state() {
+    let mut session = Session::new();
+    let entered = session.eval(
+        "mod SUM-R is sort S . ops a b c : -> S . rl a => b . rl b => c . endm
+         fmod SUM-T is sort T . op t : -> T . endfm
+         mod SUMMED is pr SUM-R . endm",
+        false,
+    );
+    assert!(entered.output.is_empty(), "{}", entered.output);
+    let first = session.eval("rewrite [1] a .", false);
+    assert!(first.output.contains("result S: b"), "{}", first.output);
+
+    let rejected = session.eval("mod SUMMED is\n  pr SUM-R + SUM-T + .\nendm", false);
+    assert_eq!(
+        rejected.output,
+        "parse error: module `SUMMED`, line 2: expected a name, found `.`"
+    );
+    assert_eq!(session.current(), Some("SUMMED"));
+
+    let resumed = session.eval("continue 1 .", false);
+    assert!(resumed.output.contains("result S: c"), "{}", resumed.output);
+    // The installed SUMMED is still the prior definition, which does not import SUM-T.
+    let absent = session.eval("reduce in SUMMED : t .", false);
+    assert!(absent.output.starts_with("error:"), "{}", absent.output);
+}
+
+/// Reference H.4.1: a long unrecognized statement is skipped silently, and the next command runs in
+/// the unchanged current module. The skip must not take a stack frame per token.
+#[test]
+fn long_unrecognized_statement_is_skipped_silently() {
+    let mut session = Session::new();
+    let entered = session.eval(
+        "fmod SKIP-RUN is sort S . ops a b : -> S . eq a = b . endfm",
+        false,
+    );
+    assert!(entered.output.is_empty(), "{}", entered.output);
+
+    let input = format!("junkalpha{} .\nreduce a .", " a".repeat(20_000));
+    let recovered = session.eval(&input, false);
+    assert!(!recovered.exit);
+    assert_eq!(
+        recovered.output,
+        "reduce in SKIP-RUN : a .\nrewrites: 1\nresult S: b"
+    );
+    assert_eq!(session.current(), Some("SKIP-RUN"));
+}

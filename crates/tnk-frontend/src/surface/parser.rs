@@ -3,6 +3,7 @@
 //! per-module mixfix parser, keeping lexer and parser state explicit.
 
 use crate::lex::{Interner, TokKind, Token};
+use crate::sig::build_sig::strip_outer_parens;
 use crate::surface::ast::*;
 
 pub type PResult<T> = Result<T, String>;
@@ -48,6 +49,32 @@ fn top_level_find(toks: &[Token], i: &Interner, kw: &str, last: bool) -> Option<
         }
     }
     found
+}
+
+/// The condition keyword of a `ceq` body, or of a `crl` body after its arrow. `if` is not reserved:
+/// BOOL's `if_then_else_fi` may appear unparenthesized on either side of the statement or in its
+/// condition. Top-level `if` and `fi` tokens (depth 0 over `()`/`[]`/`{}`) therefore pair like brackets,
+/// and the keyword is the first top-level `if` that no later `fi` closes. When every top-level `if` is
+/// closed, it is the first top-level `if`, the split used before pairing.
+fn condition_keyword(toks: &[Token], i: &Interner) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut first = None;
+    let mut open = Vec::new();
+    for (idx, t) in toks.iter().enumerate() {
+        match i.resolve(t.sym) {
+            "(" | "[" | "{" => depth += 1,
+            ")" | "]" | "}" => depth -= 1,
+            "if" if depth == 0 => {
+                first.get_or_insert(idx);
+                open.push(idx);
+            }
+            "fi" if depth == 0 => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    open.first().copied().or(first)
 }
 
 /// Locate the statement-level equation separator. Normally this is the first top-level `=`. For a
@@ -185,6 +212,11 @@ fn print_attr_error(print: &[Token], m: &PreModule, i: &Interner) -> Option<Stri
     })
 }
 
+/// A found token for diagnostic prose: its source text in backquotes, or `end of input`.
+fn describe_token(text: Option<&str>) -> String {
+    text.map_or_else(|| "end of input".to_string(), |text| format!("`{text}`"))
+}
+
 impl<'a> Parser<'a> {
     pub fn new(toks: &'a [Token], i: &'a Interner) -> Self {
         Parser { toks, pos: 0, i }
@@ -198,23 +230,24 @@ impl<'a> Parser<'a> {
             .map(|token| token.line)
     }
 
-    /// The open top-level module or view containing the current cursor, when its name was parsed.
+    /// The open top-level module or view containing the current cursor, when its name was parsed. A
+    /// terminator `.` after the opener is a missing name, not a name.
     pub fn error_context(&self) -> Option<(&'static str, String)> {
+        let name_after = |pos: usize| {
+            self.toks
+                .get(pos + 1)
+                .filter(|token| token.kind != TokKind::Dot)
+                .map(|token| self.i.resolve(token.sym).to_string())
+        };
         let mut context = None;
         let end = self.pos.min(self.toks.len().saturating_sub(1));
         for pos in 0..=end {
             match self.i.resolve(self.toks[pos].sym) {
                 "fmod" | "mod" | "fth" | "th" | "smod" | "sth" | "omod" | "oth" => {
-                    context = self
-                        .toks
-                        .get(pos + 1)
-                        .map(|token| ("module", self.i.resolve(token.sym).to_string()));
+                    context = name_after(pos).map(|name| ("module", name));
                 }
                 "view" => {
-                    context = self
-                        .toks
-                        .get(pos + 1)
-                        .map(|token| ("view", self.i.resolve(token.sym).to_string()));
+                    context = name_after(pos).map(|name| ("view", name));
                 }
                 "endfm" | "endm" | "endfth" | "endth" | "endsm" | "endsth" | "endom" | "endoth"
                 | "endv" => context = None,
@@ -244,12 +277,16 @@ impl<'a> Parser<'a> {
         }
         t
     }
+    /// The current token for diagnostic prose (see [`describe_token`]).
+    fn found(&self) -> String {
+        describe_token(self.peek_text())
+    }
     fn eat(&mut self, kw: &str) -> PResult<()> {
         if self.at(kw) {
             self.advance();
             Ok(())
         } else {
-            Err(format!("expected `{kw}`, found {:?}", self.peek_text()))
+            Err(format!("expected `{kw}`, found {}", self.found()))
         }
     }
     fn eat_dot(&mut self) -> PResult<()> {
@@ -257,7 +294,7 @@ impl<'a> Parser<'a> {
             self.advance();
             Ok(())
         } else {
-            Err(format!("expected `.`, found {:?}", self.peek_text()))
+            Err(format!("expected `.`, found {}", self.found()))
         }
     }
     /// Parse an optional `in <MODULE-EXPR> :` qualifier. The module expression ends at the top-level
@@ -272,11 +309,16 @@ impl<'a> Parser<'a> {
         Ok(Some(toks.iter().map(|t| self.i.resolve(t.sym)).collect()))
     }
 
-    /// An identifier token's text (any non-Dot token), consumed.
+    /// An identifier token's text (any non-Dot token), consumed. On failure the offending token stays
+    /// current, so [`error_line`](Self::error_line) and [`error_context`](Self::error_context) describe
+    /// it rather than the token after it.
     fn name(&mut self) -> PResult<String> {
-        match self.advance() {
-            Some(t) if t.kind != TokKind::Dot => Ok(self.i.resolve(t.sym).to_string()),
-            other => Err(format!("expected a name, found {other:?}")),
+        match self.peek() {
+            Some(t) if t.kind != TokKind::Dot => {
+                self.advance();
+                Ok(self.i.resolve(t.sym).to_string())
+            }
+            _ => Err(format!("expected a name, found {}", self.found())),
         }
     }
 
@@ -373,6 +415,127 @@ impl<'a> Parser<'a> {
         Ok(names)
     }
 
+    /// The position of a membership's `:` delimiter. Literal colons are legal operator-name fragments
+    /// (object syntax `< O : C | a : v >`, a user `<_:_>`), so the delimiter is the first paren-depth-0
+    /// `:` that is followed by a sort name and then `if` (`cmb`), or by a sort name and at most a
+    /// statement-attribute group before the terminator (`mb`). `None` when no colon has that shape; the
+    /// caller then splits at the first colon, as before, so malformed input keeps its diagnostic.
+    fn membership_delimiter(&self, conditional: bool) -> Option<usize> {
+        let text = |position: usize| self.toks.get(position).map(|t| self.i.resolve(t.sym));
+        let is_dot = |position: usize| {
+            self.toks
+                .get(position)
+                .is_some_and(|t| t.kind == TokKind::Dot)
+        };
+        let mut depth = 0i32;
+        for position in self.pos..self.toks.len() {
+            if depth == 0 && is_dot(position) {
+                break;
+            }
+            match text(position) {
+                Some("(") => depth += 1,
+                Some(")") => depth -= 1,
+                Some(":") if depth == 0 => {
+                    let Some(after) = self.sort_name_end(position + 1) else {
+                        continue;
+                    };
+                    let fits = if conditional {
+                        text(after) == Some("if")
+                    } else if text(after) == Some("[") {
+                        // An attribute group runs to its first `]`, as `stmt_attrs` reads it.
+                        (after + 1..self.toks.len())
+                            .find(|&k| text(k) == Some("]") || is_dot(k))
+                            .is_some_and(|close| text(close) == Some("]") && is_dot(close + 1))
+                    } else {
+                        is_dot(after)
+                    };
+                    if fits {
+                        return Some(position);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// The index just past a sort name starting at `start`: one name token plus any balanced `{…}`
+    /// parameter groups (`List{Nat}`, `Sub{A}{B}`).
+    fn sort_name_end(&self, start: usize) -> Option<usize> {
+        let first = self.toks.get(start)?;
+        if matches!(first.kind, TokKind::Dot | TokKind::Punct) {
+            return None;
+        }
+        let mut end = start + 1;
+        while self.toks.get(end).map(|t| self.i.resolve(t.sym)) == Some("{") {
+            let mut depth = 0i32;
+            loop {
+                match self.i.resolve(self.toks.get(end)?.sym) {
+                    "{" => depth += 1,
+                    "}" => depth -= 1,
+                    _ => {}
+                }
+                end += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+        Some(end)
+    }
+
+    /// Split an `ops`/`msgs` name list into one token run per operator. A top-level balanced `( … )`
+    /// group is one name, its tokens without the quoting parentheses (as in `op (_+_)`); any other
+    /// token is one name. Only punctuation parentheses delimit a group, so a backquoted `` `( `` is an
+    /// ordinary token. The group's quoting parentheses are dropped so raw-text consumers (parameter
+    /// instantiation, renaming) see the bare name. They stay only when the enclosed tokens are
+    /// themselves one wrapped group (`((a))`), because `canonical_name` strips exactly one quoting pair.
+    fn split_op_names(&self, names: &[Token]) -> PResult<Vec<Vec<Token>>> {
+        // Only punctuation parentheses group; a backquoted `( / `) is an identifier (TNK-LEX-001).
+        let paren = |token: &Token| match self.i.resolve(token.sym) {
+            text @ ("(" | ")") if token.kind == TokKind::Punct => text,
+            _ => "",
+        };
+        let mut out = Vec::new();
+        let mut rest = names;
+        while let Some(first) = rest.first() {
+            match paren(first) {
+                "(" => {}
+                ")" => return Err("unmatched `)` in an operator name list".into()),
+                _ => {
+                    out.push(vec![*first]);
+                    rest = &rest[1..];
+                    continue;
+                }
+            }
+            let mut depth = 0i32;
+            let close = rest
+                .iter()
+                .position(|token| {
+                    match paren(token) {
+                        "(" => depth += 1,
+                        ")" => depth -= 1,
+                        _ => {}
+                    }
+                    depth == 0
+                })
+                .ok_or("unmatched `(` in an operator name list")?;
+            let group = &rest[..=close];
+            let inner = &group[1..close];
+            if inner.is_empty() {
+                return Err("empty parenthesized operator name".into());
+            }
+            let name = if strip_outer_parens(inner, self.i).len() == inner.len() {
+                inner
+            } else {
+                group
+            };
+            out.push(name.to_vec());
+            rest = &rest[close + 1..];
+        }
+        Ok(out)
+    }
+
     /// Collect a whole statement body up to the top-level terminator `.` (left unconsumed). Besides
     /// ordinary delimiters, account for reflected module constructors: a meta-level term can contain
     /// `fmod ... sorts ... . ... endfm` at top level, and those internal dots are data, not the enclosing
@@ -440,7 +603,8 @@ impl<'a> Parser<'a> {
                 Some("path") => path = true,
                 other => {
                     return Err(format!(
-                        "vu-narrow: expected `fold`, `vfold`, or `path`, found {other:?}"
+                        "vu-narrow: expected `fold`, `vfold`, or `path`, found {}",
+                        describe_token(other)
                     ));
                 }
             }
@@ -477,7 +641,8 @@ impl<'a> Parser<'a> {
                     Some("delay") => delay = true,
                     other => {
                         return Err(format!(
-                            "vu-narrow: expected `filter` or `delay`, found {other:?}"
+                            "vu-narrow: expected `filter` or `delay`, found {}",
+                            describe_token(other)
                         ));
                     }
                 }
@@ -500,7 +665,8 @@ impl<'a> Parser<'a> {
             Some("=>!") => SearchArrow::Bang,
             other => {
                 return Err(format!(
-                    "vu-narrow: expected `=>1`/`=>+`/`=>*`/`=>!`, found {other:?}"
+                    "vu-narrow: expected `=>1`/`=>+`/`=>*`/`=>!`, found {}",
+                    describe_token(other)
                 ));
             }
         };
@@ -534,11 +700,24 @@ impl<'a> Parser<'a> {
     // ---- top level ----
 
     /// Parse one top-level item, or `None` at EOF. Commands remain untagged until the caller associates
-    /// them with its current module.
+    /// them with its current module. Unrecognized tokens and source `set` directives before the item are
+    /// skipped silently (Reference H.4.1). The skip loops here instead of recursing, so its stack depth
+    /// does not grow with the length of a skipped run.
     pub fn parse_top_item(&mut self) -> PResult<Option<TopItem>> {
-        let Some(txt) = self.peek_text() else {
-            return Ok(None);
-        };
+        while let Some(txt) = self.peek_text() {
+            let start = self.pos;
+            if let Some(item) = self.top_item_at(txt)? {
+                return Ok(Some(item));
+            }
+            debug_assert!(self.pos > start, "a top-level skip step must consume input");
+        }
+        Ok(None)
+    }
+
+    /// One [`parse_top_item`](Self::parse_top_item) step at the current token, whose text is `txt`: the
+    /// item that token opens, or `None` after skipping one unrecognized token or one source `set`
+    /// directive. A `None` step always consumes input.
+    fn top_item_at(&mut self, txt: &'a str) -> PResult<Option<TopItem>> {
         let item = match txt {
             "fmod" | "mod" | "fth" | "th" | "smod" | "sth" | "omod" | "oth" => {
                 TopItem::Module(self.module()?)
@@ -582,7 +761,8 @@ impl<'a> Parser<'a> {
                     }
                     other => {
                         return Err(format!(
-                            "show: expected `frontier states`, `most general states`, or `path`, found {other:?}"
+                            "show: expected `frontier states`, `most general states`, or `path`, found {}",
+                            describe_token(other)
                         ));
                     }
                 };
@@ -681,7 +861,8 @@ impl<'a> Parser<'a> {
                     }
                     other => {
                         return Err(format!(
-                            "expected `unify` or `match` after `variant`, found {other:?}"
+                            "expected `unify` or `match` after `variant`, found {}",
+                            describe_token(other)
                         ));
                     }
                 }
@@ -776,7 +957,8 @@ impl<'a> Parser<'a> {
                     Some("=>!") => SearchArrow::Bang,
                     other => {
                         return Err(format!(
-                            "search: expected `=>1`/`=>+`/`=>*`/`=>!`, found {other:?}"
+                            "search: expected `=>1`/`=>+`/`=>*`/`=>!`, found {}",
+                            describe_token(other)
                         ));
                     }
                 };
@@ -813,7 +995,8 @@ impl<'a> Parser<'a> {
                     Some("=>!") => SearchArrow::Bang,
                     other => {
                         return Err(format!(
-                            "smt-search: expected `=>1`/`=>+`/`=>*`/`=>!`, found {other:?}"
+                            "smt-search: expected `=>1`/`=>+`/`=>*`/`=>!`, found {}",
+                            describe_token(other)
                         ));
                     }
                 };
@@ -856,19 +1039,19 @@ impl<'a> Parser<'a> {
             "set" => {
                 // A source directive such as `set include BOOL off .` does not alter loading: imports are
                 // explicit, and interactive `set` commands are handled by the REPL before parsing.
-                // Consume through the terminator and continue with the next item.
+                // Consume through the terminator; the caller continues with the next item.
                 self.advance(); // `set`
                 while !self.at_dot() && self.peek_text().is_some() {
                     self.advance();
                 }
                 self.eat_dot()?;
-                return self.parse_top_item();
+                return Ok(None);
             }
             _ => {
                 // Recover from unknown top-level input one token at a time so the next module or command
                 // remains parseable. This fallback itself is intentionally silent.
                 self.advance();
-                return self.parse_top_item();
+                return Ok(None);
             }
         };
         Ok(Some(item))
@@ -995,7 +1178,7 @@ impl<'a> Parser<'a> {
             self.eat("]")?;
             return Ok(format!("[{}]", inners.join(",")));
         }
-        let mut name = self.name()?;
+        let name = self.name()?;
         // Dots are illegal in base sort names. Structured and kind syntax use braces or brackets, so a
         // dotted token is rejected with the whole declaration.
         if name.contains('.') {
@@ -1003,7 +1186,20 @@ impl<'a> Parser<'a> {
                 "`{name}` is not a valid sort name (`.` not allowed)"
             ));
         }
-        // Parse a chain of parameter groups recursively and reassemble it without spaces.
+        self.parameter_groups(name)
+    }
+
+    /// A renaming item's operator name: one name token plus any structured `{…}` parameter groups
+    /// (`m{X}`), spelled as the declaration's tokens concatenate. Unlike a sort name, the base token may
+    /// contain `.`.
+    fn structured_op_name(&mut self) -> PResult<String> {
+        let name = self.name()?;
+        self.parameter_groups(name)
+    }
+
+    /// Append a chain of `{…}` parameter groups to `name`, each argument a complete sort name, and
+    /// reassemble it without spaces (`Map{X,Y}`, `Box{V}{W}`).
+    fn parameter_groups(&mut self, mut name: String) -> PResult<String> {
         while self.at("{") {
             self.advance(); // {
             let mut args = Vec::new();
@@ -1146,8 +1342,10 @@ impl<'a> Parser<'a> {
                     self.advance();
                     let from_token = self.peek().ok_or("expected an attribute name")?;
                     let from_name = self.name()?;
-                    if self.at_dot() {
-                        self.eat_dot()?;
+                    // An optional `. C` class qualifier is parsed and ignored (see `renaming`). Before an
+                    // ordinary class name its period is an identifier-kind `.` (TNK-LEX-001).
+                    if self.at(".") {
+                        self.advance();
                         let _class = self.sort_name()?;
                     }
                     self.eat("to")?;
@@ -1264,6 +1462,13 @@ impl<'a> Parser<'a> {
                 let multi = kw == "ops";
                 self.advance();
                 let names = self.op_names_before_signature()?;
+                // `ops` declares one operator per name; split here so a malformed list is reported at
+                // its declaration.
+                let multi_names = if multi {
+                    Some(self.split_op_names(&names)?)
+                } else {
+                    None
+                };
                 let mut domain = Vec::new();
                 while !self.at("->") && !self.at("~>") {
                     domain.push(self.sort_name()?);
@@ -1283,10 +1488,10 @@ impl<'a> Parser<'a> {
                     Attrs::default()
                 };
                 self.eat_dot()?;
-                if multi {
-                    for t in names {
+                if let Some(multi_names) = multi_names {
+                    for name in multi_names {
                         m.ops.push(OpDecl {
-                            name: vec![t],
+                            name,
                             domain: domain.clone(),
                             range: range.clone(),
                             partial,
@@ -1394,6 +1599,12 @@ impl<'a> Parser<'a> {
                 self.advance();
                 // A message declaration becomes a constructor/message operator with the written range.
                 let names = self.op_names_before_signature()?;
+                // `msgs` names split exactly like `ops` names.
+                let multi_names = if multi {
+                    Some(self.split_op_names(&names)?)
+                } else {
+                    None
+                };
                 let mut domain = Vec::new();
                 while !self.at("->") && !self.at("~>") {
                     domain.push(self.sort_name()?);
@@ -1408,10 +1619,10 @@ impl<'a> Parser<'a> {
                 attrs.ctor = true;
                 attrs.message = true;
                 self.eat_dot()?;
-                if multi {
-                    for t in names {
+                if let Some(multi_names) = multi_names {
+                    for name in multi_names {
                         m.ops.push(OpDecl {
-                            name: vec![t],
+                            name,
                             domain: domain.clone(),
                             range: range.clone(),
                             partial: false,
@@ -1452,7 +1663,7 @@ impl<'a> Parser<'a> {
                     return Ok(());
                 }
                 let cond = if conditional {
-                    let i = top_level_find(&body, self.i, "if", false)
+                    let i = condition_keyword(&body, self.i)
                         .ok_or("`ceq` is missing its `if` condition")?;
                     let c = body.split_off(i + 1);
                     body.pop(); // the `if`
@@ -1479,7 +1690,15 @@ impl<'a> Parser<'a> {
                 self.advance();
                 // Optional leading `[name] :` label, like `eq`/`rl`.
                 let leading = self.peel_leading_label()?;
-                let lhs = self.collect_until(&[":"]);
+                let lhs = match self.membership_delimiter(conditional) {
+                    Some(delimiter) => {
+                        let lhs = self.toks[self.pos..delimiter].to_vec();
+                        self.pos = delimiter;
+                        lhs
+                    }
+                    // No colon has the delimiter's shape: split at the first one, as before.
+                    None => self.collect_until(&[":"]),
+                };
                 self.eat(":")?;
                 // The sort (and a condition) end at the optional trailing attribute `[ … ]` or `.` — stop
                 // the bubble at `[` so a `[nonexec]`/`[label …]` is not swallowed into the sort.
@@ -1527,7 +1746,7 @@ impl<'a> Parser<'a> {
                 // Collect the whole body depth-aware over `()[]{}` (like `eq`) so a `[_]`-headed lhs/rhs
                 // (`[N + 1]`) is not truncated at its `[`, then peel a trailing `[attrs]` (real attributes
                 // only, not a `[_]`-list term). Split at the **first** top-level `=>` (the rule arrow — a
-                // rewrite-condition fragment's `=>` sits after `if`), then a `crl` at its top-level `if`.
+                // rewrite-condition fragment's `=>` sits after `if`), then a `crl` at its condition keyword.
                 let mut body = self.collect_to_dot();
                 self.eat_dot()?;
                 let sa = peel_stmt_attrs(&mut body, self.i);
@@ -1549,7 +1768,7 @@ impl<'a> Parser<'a> {
                 let lhs = body;
                 let (rhs, cond);
                 if conditional {
-                    let ifi = top_level_find(&rest, self.i, "if", false)
+                    let ifi = condition_keyword(&rest, self.i)
                         .ok_or("`crl` is missing its `if` condition")?;
                     let c = rest.split_off(ifi + 1);
                     rest.pop(); // the `if`
@@ -2029,9 +2248,11 @@ impl<'a> Parser<'a> {
                 // produced. A class is a sort *and* a same-named constant; an attribute `a` is the mixfix op
                 // `a`:_`; a message is a prefix op.
                 "class" => {
-                    let from = self.name()?;
+                    // A class is named like a sort, so a parameterized class is structured (`Foo{X}`),
+                    // as in class declarations and view class maps.
+                    let from = self.sort_name()?;
                     self.eat("to")?;
-                    let to = self.name()?;
+                    let to = self.sort_name()?;
                     items.push(RenameItem::Sort {
                         from: from.clone(),
                         to: to.clone(),
@@ -2044,12 +2265,13 @@ impl<'a> Parser<'a> {
                     });
                 }
                 "attr" => {
-                    // Parse and ignore an optional `. C` attribute-class qualifier; one attribute name is
-                    // unambiguous here.
+                    // Parse and ignore an optional `. C` class qualifier: attribute operators are shared by
+                    // name across classes, so it cannot narrow the map. Before an ordinary class name its
+                    // period is an identifier-kind `.` (TNK-LEX-001); the class may be structured.
                     let from = self.name()?;
-                    if self.at_dot() {
-                        self.eat_dot()?;
-                        let _class = self.name()?;
+                    if self.at(".") {
+                        self.advance();
+                        let _class = self.sort_name()?;
                     }
                     self.eat("to")?;
                     let to = self.name()?;
@@ -2061,9 +2283,11 @@ impl<'a> Parser<'a> {
                     });
                 }
                 "msg" => {
-                    let from = self.name()?;
+                    // A message name may be structured (`m{X}`); an operator profile is not part of a
+                    // message item.
+                    let from = self.structured_op_name()?;
                     self.eat("to")?;
-                    let to = self.name()?;
+                    let to = self.structured_op_name()?;
                     items.push(RenameItem::Op {
                         from,
                         to,
@@ -2596,6 +2820,131 @@ mod tests {
         Parser::new(&toks, &i).parse_source().expect("parse ok")
     }
 
+    /// Parse one top-level item that must fail: the error, plus the line and module/view context a caller
+    /// such as the Session reports with it.
+    fn parse_failure(src: &str) -> (String, Option<u32>, Option<(&'static str, String)>) {
+        let mut i = Interner::new();
+        let toks = tokenize(src, &mut i);
+        let mut p = Parser::new(&toks, &i);
+        let err = p.parse_top_item().expect_err("parse must fail");
+        (err, p.error_line(), p.error_context())
+    }
+
+    /// A missing name is reported at the offending token: its source text, its own line, and the
+    /// enclosing module or view, also when the next token closes that module or view.
+    #[test]
+    fn missing_name_reports_the_offending_token() {
+        let module = |name: &str| Some(("module", name.to_string()));
+        let view = |name: &str| Some(("view", name.to_string()));
+        for (src, line, context) in [
+            ("fmod B is\n  pr A + C + .\nendfm\n", 2, module("B")),
+            ("fmod B is pr A + . endfm", 1, module("B")),
+            ("fmod B is\n  pr .\n  sort S .\nendfm\n", 2, module("B")),
+            (
+                "view V from T to A is\n  sort Elt to .\nendv\n",
+                2,
+                view("V"),
+            ),
+            // A `.` before `from` is an identifier (`TNK-LEX-001`), so this view is named `.`.
+            (
+                "view . from T to A is\n  sort Elt to .\nendv\n",
+                2,
+                view("."),
+            ),
+            // A terminator in the module-name position is a missing name, not a module named `.`.
+            ("fmod . endfm", 1, None),
+            ("fmod . sort S . endfm", 1, None),
+        ] {
+            let expected = (
+                "expected a name, found `.`".to_string(),
+                Some(line),
+                context,
+            );
+            assert_eq!(parse_failure(src), expected, "{src}");
+        }
+        let expected = (
+            "expected a name, found end of input".to_string(),
+            Some(1),
+            None,
+        );
+        assert_eq!(parse_failure("fmod"), expected);
+    }
+
+    /// Expected-token failures name the found token by its source text, or `end of input`.
+    #[test]
+    fn expected_token_failures_render_source_text() {
+        for (src, err) in [
+            ("fmod B\n  sort S .\nendfm\n", "expected `is`, found `sort`"),
+            ("continue 1", "expected `.`, found end of input"),
+            (
+                "{ fold, foo } vu-narrow a =>* b .",
+                "vu-narrow: expected `fold`, `vfold`, or `path`, found `foo`",
+            ),
+            (
+                "vu-narrow { filter, foo } a =>* b .",
+                "vu-narrow: expected `filter` or `delay`, found `foo`",
+            ),
+            (
+                "vu-narrow a .",
+                "vu-narrow: expected `=>1`/`=>+`/`=>*`/`=>!`, found `.`",
+            ),
+            (
+                "show foo .",
+                "show: expected `frontier states`, `most general states`, or `path`, found `foo`",
+            ),
+            (
+                "show",
+                "show: expected `frontier states`, `most general states`, or `path`, found end of input",
+            ),
+            (
+                "variant foo .",
+                "expected `unify` or `match` after `variant`, found `foo`",
+            ),
+            (
+                "search a => b .",
+                "search: expected `=>1`/`=>+`/`=>*`/`=>!`, found `.`",
+            ),
+            (
+                "smt-search a",
+                "smt-search: expected `=>1`/`=>+`/`=>*`/`=>!`, found end of input",
+            ),
+        ] {
+            assert_eq!(parse_failure(src).0, err, "{src}");
+        }
+        let (_, line, context) = parse_failure("fmod B\n  sort S .\nendfm\n");
+        assert_eq!(
+            (line, context),
+            (Some(2), Some(("module", "B".to_string())))
+        );
+    }
+
+    /// Reference H.4.1: unrecognized top-level tokens are discarded one at a time. A long run, whether one
+    /// statement or many short ones, must not take a stack frame per token.
+    #[test]
+    fn long_unrecognized_runs_are_skipped_iteratively() {
+        let module = "fmod M is sort S . op a : -> S . endfm\n";
+        let one_statement = format!("{module}junkalpha{} .\nred a .\n", " a".repeat(20_000));
+        let many_statements = format!("{module}{}red a .\n", "junkalpha a .\n".repeat(10_000));
+        for src in [one_statement, many_statements] {
+            let s = parse(&src);
+            assert_eq!(s.modules.len(), 1);
+            assert_eq!(s.commands.len(), 1, "only `red a .` survives the skip");
+        }
+    }
+
+    /// A run of source `set` directives is skipped by the same loop. Each directive is on its own line,
+    /// because a `.` before a same-line `set` is not a terminator.
+    #[test]
+    fn long_source_set_directive_runs_are_skipped_iteratively() {
+        let src = format!(
+            "fmod M is sort S . op a : -> S . endfm\n{}red a .\n",
+            "set trace off .\n".repeat(20_000)
+        );
+        let s = parse(&src);
+        assert_eq!(s.modules.len(), 1);
+        assert_eq!(s.commands.len(), 1, "only `red a .` survives the skip");
+    }
+
     #[test]
     fn parses_iter_module_and_command() {
         let src = "\
@@ -2662,6 +3011,88 @@ endfm
         assert_eq!(sp.term_hooks.len(), 2);
     }
 
+    /// In `ops`/`msgs`, a top-level parenthesized group is one operator name (its tokens without the
+    /// quoting parentheses) and every other token is one name; a punctuation token never becomes an
+    /// operator.
+    #[test]
+    fn ops_and_msgs_treat_a_parenthesized_group_as_one_name() {
+        use crate::sig::build_sig::canonical_name;
+        let src = "\
+fmod OPS is
+  sort S .
+  ops (m{X}) (n{X}) (p{X,X}) : -> S .
+  ops (_+_) (_*_) : S S -> S .
+  ops f ([_]) : S -> S .
+  ops ([_]) (:) : S -> S .
+  ops (a b) ((c)) d : -> S .
+  ops `( x `) : -> S .
+  ops (`() (`)) : -> S .
+endfm
+omod MSGS is
+  msgs (to_hi) bye (ack{X}) : Oid -> Msg .
+  msgs `) `( : Oid -> Msg .
+endom
+";
+        let mut i = Interner::new();
+        let toks = tokenize(src, &mut i);
+        let s = Parser::new(&toks, &i).parse_source().expect("parse ok");
+        let names = |m: &PreModule| -> Vec<String> {
+            m.ops
+                .iter()
+                .map(|op| canonical_name(&op.name, &i))
+                .collect()
+        };
+        // A backquoted `(`/`)` is an identifier token (TNK-LEX-001): one name, never a group
+        // delimiter, at top level or inside a group.
+        assert_eq!(
+            names(&s.modules[0]),
+            [
+                "m{X}", "n{X}", "p{X,X}", "_+_", "_*_", "f", "[_]", "[_]", ":", "a`b", "(c)", "d",
+                "(", "x", ")", "(", ")"
+            ]
+        );
+        assert_eq!(names(&s.modules[1]), ["to_hi", "bye", "ack{X}", ")", "("]);
+        assert!(s.modules[1].ops.iter().all(|op| op.attrs.message));
+        // The quoting parentheses are dropped, so raw-text consumers see the bare name.
+        let raw: Vec<&str> = s.modules[0].ops[0]
+            .name
+            .iter()
+            .map(|token| i.resolve(token.sym))
+            .collect();
+        assert_eq!(raw, ["m", "{", "X", "}"]);
+
+        // Each group names exactly what `op` declares for the same tokens.
+        for group in ["(m{X})", "(_+_)", "([_])", "(a b)", "((c))", "(:)"] {
+            let src =
+                format!("fmod G is sort S . op {group} : -> S . ops {group} : -> S . endfm\n");
+            let mut i = Interner::new();
+            let toks = tokenize(&src, &mut i);
+            let s = Parser::new(&toks, &i).parse_source().expect("parse ok");
+            let ops = &s.modules[0].ops;
+            assert_eq!(ops.len(), 2, "{group}");
+            assert_eq!(
+                canonical_name(&ops[0].name, &i),
+                canonical_name(&ops[1].name, &i),
+                "{group}"
+            );
+        }
+    }
+
+    /// An empty group or an unmatched `)` in an `ops` name list rejects the module.
+    #[test]
+    fn malformed_ops_name_groups_are_parse_errors() {
+        for (decl, expected) in [
+            ("ops a () b : -> S .", "empty parenthesized operator name"),
+            ("ops a ) ( b : -> S .", "unmatched `)`"),
+        ] {
+            let src = format!("fmod BAD is sort S . {decl} endfm\n");
+            let mut i = Interner::new();
+            let toks = tokenize(&src, &mut i);
+            let err = Parser::new(&toks, &i).parse_source().unwrap_err();
+            assert!(err.contains(expected), "{decl}: {err}");
+        }
+    }
+
     /// Import declarations preserve their mode and module expression.
     #[test]
     fn parses_imports() {
@@ -2718,6 +3149,265 @@ endfm
             }
             other => panic!("expected Sum(A, Rename(B,…)), got {other:?}"),
         }
+    }
+
+    /// `class` renaming items take structured class names, like class declarations; `msg` items take a
+    /// structured message name. A plain single-token item, including a message named `to`, is unchanged.
+    #[test]
+    fn class_and_msg_renamings_accept_structured_names() {
+        // An object module also imports CONFIGURATION; pick the renamed import.
+        let items = |src: &str| -> Vec<RenameItem> {
+            parse(src).modules[0]
+                .imports
+                .iter()
+                .find_map(|import| match &import.expr {
+                    ModuleExpr::Rename(_, items) => Some(items.clone()),
+                    _ => None,
+                })
+                .expect("a renamed import")
+        };
+        let pairs = |items: &[RenameItem]| -> Vec<(String, String, bool)> {
+            items
+                .iter()
+                .map(|item| match item {
+                    RenameItem::Sort { from, to } => (from.clone(), to.clone(), true),
+                    RenameItem::Op {
+                        from,
+                        to,
+                        dom_range: None,
+                        ..
+                    } => (from.clone(), to.clone(), false),
+                    other => panic!("unexpected item {other:?}"),
+                })
+                .collect()
+        };
+        let pair = |from: &str, to: &str, sort| (from.to_string(), to.to_string(), sort);
+
+        let structured = items(
+            "omod B{X :: T} is inc F{X} * (class Foo{X} to Bar{X}, msg m{X} to n{X}) .\nendom\n",
+        );
+        assert_eq!(
+            pairs(&structured),
+            [
+                pair("Foo{X}", "Bar{X}", true),
+                pair("Foo{X}", "Bar{X}", false),
+                pair("m{X}", "n{X}", false)
+            ]
+        );
+        let plain = items("omod B is inc F * (class Foo to Bar, msg to to tt) .\nendom\n");
+        assert_eq!(
+            pairs(&plain),
+            [
+                pair("Foo", "Bar", true),
+                pair("Foo", "Bar", false),
+                pair("to", "tt", false)
+            ]
+        );
+
+        // A profile-qualified message item stays outside the renaming grammar.
+        let mut i = Interner::new();
+        let toks = tokenize(
+            "omod B is inc F * (msg m : Oid -> Msg to n) .\nendom\n",
+            &mut i,
+        );
+        let err = Parser::new(&toks, &i).parse_source().unwrap_err();
+        assert!(err.contains("expected `to`"), "{err}");
+    }
+
+    /// The documented class qualifier `attr a . C to b` parses in renamings and view maps. Its period
+    /// precedes an ordinary word, so it is an identifier-kind `.`; the (possibly structured) class is
+    /// read and does not change the attribute map.
+    #[test]
+    fn class_qualified_attribute_maps_parse() {
+        let mut i = Interner::new();
+        let src = "\
+omod B{X :: T} is
+  inc F{X} * (attr x . C to y, attr z . Buf{X} to w, attr q to r) .
+endom
+view V from T to M is
+  attr a . C to b .
+endv
+";
+        let toks = tokenize(src, &mut i);
+        let s = Parser::new(&toks, &i).parse_source().expect("parse ok");
+        let items = s.modules[0]
+            .imports
+            .iter()
+            .find_map(|import| match &import.expr {
+                ModuleExpr::Rename(_, items) => Some(items),
+                _ => None,
+            })
+            .expect("a renamed import");
+        let maps: Vec<(&str, &str)> = items
+            .iter()
+            .map(|item| match item {
+                RenameItem::Op {
+                    from,
+                    to,
+                    dom_range: None,
+                    ..
+                } => (from.as_str(), to.as_str()),
+                other => panic!("unexpected item {other:?}"),
+            })
+            .collect();
+        assert_eq!(maps, [("x:_", "y:_"), ("z:_", "w:_"), ("q:_", "r:_")]);
+        let text = |toks: &[Token]| -> String { toks.iter().map(|t| i.resolve(t.sym)).collect() };
+        match s.views[0].op_maps.as_slice() {
+            [
+                OpMap::Op {
+                    from,
+                    to,
+                    dom_range: None,
+                },
+            ] => assert_eq!((text(from), text(to)), ("a:_".into(), "b:_".into())),
+            other => panic!("expected one attribute op map, got {other:?}"),
+        }
+    }
+
+    /// Parse `src` keeping its interner, so statement token bubbles can be spelled.
+    fn parse_with_interner(src: &str) -> (Source, Interner) {
+        let mut i = Interner::new();
+        let toks = tokenize(src, &mut i);
+        let source = Parser::new(&toks, &i).parse_source().expect("parse ok");
+        (source, i)
+    }
+
+    /// A token bubble's texts joined by spaces.
+    fn spelled(toks: &[Token], i: &Interner) -> String {
+        toks.iter()
+            .map(|t| i.resolve(t.sym))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A membership's delimiter is the colon before its target sort: the first top-level `:` followed
+    /// by a sort name and then `if` (`cmb`), or by a sort name and at most an attribute group before the
+    /// terminator (`mb`). Colons inside the subject term are term syntax. Without such a colon the first
+    /// colon splits, as before.
+    #[test]
+    fn membership_delimiter_is_the_colon_before_the_target_sort() {
+        let (source, i) = parse_with_interner(
+            "\
+fmod MB-COLON is
+  sorts S S2 T .
+  op <_:_> : S T -> S .
+  op _[_] : T S -> T .
+  ops a e : -> S .
+  op t : -> T .
+  mb < e : t > : S2 .
+  mb [m1] : < e : t [ a ] > : S2 [label m2] .
+  cmb < X:S : t > : S2 if X:S : S2 /\\ < X:S : t > = < a : t > [nonexec] .
+  mb < e : t > : Sub{A}{B} .
+  mb (< a : t >) : S2 .
+  mb < a : t > .
+endfm
+",
+        );
+        let m = &source.modules[0];
+        let parts: Vec<(String, String, Option<String>, Option<&str>)> = m
+            .statements
+            .iter()
+            .map(|statement| match statement {
+                Statement::Mb {
+                    lhs,
+                    sort,
+                    cond,
+                    label,
+                    ..
+                } => (
+                    spelled(lhs, &i),
+                    spelled(sort, &i),
+                    cond.as_deref().map(|c| spelled(c, &i)),
+                    label.as_deref(),
+                ),
+                other => panic!("expected Mb, got {other:?}"),
+            })
+            .collect();
+        let part = |lhs: &str, sort: &str, cond: Option<&str>, label: Option<&'static str>| {
+            (
+                lhs.to_string(),
+                sort.to_string(),
+                cond.map(str::to_string),
+                label,
+            )
+        };
+        assert_eq!(
+            parts,
+            [
+                part("< e : t >", "S2", None, None),
+                part("< e : t [ a ] >", "S2", None, Some("m1")),
+                part(
+                    "< X:S : t >",
+                    "S2",
+                    Some("X:S : S2 /\\ < X:S : t > = < a : t >"),
+                    None
+                ),
+                part("< e : t >", "Sub { A } { B }", None, None),
+                part("( < a : t > )", "S2", None, None),
+                part("< a", "t >", None, None),
+            ]
+        );
+        assert!(matches!(
+            &m.statements[2],
+            Statement::Mb { nonexec: true, .. }
+        ));
+    }
+
+    /// `if` is not reserved: a `ceq`/`crl` condition keyword is the first top-level `if` that no later
+    /// top-level `fi` closes, so `if_then_else_fi` may stand unparenthesized on either side or in the
+    /// condition.
+    #[test]
+    fn condition_keyword_pairs_top_level_if_with_fi() {
+        let (source, i) = parse_with_interner(
+            "\
+mod ITE is
+  sorts S Bool .
+  ops a b c : -> S .
+  ops f g h : Bool -> S .
+  ceq f(B:Bool) = if B:Bool then a else b fi if B:Bool = B:Bool .
+  ceq if B:Bool then a else b fi = c if B:Bool .
+  ceq g(B:Bool) = a if if B:Bool then true else false fi .
+  ceq h(B:Bool) = if B:Bool then a else b fi if if B:Bool then B:Bool else false fi = true .
+  crl [r] : h(B:Bool) => if B:Bool then a else b fi if B:Bool = true .
+endm
+",
+        );
+        let splits: Vec<[String; 3]> = source.modules[0]
+            .statements
+            .iter()
+            .map(|statement| match statement {
+                Statement::Eq {
+                    lhs,
+                    rhs,
+                    cond: Some(cond),
+                    ..
+                }
+                | Statement::Rule {
+                    lhs,
+                    rhs,
+                    cond: Some(cond),
+                    ..
+                } => [spelled(lhs, &i), spelled(rhs, &i), spelled(cond, &i)],
+                other => panic!("expected a conditional statement, got {other:?}"),
+            })
+            .collect();
+        let ite = "if B:Bool then a else b fi";
+        let split =
+            |lhs: &str, rhs: &str, cond: &str| [lhs.to_string(), rhs.to_string(), cond.to_string()];
+        assert_eq!(
+            splits,
+            [
+                split("f ( B:Bool )", ite, "B:Bool = B:Bool"),
+                split(ite, "c", "B:Bool"),
+                split("g ( B:Bool )", "a", "if B:Bool then true else false fi"),
+                split(
+                    "h ( B:Bool )",
+                    ite,
+                    "if B:Bool then B:Bool else false fi = true"
+                ),
+                split("h ( B:Bool )", ite, "B:Bool = true"),
+            ]
+        );
     }
 
     /// A theory (`fth`) parses into a `PreModule` flagged `is_theory` (kind Functional), with

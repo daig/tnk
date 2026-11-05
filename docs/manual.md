@@ -358,6 +358,8 @@ csd Name [ "(" TermBubble ("," TermBubble)* ")" ] ":=" Strategy "if" Condition .
 
 `pr`, `ex`, and `inc` abbreviate the three ordinary import modes. `generated-by` is accepted as a protecting-equivalent donation form; because import-mode obligations are Experimental, reflected mode-tag distinctions for this spelling are not portable. `class`/`subclass`/`msg` are object-only; `strat`/`sd`/`csd` are strategy-only. `csd` parses but is Unsupported at strategy resolution.
 
+In `ops` and `msgs`, each top-level parenthesized group is one OpName, and its pair of quoting parentheses is removed, as in `op (_+_) : S S -> S .`. Only the punctuation tokens `(` and `)` delimit a group; a backquoted `` `( `` or `` `) `` is part of an identifier (`TNK-LEX-001`). Every other token is one OpName. So `ops (m{X}) (n{X}) c : -> S .` declares the constants `m{X}`, `n{X}`, and `c`, `ops (_+_) (_*_) : S S -> S .` declares `_+_` and `_*_`, and `` ops `( `) : -> S . `` declares `(` and `)`. An empty group or an unmatched `)` in the name list is a parse error.
+
 A user sort identifier cannot contain `.`. Bracketed sort names denote kinds; structured sorts and parameter sorts such as `List{Nat}` and `X$Elt` are semantic names, not punctuation-free aliases.
 
 ### 5.3 Operator attributes
@@ -399,6 +401,14 @@ The leading `[Label] :` is optional for every statement family. For rules, the f
 
 `Condition` is a `/\`-separated conjunction of the fragments in §3.4; `\/` is not a statement-condition connective.
 
+Operator names may contain `:`, `=`, `:=`, `=>`, `if`, and `fi` as literal fragments, as in object syntax `< O : C | a : v >` and BOOL's `if_then_else_fi`. The delimiters below are therefore not simply the first token with their spelling. A token inside parentheses is never one of them.
+
+- **Membership target.** The `:` before the target sort of `mb` is the first `:` followed only by a sort name and an optional attribute group before the terminator. For `cmb`, it is the first `:` followed by a sort name and `if`. If no `:` has that shape, the first `:` is the delimiter.
+- **Condition keyword.** In `ceq` and `crl`, `if` and `fi` tokens outside parentheses, brackets, and braces pair like brackets. The condition keyword is the first `if` that no later `fi` closes. If every such `if` is closed, the keyword is the first of them.
+- **Fragment connective.** A condition fragment with a `:=`, `=>`, `=`, or `:` token is read at the first one whenever both sides build there; after a `:`, that means a sort name. Otherwise the fragment needs exactly one reading. The candidates are its later such tokens (a `:` only before a sort name) and the whole fragment as a term `b` of the kind of the loaded `true`, read as `b = true` (§3.4). A fragment with no reading is invalid, and so is an ambiguous fragment with several. If parsing a candidate exceeds the effort limit, that resource-exhaustion diagnostic (`TNK-PARSE-003`) rejects the fragment.
+
+The fragment rule also reads the `such that` conditions of `search`, `smt-search`, and the `matchrew` strategy family. Portable source parenthesizes a term that contains these tokens.
+
 **TNK-STMT-001 — Invalid statement isolation.** Under the intended statement boundary, a statement whose terms, variable discipline, print metadata, or supported condition forms are invalid is dropped with a diagnostic when the enclosing module can otherwise be built. Dropping one statement MUST NOT shift the source identity of later executable statements or corrupt reflection metadata. Appendix H.4 records current invalid-input seams that silently retain a statement or otherwise differ from this rule.
 
 ### 5.5 Views
@@ -420,7 +430,7 @@ endv
 
 **TNK-VIEW-001 — View validity.** The source must be a named theory or an instantiation rooted at one; source and target cannot be sums or renamings. Source sorts map explicitly or by identity. For an unparameterized view with a plain named target, install-time validation checks target sort existence, kind preservation, and a compatible operator or operator-to-term image for every source profile. Invalid views are not installed.
 
-Parameterized views and views with a nontrivial instantiated target receive partial install-time checks; remaining homomorphism obligations are discharged when instantiated. A partially validated stored view is not evidence that every future instantiation is valid. View variables scope only operator-to-term/message mappings.
+Parameterized views and views with a nontrivial instantiated target receive partial install-time checks; remaining homomorphism obligations are discharged when instantiated. A partially validated stored view is not evidence that every future instantiation is valid. View variables scope only operator-to-term/message mappings. An `attr` map's optional class qualifier is accepted but does not narrow the map, as in renamings (`TNK-MOD-005`).
 
 ## 6. Module expressions and composition
 
@@ -434,7 +444,7 @@ RenameItem ::= "sort"  SortName "to" SortName
              | "op"    OpName [ ":" SortName* ("->" | "~>") SortName ]
                        "to" OpName [OpAttrs]
              | "label" Name "to" Name
-             | "class" Name "to" Name
+             | "class" SortName "to" SortName
              | "attr"  Name [ "." Class ] "to" Name
              | "msg"   OpName "to" OpName
 ```
@@ -447,7 +457,7 @@ Instantiation arguments are a view name, a parameterized-view instantiation, or 
 
 **TNK-MOD-004 — Parameters.** A formal parameter copies only sorts declared by its bounding theory under `X$`; sorts donated to that theory by ordinary modules remain shared. `[pconst]` operators receive corresponding parameter names and map through views. Structured sort parameters substitute structurally (`Base{X}` to `Base{Arg}`), including chained instances. A theory-target view can deliberately leave a parameter free for a later instantiation; importing an instance that still has free parameters is an error. An apparent `X$Name` not owned by the bound theory is not rewritten merely because of its spelling.
 
-**TNK-MOD-005 — Renaming.** Sort, operator, label, class, attribute, and message renamings apply structurally. An operator profile selects an overload; without one the name map applies to every matching declaration. Optional target attributes override the renamed operator attributes. Mixfix applications, special hook references, identity/term-hook bubbles, and required sort qualification are reconstructed structurally rather than by blind text replacement. Strategy names themselves are not ordinary operator renames.
+**TNK-MOD-005 — Renaming.** Sort, operator, label, class, attribute, and message renamings apply structurally. An operator profile selects an overload; without one the name map applies to every matching declaration. An attribute item's optional `. C` class qualifier is accepted but does not narrow the map: attribute operators are shared by name across classes, so `attr a . C to b` renames attribute `a` of every class, exactly like `attr a to b`. Optional target attributes override the renamed operator attributes. Mixfix applications, special hook references, identity/term-hook bubbles, and required sort qualification are reconstructed structurally rather than by blind text replacement. Strategy names themselves are not ordinary operator renames.
 
 **TNK-MOD-006 — Atomic definition.** A successful module definition makes that module current, clears reflection state, drops the continuation, and rebuilds transitive dependents. A successful view definition leaves the current module unchanged; it rebuilds dependent modules and drops the continuation iff a module was rebuilt. A failed module/view definition preserves the prior database, built dependents, current selection, and continuation.
 
@@ -1316,12 +1326,12 @@ ModuleAtom   ::= (Name | "(" ModuleExpr ")")
 Rename       ::= "sort" SortName "to" SortName
                | "label" Name "to" Name
                | "op" OpSelector "to" OpName OpAttrs?
-               | "class" Name "to" Name
-               | "attr" Name ["." Name] "to" Name
+               | "class" SortName "to" SortName
+               | "attr" Name ["." SortName] "to" Name
                | "msg" OpName "to" OpName
 ```
 
-The matching close keyword is required. Module-kind gates are normative in `TNK-MOD-001`. `class`/`classes` use the parser's class-list surface; `msg`/`msgs` reuse operator declaration syntax but are object-only. `csd` is accepted but its conditional execution is Unsupported.
+The matching close keyword is required. Module-kind gates are normative in `TNK-MOD-001`. `op` and `msg` take one OpName. In `ops` and `msgs`, the `OpName+` list holds one OpName per top-level parenthesized group and one per remaining token (§5.2). `class`/`classes` use the parser's class-list surface; `msg`/`msgs` reuse operator declaration syntax but are object-only. `csd` is accepted but its conditional execution is Unsupported.
 
 ### D.1 Command grammar
 
