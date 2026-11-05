@@ -11,7 +11,9 @@
 #   4  tnk timed out (60s)
 #   2  usage / setup error
 #
-# Oracle:  MAUDE_LIB=$ORACLE_LIB maude -no-banner -no-advise <fixture> </dev/null
+# Oracle:  MAUDE_LIB=$ORACLE_LIB $ORACLE_BIN -no-banner -no-advise <fixture> </dev/null
+#          ORACLE_BIN defaults to a cached pinned release, else `maude` on PATH, else a verified
+#          download of the pinned release (resolution order and knobs: tools/oracle.sh).
 # tnk:     target/release/tnk-repl
 #   Fixtures without `*** PRELUDE` run with `-no-prelude`; marked fixtures use the standing prelude,
 #   matching the oracle environment.
@@ -35,17 +37,10 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # `prelude.maude` resolves from the Maude install while `load smt` etc. hit the bundled copies.
 TNK_SHARE_LIB=${TNK_SHARE_LIB:-$ROOT/share/maude-gpl:$ROOT/share/tnk}
 ORACLE_LIB=${ORACLE_LIB:-}
-if [ -z "$ORACLE_LIB" ] && [ -n "${MAUDE_LIB:-}" ]; then
-  IFS=: read -r -a maude_lib_dirs <<< "$MAUDE_LIB"
-  for dir in "${maude_lib_dirs[@]}"; do
-    if [ -n "$dir" ] && [ -f "$dir/prelude.maude" ]; then
-      ORACLE_LIB=$dir
-      break
-    fi
-  done
-fi
-ORACLE_BIN=${ORACLE_BIN:-maude}
+ORACLE_BIN=${ORACLE_BIN:-}
 ORACLE_VERSION=${ORACLE_VERSION:-3.5.1}
+# Oracle lookup, pinned-release fetch, and portable timeout: see tools/oracle.sh.
+. "$ROOT/tools/oracle.sh"
 TNK_BIN=${TNK_BIN:-$ROOT/target/release/tnk-repl}
 TIMEOUT_SECS=${TIMEOUT_SECS:-60}
 
@@ -62,8 +57,9 @@ if [ ! -x "$TNK_BIN" ]; then
   echo "error: tnk binary not found at $TNK_BIN (cargo build --release first)" >&2
   exit 2
 fi
+resolve_oracle || exit 2
 if [ -z "$ORACLE_LIB" ] || [ ! -f "$ORACLE_LIB/prelude.maude" ]; then
-  echo "error: set ORACLE_LIB, or include a directory containing prelude.maude in MAUDE_LIB" >&2
+  echo "error: no prelude.maude for the oracle; set ORACLE_LIB, or include its directory in MAUDE_LIB" >&2
   exit 2
 fi
 IFS= read -r oracle_version < <("$ORACLE_BIN" --version 2>/dev/null)
@@ -139,7 +135,7 @@ normalize() {
 # modules from scratch, so the comparison must begin without a standing prelude.
 oracle_flags=()
 [ "${BOTH_NO_PRELUDE:-0}" = "1" ] && oracle_flags+=(-no-prelude)
-( cd "$fixdir" && MAUDE_LIB="$ORACLE_LIB" timeout "$TIMEOUT_SECS" \
+( cd "$fixdir" && MAUDE_LIB="$ORACLE_LIB" run_with_timeout "$TIMEOUT_SECS" \
     "$ORACLE_BIN" -no-banner -no-advise ${oracle_flags[@]+"${oracle_flags[@]}"} "$fixture" </dev/null ) \
     >"$tmpdir/oracle.raw" 2>&1
 rc=$?
@@ -160,7 +156,7 @@ elif [ "${TNK_ASSUME_PRELUDE:-0}" != "1" ] && ! grep -q '^\*\*\* PRELUDE' "$fixt
   # TNK_ASSUME_PRELUDE=1 supports fixture sets that omit the marker.
   tnk_flags+=(-no-prelude)
 fi
-( cd "$fixdir" && MAUDE_LIB="$TNK_SHARE_LIB:$ORACLE_LIB" timeout "$TIMEOUT_SECS" \
+( cd "$fixdir" && MAUDE_LIB="$TNK_SHARE_LIB:$ORACLE_LIB" run_with_timeout "$TIMEOUT_SECS" \
     "$TNK_BIN" -no-banner ${tnk_flags[@]+"${tnk_flags[@]}"} "$fixture" </dev/null ) \
     >"$tmpdir/tnk.raw" 2>&1
 rc=$?
