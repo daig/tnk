@@ -734,7 +734,7 @@ fn premodule_of(d: &FlatDecls) -> PreModule {
 }
 
 /// Whether `name` is a single-token op name (a constant or prefix operator — no holes).
-fn is_single_token(name: &str, interner: &mut Interner) -> bool {
+pub(crate) fn is_single_token(name: &str, interner: &mut Interner) -> bool {
     let frags = split_mixfix(name, interner);
     frags.len() == 1 && matches!(frags[0], Frag::Tok(_))
 }

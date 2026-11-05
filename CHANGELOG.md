@@ -158,6 +158,12 @@ All notable user-visible changes are documented here. This project follows Seman
 
 - A sort renaming now renames the sorts inside kind spellings: in operator and strategy declarations (`[P]`, `[P,Q]`), in variables declared at a kind, and in on-the-fly variables such as `W:[P]` in statements. A renamed module whose source spelled a renamed sort inside a kind used to be rejected (``unknown sort `P` in kind `[P]` ``) or to drop the statements over `W:[P]` (`dropped equation: no parse`). When the old sort name still existed, for example through the implicit BOOL import beside `sort Bool to Boolean`, the kept spelling silently named that sort's kind instead, so EXT-BOOL renamed this way lost its `and-then` and `or-else` equations. A formal parameter's theory copy is such a renaming, so a parameterized module over a theory with an operator or variable at `[Elt]` is no longer rejected, and the copy keeps a theory equation over `W:[Elt]`.
 
+- A parameter constant (`[pconst]`) that a view does not map now maps by identity (`X$c` to `c`), like any other unmapped source operator. The instance used to keep `X$c`, so the statements that mention it were dropped (`no parse at token … (X$c)`). A parenthesized declaration `op (c) : … [pconst]` is now the parameter constant `X$c`; its parameter copy used to be named `X$(c)`.
+
+- Passing an enclosing parameter `p` as an instantiation argument (`inc BAR{Y}` inside `BAR2{Y :: T}`) now re-qualifies the parameter constants as well as the parameter sorts (`X$c` to `p$c`). The instance's statements that mention `X$c` used to be dropped, and an identity attribute that mentions it rejected the module (`bad identity term`).
+
+- A structured operator name declared by a parameter theory (`op c{X} : -> Elt`) now keeps its spelling when the parameter is instantiated. Instantiation used to respell it like a parameterized constant of the instantiated module (`c{Y}`, `c{V}`), so the statements that mention it were dropped. Structured constants that the instantiated module declares itself (`d{X}`) are still instantiated.
+
 ### Documentation
 
 - §5.2 now states that the components of a kind spelling `[A,B,...]` must be sorts of one kind, and Appendix H.4.1 records that operator and variable declarations resolve only the first component. `TNK-MOD-005` states that a sort renaming, and a formal parameter's theory copy, rewrite each component of a kind spelling.

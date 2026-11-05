@@ -1337,4 +1337,154 @@ mod tests {
             &[e("D", "tw(d2, d1)", 1)],
         );
     }
+
+    /// A parameter constant that the view leaves unmapped maps by identity (`P$e` to `e`), also after a
+    /// mixfix map has reconstructed the statement. A quoted constant `(e)` is the parameter constant
+    /// `Q$e` in the parameter copy and in the instance. These equations used to be dropped (`no parse at
+    /// token … (P$e)`). An explicit map of a quoted ordinary theory operator `(c)` still applies.
+    #[test]
+    fn unmapped_parameter_constant_maps_by_identity() {
+        assert_program_results(
+            "fth PT is sort S . op e : -> S [pconst] . op _+_ : S S -> S . endfth\n\
+             fmod USEP{P :: PT} is\n\
+               op w : P$S -> P$S .\n\
+               eq w(P$e) = P$e + P$e .\n\
+             endfm\n\
+             fmod TGT is sort T . ops e k : -> T . op _*_ : T T -> T . endfm\n\
+             view VI from PT to TGT is sort S to T . op _+_ to _*_ . endv\n\
+             fmod INST-I is inc USEP{VI} . endfm\n\
+             red w(e) .\n\
+             red w(k) .\n\
+             fth QT is sort S . op (e) : -> S [pconst] . endfth\n\
+             fmod USEQ{Q :: QT} is op v : Q$S -> Q$S . eq v(Q$e) = Q$e . endfm\n\
+             red v(Q$e) .\n\
+             view VQ from QT to TGT is sort S to T . endv\n\
+             fmod INST-Q is inc USEQ{VQ} . endfm\n\
+             red v(e) .\n\
+             fth QC is sort Elt . op (c) : -> Elt . op k : Elt -> Elt . endfth\n\
+             fmod MQC{X :: QC} is op f : X$Elt -> X$Elt . eq f(c) = k(c) . endfm\n\
+             fmod TQC is sort N . ops d e : -> N . op g : N -> N . endfm\n\
+             view VQC from QC to TQC is sort Elt to N . op c to d . op k to g . endv\n\
+             fmod USEQC is inc MQC{VQC} . endfm\n\
+             red f(d) .\n",
+            &[
+                e("T", "e * e", 1),
+                e("T", "w(k)", 0),
+                e("Q$S", "Q$e", 1),
+                e("T", "e", 1),
+                e("N", "g(d)", 1),
+            ],
+        );
+    }
+
+    /// Passing an enclosing parameter re-qualifies the parameter constants like the parameter sorts
+    /// (`X$a` to `Y$a`): for an enclosing theory that includes the bound theory, for crosswise parameters,
+    /// in an identity attribute, and in the target instance `M{W}` of a parameterized view. A constant the
+    /// module declares itself (`X$d`) keeps its name. The statements used to be dropped (`no parse at
+    /// token … (X$a)`) and the identity rejected the module. Grounding the enclosing module still maps the
+    /// constant through the view.
+    #[test]
+    fn by_parameter_instantiation_requalifies_parameter_constants() {
+        assert_program_results(
+            "fth T is sort Foo . op a : -> Foo [pconst] . endfth\n\
+             fmod BAR{X :: T} is\n\
+               op X$d : -> X$Foo .\n\
+               op f : X$Foo -> X$Foo .\n\
+               eq f(X$a) = X$d .\n\
+             endfm\n\
+             fmod BAR2{Y :: T} is\n\
+               inc BAR{Y} .\n\
+               op g : Y$Foo -> Y$Foo .\n\
+               eq g(Y$a) = f(Y$a) .\n\
+             endfm\n\
+             red g(Y$a) .\n\
+             fmod BAZ is sort Baz . op z : -> Baz . endfm\n\
+             view VB from T to BAZ is sort Foo to Baz . op a to z . endv\n\
+             fmod GROUND is inc BAR2{VB} . endfm\n\
+             red g(z) .\n\
+             fth T3 is inc T . op extra : -> Foo . endfth\n\
+             fmod BAR3{Z :: T3} is inc BAR{Z} . endfm\n\
+             red f(Z$a) .\n\
+             fmod PAIR{X1 :: T, X2 :: T} is\n\
+               op p : X1$Foo X2$Foo -> X1$Foo .\n\
+               eq p(X1$a, X2$a) = X1$a .\n\
+             endfm\n\
+             fmod CROSS{A :: T, B :: T} is inc PAIR{B, A} . endfm\n\
+             red p(B$a, A$a) .\n\
+             fmod MON{X :: T} is\n\
+               op _+_ : X$Foo X$Foo -> X$Foo [assoc id: X$a] .\n\
+               op q : X$Foo -> X$Foo .\n\
+               var E : X$Foo .\n\
+               eq q(E) = E + X$a .\n\
+             endfm\n\
+             fmod MON2{W :: T} is inc MON{W} . op w : -> W$Foo . endfm\n\
+             red q(w) .\n\
+             fth T2 is sort Bar . endfth\n\
+             fmod M{X :: T} is\n\
+               sort Baz{X} .\n\
+               op h : X$Foo -> X$Foo .\n\
+               op k : X$Foo -> X$Foo .\n\
+               eq h(X$a) = k(X$a) .\n\
+             endfm\n\
+             view V{Y :: T} from T2 to M{Y} is sort Bar to Baz{Y} . endv\n\
+             fmod M2{Z :: T2} is op n : Z$Bar -> Z$Bar . endfm\n\
+             fmod TEST{W :: T} is inc M2{V{W}} . endfm\n\
+             red h(W$a) .\n",
+            &[
+                e("Y$Foo", "X$d", 2),
+                e("Baz", "X$d", 2),
+                e("Z$Foo", "X$d", 1),
+                e("B$Foo", "B$a", 1),
+                e("W$Foo", "w", 1),
+                e("W$Foo", "k(W$a)", 1),
+            ],
+        );
+    }
+
+    /// A structured operator name that the parameter theory declares (`c{X}`) names that theory operator,
+    /// so instantiation keeps it, by parameter and under a view's identity map, while a structured
+    /// constant the module declares itself is still instantiated (`d{X}` to `d{Y}`, `d{VI}`, `d{VA}`, also
+    /// when a view's image is spelled `d{X}`). The statements used to respell the theory operator (`c{Y}`,
+    /// `c{VI}`) and were dropped.
+    #[test]
+    fn theory_structured_operator_keeps_its_name() {
+        assert_program_results(
+            "fth T is sort Elt . op c{X} : -> Elt . endfth\n\
+             fmod FOO{X :: T} is\n\
+               sort Box{X} .\n\
+               op d{X} : -> Box{X} .\n\
+               op f : X$Elt -> X$Elt .\n\
+               op g : X$Elt -> X$Elt .\n\
+               op m : Box{X} -> X$Elt .\n\
+               eq f(c{X}) = g(c{X}) .\n\
+               eq m(d{X}) = c{X} .\n\
+             endfm\n\
+             fmod BAR{Y :: T} is inc FOO{Y} . endfm\n\
+             red f(c{X}) .\n\
+             red m(d{Y}) .\n\
+             fmod TGT is sort N . op c{X} : -> N . endfm\n\
+             view VI from T to TGT is sort Elt to N . endv\n\
+             fmod USEI is inc FOO{VI} . endfm\n\
+             red f(c{X}) .\n\
+             red m(d{VI}) .\n\
+             fth TA is sort Elt . op a : -> Elt . endfth\n\
+             fmod OWN{X :: TA} is\n\
+               sort Box{X} .\n\
+               op d{X} : -> Box{X} .\n\
+               op m : Box{X} -> X$Elt .\n\
+               eq m(d{X}) = a .\n\
+             endfm\n\
+             fmod TD is sort N2 . op d{X} : -> N2 . endfm\n\
+             view VA from TA to TD is sort Elt to N2 . op a to d{X} . endv\n\
+             fmod USEA is inc OWN{VA} . endfm\n\
+             red m(d{VA}) .\n",
+            &[
+                e("Y$Elt", "g(c{X})", 1),
+                e("Y$Elt", "c{X}", 1),
+                e("N", "g(c{X})", 1),
+                e("N", "c{X}", 1),
+                e("N2", "d{X}", 1),
+            ],
+        );
+    }
 }

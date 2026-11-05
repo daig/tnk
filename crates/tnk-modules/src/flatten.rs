@@ -11,6 +11,7 @@ use tnk_frontend::lex::{Interner, Token, tokenize};
 use tnk_frontend::rename_terms::{
     ProfileSorts, ReconTarget, ViewOpMap, ViewOpSubst, rewrite_op_hook_signature,
 };
+use tnk_frontend::sig::build_sig::canonical_name;
 use tnk_frontend::surface::ast::{
     Attrs, ModuleExpr, ModuleKind, OpDecl, OpMap, PreModule, RenameItem, Statement, StratExpr,
     VarDecl, ViewDecl,
@@ -18,7 +19,7 @@ use tnk_frontend::surface::ast::{
 use tnk_frontend::surface::sort_spelling::{kind_components, map_sort_spelling};
 
 use crate::db::ModuleDb;
-use crate::rename::{apply_renaming, rename_bubble_tokens};
+use crate::rename::{apply_renaming, is_single_token, rename_bubble_tokens};
 use crate::view::ViewDb;
 
 /// The renamable declaration bundle of a (sub-)module expression — everything a renaming `* (…)` rewrites.
@@ -943,12 +944,13 @@ fn add_parameter_copy(
         })
         .collect();
     // A parameter constant `op c : … [pconst]` is prefixed like a parameter sort: `c ↦ X$c` (the body
-    // refers to it as `X$c`, and instantiation maps `X$c` through the view's op map for `c`).
+    // refers to it as `X$c`, and instantiation maps `X$c` through the view's op map for `c`). The
+    // declaration is matched by its written tokens; the copy is named after the canonical name, which
+    // is the name instantiation keys `X$c` by ([`TheoryOps::pconsts`]).
     for op in &decls.ops {
-        if op.attrs.pconst {
-            let name: String = op.name.iter().map(|t| interner.resolve(t.sym)).collect();
+        if let Some(name) = pconst_name(op, interner) {
             items.push(RenameItem::Op {
-                from: name.clone(),
+                from: op.name.iter().map(|t| interner.resolve(t.sym)).collect(),
                 to: format!("{param}${name}"),
                 dom_range: None,
                 attrs: Attrs::default(),
@@ -992,28 +994,50 @@ fn theory_param_sorts(
         .collect())
 }
 
-/// The canonical names of a theory's **parameter constants** (`op c : … [pconst]`) — the constants a
-/// parameterized module refers to as `X$c` and that instantiation maps through the view's op map for `c`.
-fn theory_pconst_ops(
+/// The canonical name ([`canonical_name`], so a quoted `(c)` is `c`) of a **parameter constant**
+/// declaration `op c : … [pconst]`: the `c` of the parameter copy's `X$c`.
+fn pconst_name(op: &OpDecl, interner: &Interner) -> Option<String> {
+    op.attrs.pconst.then(|| canonical_name(&op.name, interner))
+}
+
+/// The operator names of a parameter theory's flattened closure that instantiation treats by name,
+/// spelled canonically.
+#[derive(Default)]
+struct TheoryOps {
+    /// The **parameter constants** ([`pconst_name`]): a parameterized module refers to `c` as `X$c`
+    /// ([`add_parameter_copy`]), and instantiation maps `X$c` to the argument's image of `c`.
+    pconsts: HashSet<String>,
+    /// The structured (brace-named) operator names, such as `c{X}`. They name operators of the theory
+    /// itself, not parameterized constants of the module being instantiated, so instantiation keeps their
+    /// spelling (a theory's `c{X}` stays `c{X}` when its parameter is bound to `V`).
+    structured: HashSet<String>,
+}
+
+/// Collect the [`TheoryOps`] of `theory`.
+fn theory_ops(
     theory: &str,
     db: &ModuleDb,
     views: &ViewDb,
     interner: &mut Interner,
-) -> Result<HashSet<String>, String> {
+) -> Result<TheoryOps, String> {
     let mut tmp = Acc::default();
     let mut tmp_visited = HashSet::new();
     collect_named(theory, db, views, &mut tmp, &mut tmp_visited, interner)?;
-    Ok(tmp
-        .into_decls()
-        .ops
-        .iter()
-        .filter(|op| op.attrs.pconst)
-        .map(|op| op.name.iter().map(|t| interner.resolve(t.sym)).collect())
-        .collect())
+    let mut ops = TheoryOps::default();
+    for op in &tmp.into_decls().ops {
+        let name = canonical_name(&op.name, interner);
+        if op.attrs.pconst {
+            ops.pconsts.insert(name.clone());
+        }
+        if name.contains('{') {
+            ops.structured.insert(name);
+        }
+    }
+    Ok(ops)
 }
 
 /// The canonical names of every operator in a theory's flattened signature, spelled as
-/// [`theory_pconst_ops`] spells them.
+/// [`theory_ops`] spells them.
 fn theory_op_names(
     theory: &str,
     db: &ModuleDb,
@@ -1343,9 +1367,9 @@ fn subst_brace_args(name: &str, map: &HashMap<&str, String>) -> String {
 /// `{…}` in a chain `M{A}{B}`, outermost last), against the enclosing parameter `scope`. Each parameter's
 /// arguments across the chain are *composed* ([`resolve_arg`] per level): a module-view (kind 3) imports its
 /// target and binds the parameter to its sort image, a by-parameter argument (kind 2) prefix-renames
-/// `X$s ↦ p$s`, and a theory-view (kind 1) leaves the parameter free for the next level to bind — so a
-/// chain `BOX{ToT2}{C2}` composes the theory-view `ToT2` with the module-view `C2` into one binding
-/// (`X$Elt ↦ Hue`, `Box{X} ↦ Box{ToT2}{C2}`). A chain ending in an enclosing parameter, `BOX{ToT2}{p}`,
+/// `X$s ↦ p$s` (and `X$c ↦ p$c`), and a theory-view (kind 1) leaves the parameter free for the next level
+/// to bind — so a chain `BOX{ToT2}{C2}` composes the theory-view `ToT2` with the module-view `C2` into one
+/// binding (`X$Elt ↦ Hue`, `Box{X} ↦ Box{ToT2}{C2}`). A chain ending in an enclosing parameter, `BOX{ToT2}{p}`,
 /// keeps the retyped parameter under `p`, so `ToT2`'s sort and operator images take the names of `p`'s
 /// copy of `T2` ([`ParamCopyNames`]); the levels' operator maps are merged, not composed, so a longer
 /// chain gets those names only while no view after its first maps operators. `mname`'s imports are
@@ -1400,7 +1424,7 @@ fn instantiate(
         // grammar contains the parameter copy, where genuine theory sorts are named `X$s`; module-origin
         // sorts retain their names.
         let theory_sorts = theory_param_sorts(&param.theory, db, views, interner)?;
-        let pconst_ops = theory_pconst_ops(&param.theory, db, views, interner)?;
+        let theory_ops = theory_ops(&param.theory, db, views, interner)?;
         // A chain ending in an enclosing parameter `p` (`M{TV}{p}`) keeps the parameter under `p`'s copy of
         // the theory view's target, so the view's images take that copy's names.
         let copy = ParamCopyNames::of_chain(&resolutions, db, views, interner)?;
@@ -1410,14 +1434,14 @@ fn instantiate(
                     Some(copy) => copy.rename_tokens(val, &[], interner),
                     None => val.clone(),
                 };
-                if pconst_ops.contains(k) {
+                if theory_ops.pconsts.contains(k) {
                     op_subst.insert(format!("{}${}", param.name, k), val);
                 } else {
                     op_subst.insert(k.clone(), val);
                 }
             }
             for mut map in r.op_recon.iter().cloned() {
-                if pconst_ops.contains(&map.source) {
+                if theory_ops.pconsts.contains(&map.source) {
                     map.source = format!("{}${}", param.name, map.source);
                 }
                 if let Some((domain, range)) = &mut map.dom_range {
@@ -1454,7 +1478,7 @@ fn instantiate(
                 if mapped || name.contains('_') || tokenize(&name, interner).len() != 1 {
                     continue;
                 }
-                let key = if pconst_ops.contains(&name) {
+                let key = if theory_ops.pconsts.contains(&name) {
                     format!("{}${name}", param.name)
                 } else {
                     name.clone()
@@ -1464,6 +1488,29 @@ fn instantiate(
                     let image = tokenize(&image, interner);
                     op_subst.insert(key, image);
                 }
+            }
+        }
+        // A single-level argument also images every parameter constant its view does not map by
+        // name: an unmapped `c` maps by identity like any unmapped source operator (`X$c ↦ c`), and an
+        // enclosing parameter `p` re-qualifies it like a parameter sort (`X$c ↦ p$c`). A constant that a
+        // signature-qualified map selects is left to that reconstruction map. A chain (`M{TV}{X}`) gets no
+        // such image here, because its image would have to compose the levels.
+        if let [only] = resolutions.as_slice() {
+            for c in &theory_ops.pconsts {
+                let key = format!("{}${c}", param.name);
+                let image = if only.binding.by_param {
+                    format!("{}${c}", only.binding.final_name)
+                } else {
+                    c.clone()
+                };
+                if image == key
+                    || op_subst.contains_key(&key)
+                    || only.op_recon.iter().any(|map| map.source == *c)
+                    || !is_single_token(c, interner)
+                {
+                    continue;
+                }
+                op_subst.insert(key, tokenize(&image, interner));
             }
         }
         // Compose the sort image: each source sort threaded through every level's map in order.
@@ -1496,6 +1543,7 @@ fn instantiate(
                 by_param: last.binding.by_param,
                 final_param_sorts: copy.map(|copy| copy.sorts.into_keys().collect()),
                 theory_sorts: Some(theory_sorts),
+                structured_ops: theory_ops.structured,
             },
         );
         // For re-instantiating `mname`'s imports that mention the parameter, the last level's argument is
@@ -1725,6 +1773,11 @@ struct ParamBinding {
     /// `None` disables the gate for nested-view bindings because their view-map target sorts cannot be
     /// fake parameter sorts.
     theory_sorts: Option<HashSet<String>>,
+    /// The parameter theory's structured operator names ([`TheoryOps::structured`]). [`subst_bubble`]
+    /// keeps such a name (`c{X}` declared by the theory) instead of instantiating its brace arguments,
+    /// which would name a nonexistent `c{V}`; a structured name the instantiated module declares itself is
+    /// still instantiated (`d{X}` to `d{V}`).
+    structured_ops: HashSet<String>,
 }
 
 /// The names of an enclosing parameter's copy of a theory, for a chain `M{TV}{p}` whose last level passes
@@ -1736,7 +1789,7 @@ struct ParamBinding {
 struct ParamCopyNames {
     /// `s ↦ p$s` for each genuine sort of `T` ([`theory_param_sorts`]).
     sorts: HashMap<String, String>,
-    /// `c ↦ p$c` for each parameter constant of `T` ([`theory_pconst_ops`]).
+    /// `c ↦ p$c` for each parameter constant of `T` ([`theory_ops`]).
     pconsts: HashMap<String, String>,
 }
 
@@ -1787,7 +1840,7 @@ impl ParamCopyNames {
         };
         Ok(Some(Self {
             sorts: qualify(theory_param_sorts(theory, db, views, interner)?),
-            pconsts: qualify(theory_pconst_ops(theory, db, views, interner)?),
+            pconsts: qualify(theory_ops(theory, db, views, interner)?.pconsts),
         }))
     }
 
@@ -1861,7 +1914,7 @@ fn resolve_arg(
     scope: &[String],
 ) -> Result<ArgResolution, String> {
     // By-parameter: the argument is an enclosing parameter `p`. The instance keeps a parameter, renamed to
-    // `p` (`X$s ↦ p$s`, `Base{X} ↦ Base{p}`); nothing is imported.
+    // `p` (`X$s ↦ p$s`, `X$c ↦ p$c`, `Base{X} ↦ Base{p}`); nothing is imported.
     if let ModuleExpr::Named(p) = arg
         && scope.iter().any(|n| n == p)
     {
@@ -1873,6 +1926,7 @@ fn resolve_arg(
                 by_param: true,
                 final_param_sorts: None,
                 theory_sorts: None,
+                structured_ops: HashSet::new(),
             },
             target: None,
             op_subst: HashMap::new(),
@@ -1898,6 +1952,7 @@ fn resolve_arg(
                     by_param: false,
                     final_param_sorts: None,
                     theory_sorts: None,
+                    structured_ops: HashSet::new(),
                 },
                 target: Some(v.to.clone()),
                 op_subst,
@@ -1947,6 +2002,7 @@ fn resolve_arg(
                     by_param: false,
                     final_param_sorts: None,
                     theory_sorts: None,
+                    structured_ops: HashSet::new(),
                 },
                 target: Some(target),
                 op_subst,
@@ -2397,7 +2453,8 @@ fn inst_sort_bubble(
 /// `name:sort` has its sort instantiated (`E:X$Elt ↦ E:Box{ToColor}`). Each rewritten variable stays one
 /// token, so it re-parses as an on-the-fly variable of the instance sort; a `name:sort` whose sort is
 /// unaffected by the instantiation is left untouched (so an operator coincidentally containing a colon is
-/// safe).
+/// safe). A structured name has its brace arguments instantiated (`d{X} ↦ d{V}`) unless a bound
+/// parameter's theory declares it ([`ParamBinding::structured_ops`]).
 fn subst_bubble(
     bubble: &[Token],
     bindings: &HashMap<String, ParamBinding>,
@@ -2471,6 +2528,16 @@ fn subst_bubble(
                         break;
                     }
                 }
+            }
+            // An operator of a bound parameter's theory is named by its own spelling (a theory's `c{X}`
+            // is not a parameterized constant of this module), so its braces are not instantiated.
+            if bindings
+                .values()
+                .any(|binding| binding.structured_ops.contains(&name))
+            {
+                out.extend_from_slice(&bubble[idx..end]);
+                idx = end;
+                continue;
             }
             let mapped = inst_sort(&name, bindings);
             if mapped != name {
