@@ -1949,6 +1949,215 @@ fn renamed_and_view_mapped_rule_and_strategy_conditions() {
     );
 }
 
+/// An object pattern may leave its attribute set empty (`< O : C | >`). View maps and renamings rebuild
+/// such a rule from its source parse, which completes the empty set with `none` as the statement loader
+/// does: a message-to-term view map, a profile-qualified renaming, and a mixfix message renaming with a
+/// compound argument all keep the rule (each was dropped as `no parse`, so the `rew` did nothing).
+#[test]
+fn empty_attribute_set_rules_survive_view_maps_and_renamings() {
+    let out = repl()
+        .eval(
+            "oth PING is\n\
+               sort Load .\n\
+               msg ping : Oid Load -> Msg .\n\
+             endoth\n\
+             omod SERVER{X :: PING} is\n\
+               class Srv .\n\
+               op ack : Oid -> Msg [ctor] .\n\
+               var S : Oid .\n\
+               var L : X$Load .\n\
+               rl ping(S, L) < S : Srv | > => ack(S) .\n\
+             endom\n\
+             omod NET is\n\
+               sorts Packet Bytes .\n\
+               op wrap : Bytes -> Packet [ctor] .\n\
+               msg send : Oid Packet -> Msg .\n\
+               op host : -> Oid [ctor] .\n\
+               op b : -> Bytes [ctor] .\n\
+             endom\n\
+             view Wire from PING to NET is\n\
+               sort Load to Bytes .\n\
+               var O : Oid .\n\
+               var D : Load .\n\
+               msg ping(O, D) to term send(O, wrap(D)) .\n\
+             endv\n\
+             omod APP is\n\
+               inc SERVER{Wire} .\n\
+             endom\n\
+             rew send(host, wrap(b)) < host : Srv | > .\n\
+             omod ECHO is\n\
+               class Srv .\n\
+               sort Data .\n\
+               op d : -> Data [ctor] .\n\
+               op f : Data -> Data [ctor] .\n\
+               op host : -> Oid [ctor] .\n\
+               op done : -> Msg [ctor] .\n\
+               msg ping : Data Oid -> Msg .\n\
+               msg ping : Oid -> Msg .\n\
+               msg _from_ : Data Oid -> Msg .\n\
+               rl ping(X:Data, O:Oid) < O:Oid : Srv | > => done .\n\
+               rl (f(X:Data) from O:Oid) < O:Oid : Srv | > => done .\n\
+             endom\n\
+             omod ECHO-PROFILE is\n\
+               inc ECHO * (op ping : Data Oid -> Msg to pong) .\n\
+             endom\n\
+             rew pong(d, host) < host : Srv | > .\n\
+             omod ECHO-MIXFIX is\n\
+               inc ECHO * (msg _from_ to _via_) .\n\
+             endom\n\
+             rew (f(d) via host) < host : Srv | > .\n",
+        )
+        .output;
+    assert!(!out.contains("dropped rule"), "every rule is kept: {out}");
+    let results: Vec<&str> = out
+        .lines()
+        .filter(|line| line.starts_with("result "))
+        .collect();
+    assert_eq!(
+        results,
+        [
+            "result Msg: ack(host)",
+            "result Msg: done",
+            "result Msg: done"
+        ],
+        "{out}"
+    );
+    assert_eq!(out.matches("rewrites: 1\n").count(), 3, "{out}");
+}
+
+/// A sort renaming renames the sorts inside kind spellings: operator profiles (`[P]`, `[P,Q]`), a
+/// variable declared at `[P]`, and an on-the-fly `W:[P]` in a statement. A formal parameter's theory copy
+/// is such a renaming (`Elt` to `X$Elt`), so a theory operator at `[Elt]` and a theory equation over
+/// `W:[Elt]` are copied too, and the parameterized module and its instance build. Previously the renamed
+/// and parameterized modules were rejected (`unknown sort P in kind [P]`) or lost the equation.
+#[test]
+fn sort_renaming_and_parameter_copies_follow_kind_spellings() {
+    let out = repl()
+        .eval(
+            "fmod KIND-SRC is\n\
+               sorts P Q .\n\
+               subsort P < Q .\n\
+               op p : -> P .\n\
+               op g : [P] -> [P] .\n\
+               op h : [P,Q] -> [Q] .\n\
+               ops k1 k2 : Q -> Q .\n\
+               var V : [P] .\n\
+               eq k1(V) = V .\n\
+               eq k2(W:[P]) = W:[P] .\n\
+             endfm\n\
+             fmod KIND-REN-P is\n\
+               inc KIND-SRC * (sort P to PX) .\n\
+             endfm\n\
+             red g(p) .\n\
+             red k1(p) .\n\
+             red k2(p) .\n\
+             fmod KIND-REN-Q is\n\
+               inc KIND-SRC * (sort Q to QX) .\n\
+             endfm\n\
+             red h(p) .\n\
+             fth KIND-TH is\n\
+               sort Elt .\n\
+               op c : -> Elt .\n\
+               op f : [Elt] -> [Elt] .\n\
+               op e : Elt -> Elt .\n\
+               eq e(W:[Elt]) = W:[Elt] .\n\
+             endfth\n\
+             fmod KIND-PAR{X :: KIND-TH} is\n\
+               op twice : X$Elt -> [X$Elt] .\n\
+               var Y : X$Elt .\n\
+               eq twice(Y) = f(f(Y)) .\n\
+             endfm\n\
+             red in KIND-PAR : e(c) .\n\
+             fmod KIND-NUM is\n\
+               sort N .\n\
+               op n : -> N .\n\
+               op dbl : [N] -> [N] .\n\
+               op same : N -> N .\n\
+             endfm\n\
+             view KIND-V from KIND-TH to KIND-NUM is\n\
+               sort Elt to N .\n\
+               op c to n .\n\
+               op f to dbl .\n\
+               op e to same .\n\
+             endv\n\
+             fmod KIND-USE is\n\
+               inc KIND-PAR{KIND-V} .\n\
+             endfm\n\
+             red twice(n) .\n",
+        )
+        .output;
+    assert!(
+        !out.contains("error") && !out.contains("warning"),
+        "every module builds with its statements: {out}"
+    );
+    let results: Vec<&str> = out
+        .lines()
+        .filter(|line| line.starts_with("reduce in ") || line.starts_with("result "))
+        .collect();
+    assert_eq!(
+        results,
+        [
+            "reduce in KIND-REN-P : g(p) .",
+            "result [Q]: g(p)",
+            "reduce in KIND-REN-P : k1(p) .",
+            "result PX: p",
+            "reduce in KIND-REN-P : k2(p) .",
+            "result PX: p",
+            "reduce in KIND-REN-Q : h(p) .",
+            "result [QX]: h(p)",
+            "reduce in KIND-PAR : e(c) .",
+            "result X$Elt: c",
+            "reduce in KIND-USE : twice(n) .",
+            "result [N]: dbl(dbl(n))",
+        ],
+        "{out}"
+    );
+}
+
+/// A stale kind spelling is silently wrong when its old sort name still exists. With the implicit BOOL
+/// import, a module importing a copy renamed `sort Bool to Boolean` also has the unrenamed `Bool`, so a
+/// kept `[Bool]` resolved to the implicit BOOL's kind: `g : [Bool] -> S` did not accept a `Boolean`, and
+/// EXT-BOOL's equations over `var B : [Bool]` (copied as `B:[Bool]`) were dropped, leaving `and-then`
+/// and `or-else` unreduced. The renamed kinds are now `[Boolean]`.
+#[test]
+fn sort_renaming_renames_kinds_beside_the_implicit_bool() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-set.maude"));
+    let out = r
+        .eval(
+            "set include BOOL on .\n\
+             fmod KIND-BOOL is\n\
+               sort S .\n\
+               op g : [Bool] -> S .\n\
+             endfm\n\
+             fmod KIND-BOOLEAN is\n\
+               inc KIND-BOOL * (sort Bool to Boolean) .\n\
+             endfm\n\
+             red g((true).Boolean) .\n\
+             fmod EXT-BOOLEAN is\n\
+               inc EXT-BOOL * (sort Bool to Boolean) .\n\
+             endfm\n\
+             red (true).Boolean and-then (false).Boolean .\n\
+             red (false).Boolean or-else (true).Boolean .\n",
+        )
+        .output;
+    assert!(!out.contains("[Bool]"), "no stale kind remains: {out}");
+    let results: Vec<&str> = out
+        .lines()
+        .filter(|line| line.starts_with("result "))
+        .collect();
+    assert_eq!(
+        results,
+        [
+            "result S: g(true)",
+            "result Boolean: (false).Boolean",
+            "result Boolean: (true).Boolean",
+        ],
+        "{out}"
+    );
+    assert_eq!(out.matches("rewrites: 1\n").count(), 2, "{out}");
+}
+
 /// A parameter theory that imports a module — the module-declared sort `Bool` is kept (not
 /// renamed to `X$Bool`), so the parameterized module builds and the instance reduces.
 #[test]

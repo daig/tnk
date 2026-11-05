@@ -15,7 +15,9 @@ use crate::cfparser::{ParseEffort, earley, forest};
 use crate::grammar::build::build_grammar;
 use crate::grammar::{Action, GSym, Nt};
 use crate::lex::{Frag, Interner, TokKind, Token, split_mixfix};
-use crate::load::{ConditionPiece, condition_pieces};
+use crate::load::{
+    ConditionPiece, condition_pieces, fill_empty_object_attributes, install_identities,
+};
 use crate::sig::build_sig::{build_module, canonical_name, resolve_sort};
 use crate::sig::syntax::BuiltModule;
 use crate::surface::ast::PreModule;
@@ -36,7 +38,14 @@ pub struct OpRenamer {
     targets: RenameTargets,
 }
 
-fn build_syntax_module(pm: &PreModule, interner: &mut Interner) -> Result<BuiltModule, String> {
+/// Build the signature and grammar that source bubbles are parsed against. Identity terms are installed
+/// as in a loaded module, so a bubble that omits an object's attribute set (`< O : C | >`) is completed
+/// with the attribute-set identity before parsing, exactly as the statement loader completes it
+/// ([`fill_empty_object_attributes`]).
+fn build_syntax_module(
+    pm: &PreModule,
+    interner: &mut Interner,
+) -> Result<(BuiltModule, CompiledGrammar), String> {
     let mut syntax = pm.clone();
     for operator in &mut syntax.ops {
         let is_host = operator
@@ -51,7 +60,13 @@ fn build_syntax_module(pm: &PreModule, interner: &mut Interner) -> Result<BuiltM
             operator.attrs.special = None;
         }
     }
-    build_module(&syntax, interner)
+    let mut built = build_module(&syntax, interner)?;
+    let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
+    // Identities serve only that completion here. A bad identity term is diagnosed by the build of the
+    // module that is executed; here it leaves the remaining slots reserved, which name no identity
+    // constant, so a bubble that needs one is not completed.
+    let _ = install_identities(&mut built, &grammar, interner);
+    Ok((built, grammar))
 }
 
 impl OpRenamer {
@@ -74,8 +89,7 @@ impl OpRenamer {
                 .or_default()
                 .push((*arity, literal_frags(to, interner)));
         }
-        let built = build_syntax_module(pm, interner)?;
-        let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
+        let (built, grammar) = build_syntax_module(pm, interner)?;
         Ok(Some(Self {
             built,
             grammar,
@@ -85,17 +99,19 @@ impl OpRenamer {
 
     /// Rewrite one term bubble into a fresh token vector, replacing each renamed operator's literal
     /// fragments. A bubble that does not parse as a term is returned unchanged because operator identity
-    /// is undefined there.
+    /// is undefined there. An omitted object attribute set is completed before parsing, as the statement
+    /// loader completes it, and an edited bubble keeps that explicit identity.
     pub fn rewrite(&self, bubble: &[Token], interner: &mut Interner) -> Vec<Token> {
         if bubble.is_empty() {
             return bubble.to_vec();
         }
-        let tree = match parse_term(bubble, &self.grammar, interner) {
+        let tokens = fill_empty_object_attributes(bubble, &self.built, interner);
+        let tree = match parse_term(&tokens, &self.grammar, interner) {
             Ok(t) => t,
             Err(_) => return bubble.to_vec(),
         };
         let mut edits: Vec<(usize, String)> = Vec::new();
-        self.collect(&tree, bubble, interner, &mut edits);
+        self.collect(&tree, &tokens, interner, &mut edits);
         if edits.is_empty() {
             return bubble.to_vec();
         }
@@ -103,7 +119,8 @@ impl OpRenamer {
             .iter()
             .map(|(pos, text)| (*pos, interner.intern(text)))
             .collect();
-        let mut out = bubble.to_vec();
+        // The edit positions index the completed tokens.
+        let mut out = tokens.into_owned();
         for (pos, sym) in new_syms {
             out[pos].sym = sym;
         }
@@ -381,8 +398,7 @@ impl ViewOpSubst {
         if maps.is_empty() {
             return Ok(None);
         }
-        let built = build_syntax_module(pm, interner)?;
-        let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
+        let (built, grammar) = build_syntax_module(pm, interner)?;
         let resolve = |sort: &String| {
             let resolved = match profile_sorts {
                 ProfileSorts::SortsAndKinds if kind_components(sort).is_some() => {
@@ -513,29 +529,34 @@ impl ViewOpSubst {
     /// `op _,_ to _;_` it would turn the comma of `insert(E, S)` into an application. An ambiguous bubble
     /// is reconstructed only when its two extracted readings give the same tokens; otherwise it is
     /// returned unchanged.
+    ///
+    /// The parse sees the tokens the statement loader parses: an omitted object attribute set
+    /// (`< O : C | >`) is first completed with the attribute-set identity. A reconstruction keeps that
+    /// explicit identity (`< O : C | none >`), which denotes the same term; a bubble in which no mapped
+    /// operator occurs keeps its own tokens.
     pub fn rewrite_checked(&self, bubble: &[Token], interner: &mut Interner) -> (Vec<Token>, bool) {
         if bubble.is_empty() {
             return (Vec::new(), false);
         }
-        let parsed = match parse_forest(bubble, &self.grammar, interner) {
+        let tokens = fill_empty_object_attributes(bubble, &self.built, interner);
+        let parsed = match parse_forest(&tokens, &self.grammar, interner) {
             Ok(parsed) => parsed,
             Err(_) => return (self.rewrite_lexical(bubble, interner), false),
         };
-        let rewritten = self.emit(&parsed.tree, bubble, interner);
-        if !parsed.ambiguous {
-            return (rewritten, true);
-        }
-        let reading_independent = parsed.alternative.is_some_and(|alternative| {
-            let other = self.emit(&alternative, bubble, interner);
-            other
-                .iter()
-                .map(|t| t.sym)
-                .eq(rewritten.iter().map(|t| t.sym))
-        });
-        if reading_independent {
-            (rewritten, true)
-        } else {
+        let same_tokens = |left: &[Token], right: &[Token]| {
+            left.iter().map(|t| t.sym).eq(right.iter().map(|t| t.sym))
+        };
+        let rewritten = self.emit(&parsed.tree, &tokens, interner);
+        let reading_independent = !parsed.ambiguous
+            || parsed.alternative.is_some_and(|alternative| {
+                same_tokens(&self.emit(&alternative, &tokens, interner), &rewritten)
+            });
+        if !reading_independent {
             (bubble.to_vec(), false)
+        } else if same_tokens(&rewritten, &tokens) {
+            (bubble.to_vec(), true)
+        } else {
+            (rewritten, true)
         }
     }
 
@@ -1093,5 +1114,53 @@ mod tests {
             .err()
             .expect("kind profile rejected");
         assert!(err.contains("unknown source sort `[B,A]`"), "got: {err}");
+    }
+
+    /// An object pattern may omit its attribute set (`< O : c | >`). The source parse completes it with
+    /// the attribute-set identity, as the statement loader does, so such a bubble is a term and its mapped
+    /// operators are rebuilt; the output keeps the explicit `none`, while a bubble without a mapped
+    /// operator keeps its own tokens. The arity-keyed renamer edits tokens in place, so its edit after
+    /// the completed position must index the completed tokens.
+    #[test]
+    fn empty_attribute_set_is_completed_before_the_source_parse() {
+        let mut i = Interner::new();
+        let pm = source_module(
+            "mod OBJ-SRC is sorts Oid Cid Attribute AttributeSet Object Msg Configuration . \
+             subsort Attribute < AttributeSet . subsorts Object Msg < Configuration . \
+             op none : -> AttributeSet [ctor] . \
+             op _,_ : AttributeSet AttributeSet -> AttributeSet [ctor assoc comm id: none] . \
+             op <_:_|_> : Oid Cid AttributeSet -> Object [ctor object] . \
+             op __ : Configuration Configuration -> Configuration [ctor assoc comm] . \
+             op c : -> Cid [ctor] . op m : Oid -> Msg [ctor] . var O : Oid . endm",
+            &mut i,
+        );
+        let view = ViewOpSubst::new(
+            &pm,
+            &[op_map("m", "_!")],
+            ProfileSorts::SortsAndKinds,
+            &mut i,
+        )
+        .expect("build")
+        .expect("mapper");
+        assert_eq!(
+            substituted(&view, "m(O) < O : c | >", &mut i),
+            ("( ( O ) ! ) < O : c | none >".into(), true)
+        );
+        assert_eq!(
+            substituted(&view, "< O : c | >", &mut i),
+            ("< O : c | >".into(), true)
+        );
+
+        let renamer = OpRenamer::new(&pm, &[("m".into(), Some(1), "n".into())], &mut i)
+            .expect("build")
+            .expect("renamer");
+        let bubble = tokenize("< O : c | > m(O)", &mut i);
+        let text = renamer
+            .rewrite(&bubble, &mut i)
+            .iter()
+            .map(|t| i.resolve(t.sym))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(text, "< O : c | none > n ( O )");
     }
 }

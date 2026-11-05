@@ -1,7 +1,8 @@
 //! Apply a renaming `* (sort A to B, op f to g)` to a flattened declaration bundle.
 //!
 //! Sort renaming substitutes the sort name everywhere it can appear: the `sorts`/`subsorts` lists, op
-//! domains/ranges, variable sorts, and (as a token) inside statement bubbles. Op renaming replaces the
+//! domains/ranges, variable sorts, strategy declaration sorts, and (as a token) inside statement bubbles,
+//! including each component of a kind spelling (`[P,Q]`, `W:[P]`). Op renaming replaces the
 //! name of each matching op declaration. Term bubbles (statement sides, identities, term hooks, strategy
 //! terms) are rewritten *grammar-aware*, because operator identity is not textual — an operator comma and
 //! an argument separator are the same token (`delete(E, (E, S))`, `if E in S' then E, A else A fi`): build
@@ -19,6 +20,7 @@ use tnk_frontend::rename_terms::{
     OpRenamer, ProfileSorts, ReconTarget, ViewOpMap, ViewOpSubst, rewrite_op_hook_signature_by,
 };
 use tnk_frontend::surface::ast::{Attrs, ModuleKind, PreModule, RenameItem, Statement, StratExpr};
+use tnk_frontend::surface::sort_spelling::map_sort_spelling;
 
 use crate::flatten::FlatDecls;
 
@@ -119,8 +121,8 @@ pub fn apply_renaming(
         let orig_domain = op.domain.clone();
         let orig_range = op.range.clone();
         rename_each(&mut op.domain, &sort_map);
-        if let Some(t) = sort_map.get(&op.range) {
-            op.range = t.clone();
+        if let Some(t) = rename_sort_spelling(&op.range, &sort_map) {
+            op.range = t;
         }
         let canon: String = op.name.iter().map(|t| interner.resolve(t.sym)).collect();
         // Find the rename spec for this declaration. A signature-qualified spec selects the overload family
@@ -196,8 +198,8 @@ pub fn apply_renaming(
         }
     }
     for v in &mut d.vars {
-        if let Some(t) = sort_map.get(&v.sort) {
-            v.sort = t.clone();
+        if let Some(t) = rename_sort_spelling(&v.sort, &sort_map) {
+            v.sort = t;
         }
     }
 
@@ -333,8 +335,8 @@ pub fn apply_renaming(
     let rename_identity = format!("{items:?}");
     for decl in &mut d.strat_decls {
         rename_each(&mut decl.domain, &sort_map);
-        if let Some(to) = sort_map.get(&decl.subject) {
-            decl.subject = to.clone();
+        if let Some(to) = rename_sort_spelling(&decl.subject, &sort_map) {
+            decl.subject = to;
         }
         decl.home = None;
         if let Some(origin) = &mut decl.origin {
@@ -764,11 +766,20 @@ pub(crate) fn rename_bubble_tokens(
     subst_tokens(bubble, op_map, interner);
 }
 
-/// Replace each string in `xs` that is a key of `map` with its mapped value.
+/// The image of one sort spelling under the sort renames `map`: the spelling's own entry if it has one,
+/// otherwise, for a kind spelling, the kind with each renamed component replaced (`[P,Q]` becomes
+/// `[PX,Q]` under `sort P to PX`). `None` when nothing is renamed.
+fn rename_sort_spelling(name: &str, map: &HashMap<String, String>) -> Option<String> {
+    map.get(name)
+        .cloned()
+        .or_else(|| map_sort_spelling(name, |component| map.get(component).cloned()))
+}
+
+/// Rename each sort spelling in `xs` ([`rename_sort_spelling`]).
 fn rename_each(xs: &mut [String], map: &HashMap<String, String>) {
     for x in xs {
-        if let Some(t) = map.get(x) {
-            *x = t.clone();
+        if let Some(t) = rename_sort_spelling(x, map) {
+            *x = t;
         }
     }
 }
@@ -845,12 +856,12 @@ fn subst_sort_tokens(
 
     let mut index = 0;
     while index < bubble.len() {
-        // The lexer keeps an on-the-fly variable with a structured sort as one identifier token
-        // (`L:List{Nat}`), while `tokenize("List{Nat}")` below necessarily yields several tokens.
-        // Handle that exact suffix before the token-sequence matcher.
+        // The lexer keeps an on-the-fly variable with a structured sort or a kind as one identifier token
+        // (`L:List{Nat}`, `W:[P,Q]`), while `tokenize("List{Nat}")` below necessarily yields several
+        // tokens. Handle that suffix before the token-sequence matcher, renaming each component of a kind.
         if let Some((name, sort)) = interner.resolve(bubble[index].sym).rsplit_once(':')
             && !name.is_empty()
-            && let Some(target) = map.get(sort)
+            && let Some(target) = rename_sort_spelling(sort, map)
         {
             bubble[index].sym = interner.intern(&format!("{name}:{target}"));
             index += 1;
@@ -952,6 +963,90 @@ mod tests {
         )
         .expect("rename");
         assert_eq!(renamed.sorts, ["Item"]);
+    }
+
+    /// A sort renaming renames each component of a kind spelling: operator profiles, variable and
+    /// strategy-declaration sorts, and the kind of a glued on-the-fly variable (`W:[P]`) in a statement
+    /// or a strategy-definition parameter. A component that is not renamed stays (`[Q,PX]`).
+    #[test]
+    fn sort_rename_follows_kind_spellings() {
+        let mut i = Interner::new();
+        let tokens = tokenize(
+            "smod KR is\n sorts P Q .\n subsort P < Q .\n op p : -> P .\n \
+             op g : [P] -> [P] .\n op h : [P,Q] -> [Q] .\n op k : Q -> Q .\n var V : [P] .\n \
+             rl [r] : p => p .\n eq k(W:[P]) = W:[Q,P] .\n \
+             strat st : [P] @ [Q,P] .\n sd st(X:[P]) := r .\nendsm",
+            &mut i,
+        );
+        let pm = Parser::new(&tokens, &i)
+            .parse_source()
+            .expect("parse")
+            .modules
+            .remove(0);
+        let d = FlatDecls {
+            object_statements: vec![pm.is_object; pm.statements.len()],
+            sorts: pm.sorts,
+            subsorts: pm.subsorts,
+            ops: pm.ops,
+            vars: pm.vars,
+            statements: pm.statements,
+            strat_decls: pm.strat_decls,
+            strat_defs: pm.strat_defs,
+        };
+        let renamed = apply_renaming(
+            d,
+            &[RenameItem::Sort {
+                from: "P".into(),
+                to: "PX".into(),
+            }],
+            &mut i,
+        )
+        .expect("rename");
+        let profiles: Vec<(String, Vec<String>, String)> = renamed
+            .ops
+            .iter()
+            .map(|op| {
+                let name = op.name.iter().map(|t| i.resolve(t.sym)).collect();
+                (name, op.domain.clone(), op.range.clone())
+            })
+            .collect();
+        let profile = |name: &str, domain: &[&str], range: &str| {
+            let domain = domain.iter().map(|sort| sort.to_string()).collect();
+            (name.to_string(), domain, range.to_string())
+        };
+        assert_eq!(
+            profiles,
+            [
+                profile("p", &[], "PX"),
+                profile("g", &["[PX]"], "[PX]"),
+                profile("h", &["[PX,Q]"], "[Q]"),
+                profile("k", &["Q"], "Q"),
+            ]
+        );
+        assert_eq!(renamed.vars[0].sort, "[PX]");
+        let decl = &renamed.strat_decls[0];
+        assert_eq!(decl.domain, ["[PX]"]);
+        assert_eq!(decl.subject, "[Q,PX]");
+        let text = |tokens: &[Token]| {
+            tokens
+                .iter()
+                .map(|t| i.resolve(t.sym))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let (lhs, rhs) = renamed
+            .statements
+            .iter()
+            .find_map(|statement| match statement {
+                Statement::Eq { lhs, rhs, .. } => Some((lhs, rhs)),
+                _ => None,
+            })
+            .expect("equation");
+        assert_eq!(
+            (text(lhs), text(rhs)),
+            ("k ( W:[PX] )".into(), "W:[Q,PX]".into())
+        );
+        assert_eq!(text(&renamed.strat_defs[0].params[0]), "X:[PX]");
     }
 
     #[test]

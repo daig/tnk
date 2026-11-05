@@ -1243,8 +1243,11 @@ impl Signature {
         self.identities.get(id).sort
     }
 
+    /// The constant symbol of a constant identity. `None` when the identity term is not a constant, and
+    /// also when its slot is still only reserved: a signature built only for parsing (the source grammar
+    /// of a renaming or view map) may leave a slot reserved, and a reserved slot names no constant yet.
     pub(crate) fn identity_constant(&self, id: IdentityId) -> Option<SymbolId> {
-        match self.identity_term(id) {
+        match self.identities.get(id).term.as_ref()? {
             Term::Op { symbol, args } if args.is_empty() => Some(*symbol),
             _ => None,
         }
@@ -5849,6 +5852,7 @@ pub struct OoInfo {
     /// `Atts` is created at this sort.
     pub attr_set_sort: SortId,
     /// The AttributeSet identity (`none`), if `_,_` was declared with one — the empty attribute set.
+    /// `None` also while that identity's term is not installed.
     pub none_sym: Option<SymbolId>,
     /// The class-identifier sort `Cid` — the object constructor's 2nd argument sort.
     pub cid_sort: SortId,
@@ -10345,6 +10349,36 @@ mod tests {
         assert_eq!(e.sig.identity_constant(u.identity().unwrap()), Some(empty));
         assert_eq!(e.symbol(plus).theory(), Theory::Free, "a plain op is free");
         assert_eq!(e.symbol(empty).theory(), Theory::Free, "a constant is free");
+    }
+
+    /// A reserved identity slot whose term is not installed names no constant, so `oo_info` over such a
+    /// signature (the source grammar of a renaming builds one) reports no empty attribute set instead
+    /// of panicking. Installing the term makes it the `none` constant.
+    #[test]
+    fn reserved_identity_has_no_constant_until_installed() {
+        let mut e = Engine::new();
+        let oid = e.add_sort("Oid");
+        let cid = e.add_sort("Cid");
+        let attrs = e.add_sort("AttributeSet");
+        let object = e.add_sort("Object");
+        e.close_sorts();
+        let none = e.add_op("none", vec![], attrs);
+        let join = e.add_op_ac("_,_", vec![attrs, attrs], attrs, None);
+        let ctor = e.add_op("<_:_|_>", vec![oid, cid, attrs], object);
+        e.set_oo_flags(ctor, false, true, false, false);
+        e.reserve_identity(join, attrs);
+
+        let identity = e.symbol(join).identity().expect("reserved identity");
+        assert_eq!(e.sig.identity_constant(identity), None);
+        let info = e.oo_info().expect("object constructor in scope");
+        assert_eq!(info.attr_set_sym, join);
+        assert_eq!(info.none_sym, None, "a reserved slot names no constant");
+
+        e.set_identity_term(join, Term::constant(none));
+        assert_eq!(
+            e.oo_info().expect("object constructor").none_sym,
+            Some(none)
+        );
     }
 
     #[test]

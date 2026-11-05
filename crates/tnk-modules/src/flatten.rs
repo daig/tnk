@@ -74,8 +74,17 @@ impl DonationScopes {
                             scope
                                 .iter()
                                 .map(|(name, sort)| {
-                                    let sort = sort_map.get(sort.as_str()).copied().unwrap_or(sort);
-                                    (name.clone(), sort.to_string())
+                                    // Kind spellings rename component-wise, as the renaming itself does.
+                                    let renamed = sort_map
+                                        .get(sort.as_str())
+                                        .map(|to| to.to_string())
+                                        .or_else(|| {
+                                            map_sort_spelling(sort, |component| {
+                                                sort_map.get(component).map(|to| to.to_string())
+                                            })
+                                        })
+                                        .unwrap_or_else(|| sort.clone());
+                                    (name.clone(), renamed)
                                 })
                                 .collect(),
                         )
@@ -2751,6 +2760,46 @@ fmod TOP is protecting L . protecting R . endfm
         assert!(
             flat.params.is_empty(),
             "no formal parameters remain after flattening"
+        );
+    }
+
+    /// The parameter copy renames a theory sort inside kind spellings too: an operator and a variable
+    /// declared at `[Elt]` are copied at `[X$Elt]`, and a theory equation's on-the-fly variable `W:[Elt]`
+    /// becomes `W:[X$Elt]`, so the copy declares no stale `Elt` kind and keeps the equation.
+    #[test]
+    fn parameter_copy_renames_theory_sorts_inside_kinds() {
+        let (db, views, mut i) = db_of(
+            "fth KT is\n sort Elt .\n op f : [Elt] -> [Elt] .\n op e : Elt -> Elt .\n \
+             var Z : [Elt] .\n eq e(W:[Elt]) = W:[Elt] .\nendfth\n\
+             fmod KP{X :: KT} is endfm\n",
+        );
+        let flat = flatten("KP", &db, &views, &mut i).expect("flatten");
+        let f = flat
+            .ops
+            .iter()
+            .find(|op| i.resolve(op.name[0].sym) == "f")
+            .expect("copied f");
+        assert_eq!(f.domain, ["[X$Elt]"]);
+        assert_eq!(f.range, "[X$Elt]");
+        let z = flat
+            .vars
+            .iter()
+            .find(|v| v.names.iter().any(|name| name == "Z"))
+            .expect("copied Z");
+        assert_eq!(z.sort, "[X$Elt]");
+        let text = |tokens: &[Token]| {
+            tokens
+                .iter()
+                .map(|t| i.resolve(t.sym))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let [Statement::Eq { lhs, rhs, .. }] = flat.statements.as_slice() else {
+            panic!("one copied equation: {} statements", flat.statements.len());
+        };
+        assert_eq!(
+            (text(lhs), text(rhs)),
+            ("e ( W:[X$Elt] )".into(), "W:[X$Elt]".into())
         );
     }
 

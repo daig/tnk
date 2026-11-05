@@ -334,7 +334,7 @@ pub fn try_build_loaded_module_homed_traced_with_host_functions<'m>(
     ))
 }
 
-fn install_identities(
+pub(crate) fn install_identities(
     built: &mut BuiltModule,
     grammar: &CompiledGrammar,
     interner: &Interner,
@@ -2012,7 +2012,7 @@ fn parse_forest_any_with_effort(
 /// Object syntax permits an omitted third argument (`< O : C | >`), denoting the empty `AttributeSet`.
 /// The mixfix grammar treats `<_:_|_>` as an ordinary three-hole operator, so this function materializes
 /// the identity token before parsing. The common non-object path remains borrowed and allocates no token copy.
-fn fill_empty_object_attributes<'a>(
+pub(crate) fn fill_empty_object_attributes<'a>(
     tokens: &'a [Token],
     m: &BuiltModule,
     i: &Interner,
