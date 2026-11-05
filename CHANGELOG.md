@@ -13,6 +13,8 @@ All notable user-visible changes are documented here. This project follows Seman
 
 - Scoped callback DAG wrappers and callback-lifetime `HostSymbol` capabilities prevent raw engine-handle escape, captured or cross-engine callback construction, reentrant reduction, and unsafe collection. Host bindings are sealed before semantic execution; missing capabilities and incompatible eager schedules, overloads, sorts, theories, or supporting hooks reject module construction.
 
+- Cyclic subsort declarations, including self-loops and cycles formed only through imports, are now rejected with an ordinary `error:` module diagnostic instead of panicking (the CLI previously exited with status `101`). The invalid module is not installed and the Session continues. `Sorts::subsort_cycle` and `Engine::subsort_cycle` expose the check to low-level callers.
+
 ### Documentation
 
 - Documented the public reducer API, source attachment grammar, purity/trust boundary, fault policy, supported typed adapters, feature status, and end-to-end configured Session workflow.

@@ -76,6 +76,61 @@ impl Sorts {
         self.down[sup.index()].push(sub);
     }
 
+    /// Find a cycle in the declared subsort edges, which would make [`close`](Self::close) panic.
+    /// Returns a witness path `[s0, s1, ..., s0]` with each `s_i < s_{i+1}` declared; a self-loop
+    /// `A < A` yields `[A, A]`. The search visits sorts and edges in declaration order, so the witness
+    /// is deterministic. Callable before `close`; frontends use it to reject an invalid signature
+    /// with a diagnostic instead of reaching the closure's panic.
+    pub fn subsort_cycle(&self) -> Option<Vec<SortId>> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mark {
+            Unvisited,
+            OnPath,
+            Done,
+        }
+        let n = self.up.len();
+        let mut mark = vec![Mark::Unvisited; n];
+        // Iterative DFS: each frame is (sort, index of the next supersort edge to follow).
+        let mut path: Vec<(usize, usize)> = Vec::new();
+        for root in 0..n {
+            if mark[root] != Mark::Unvisited {
+                continue;
+            }
+            mark[root] = Mark::OnPath;
+            path.push((root, 0));
+            while let Some(frame) = path.last_mut() {
+                let (s, next) = *frame;
+                let Some(&sup) = self.up[s].get(next) else {
+                    mark[s] = Mark::Done;
+                    path.pop();
+                    continue;
+                };
+                frame.1 += 1;
+                let t = sup.index();
+                match mark[t] {
+                    Mark::Done => {}
+                    Mark::Unvisited => {
+                        mark[t] = Mark::OnPath;
+                        path.push((t, 0));
+                    }
+                    Mark::OnPath => {
+                        let start = path
+                            .iter()
+                            .position(|&(x, _)| x == t)
+                            .expect("an on-path sort is on the DFS path");
+                        let mut cycle: Vec<SortId> = path[start..]
+                            .iter()
+                            .map(|&(x, _)| Id::from_raw(x as u32))
+                            .collect();
+                        cycle.push(sup);
+                        return Some(cycle);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn sort(&self, s: SortId) -> &Sort {
         &self.sorts[s.index()]
     }
@@ -485,6 +540,38 @@ mod tests {
         let k = s.kind(s.kind_of(solo));
         assert_eq!(k.index_order, vec![k.error, solo]);
         assert_eq!(s.component_index(solo), 1);
+    }
+
+    #[test]
+    fn subsort_cycle_witness() {
+        let mut s = Sorts::new();
+        let a = s.add_sort("A");
+        let b = s.add_sort("B");
+        let c = s.add_sort("C");
+        let d = s.add_sort("D");
+        s.add_subsort(d, a);
+        s.add_subsort(a, b);
+        s.add_subsort(b, c);
+        assert_eq!(s.subsort_cycle(), None);
+        s.add_subsort(c, a);
+        assert_eq!(s.subsort_cycle(), Some(vec![a, b, c, a]));
+
+        let mut s = Sorts::new();
+        let x = s.add_sort("X");
+        s.add_subsort(x, x);
+        assert_eq!(s.subsort_cycle(), Some(vec![x, x]));
+
+        // A diamond is acyclic even though `Bot` reaches `Top` twice.
+        let mut s = Sorts::new();
+        let bot = s.add_sort("Bot");
+        let l = s.add_sort("L");
+        let r = s.add_sort("R");
+        let top = s.add_sort("Top");
+        s.add_subsort(bot, l);
+        s.add_subsort(bot, r);
+        s.add_subsort(l, top);
+        s.add_subsort(r, top);
+        assert_eq!(s.subsort_cycle(), None);
     }
 
     #[test]

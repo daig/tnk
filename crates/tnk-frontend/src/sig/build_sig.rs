@@ -259,6 +259,17 @@ pub(crate) fn build_module_with_host_functions(
             }
         }
     }
+    // TNK-SORT-001: a subsort cycle invalidates the signature. The PreModule here is already
+    // flattened, so this also catches cycles formed only across imports. Rejecting before closure
+    // keeps the module definition atomic (nothing is installed) and avoids the closure's panic.
+    if let Some(cycle) = engine.subsort_cycle() {
+        let path = cycle
+            .iter()
+            .map(|&s| engine.sorts().name(s))
+            .collect::<Vec<_>>()
+            .join(" < ");
+        return Err(format!("subsort declarations form a cycle: `{path}`"));
+    }
     engine.close_sorts();
 
     let mut ops: HashMap<(String, usize), SymbolId> = HashMap::new();

@@ -116,3 +116,47 @@ fn missing_optional_prelude_warns_and_exits_successfully() {
         "warning: prelude.maude not found (set MAUDE_LIB or use -no-prelude); continuing without\n"
     );
 }
+
+#[test]
+fn cli_reports_subsort_cycle_without_panicking() {
+    let mut child = command()
+        .args(["-no-banner", "-no-prelude"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn tnk-repl");
+
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(
+            b"fmod CYCLIC is\n\
+                sorts A B C .\n\
+                subsort A < B .\n\
+                subsort B < C .\n\
+                subsort C < A .\n\
+              endfm\n\
+              fmod AFTER is\n\
+                sort D .\n\
+                op d : -> D .\n\
+              endfm\n\
+              reduce d .\n",
+        )
+        .expect("write source to tnk-repl");
+
+    let output = child.wait_with_output().expect("wait for tnk-repl");
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(
+        stdout.starts_with("error: module `CYCLIC`"),
+        "unexpected output: {stdout:?}"
+    );
+    assert!(
+        stdout.ends_with("reduce in AFTER : d .\nrewrites: 0\nresult D: d\n"),
+        "unexpected output: {stdout:?}"
+    );
+}

@@ -133,3 +133,76 @@ fn parser_effort_limit_reports_once_and_session_recovers() {
         recovered.output
     );
 }
+
+/// TNK-SORT-001: a subsort cycle invalidates the signature. Each cyclic definition is rejected with
+/// an ordinary `error:` diagnostic (no panic), is not installed, and later input still runs.
+#[test]
+fn cyclic_subsorts_are_rejected_atomically_and_session_recovers() {
+    let mut session = Session::new();
+    let entered = session.eval(
+        "fmod CYCLE-BASE is
+           sorts A B .
+           subsort A < B .
+           op a : -> A [ctor] .
+         endfm",
+        false,
+    );
+    assert!(!entered.exit, "{}", entered.output);
+    assert_eq!(session.current(), Some("CYCLE-BASE"));
+
+    let cases = [
+        // Direct self-loop.
+        ("CYCLE-SELF", "sort S . subsort S < S ."),
+        // Two-sort cycle in one declaration chain.
+        ("CYCLE-CHAIN", "sorts S T . subsorts S < T < S ."),
+        // Longer cycle across separate declarations.
+        (
+            "CYCLE-LONG",
+            "sorts P Q R . subsort P < Q . subsort Q < R . subsort R < P .",
+        ),
+        // Cycle that only appears after flattening the import of CYCLE-BASE (A < B).
+        ("CYCLE-IMPORT", "including CYCLE-BASE . subsort B < A ."),
+    ];
+    for (name, body) in cases {
+        let out = session.eval(&format!("fmod {name} is {body} endfm"), false);
+        assert!(!out.exit, "{}", out.output);
+        assert!(
+            out.output.starts_with("error:") && out.output.contains(name),
+            "{name}: expected a declaration diagnostic, got {:?}",
+            out.output
+        );
+        assert!(out.output.contains("cycle"), "{}", out.output);
+        assert_eq!(session.current(), Some("CYCLE-BASE"), "{name} was selected");
+
+        let shown = session.eval(&format!("show module {name} ."), false);
+        assert!(
+            shown.output.contains("no such module"),
+            "{name} was installed: {}",
+            shown.output
+        );
+    }
+
+    // A rejected redefinition leaves the prior definition in place.
+    let redefined = session.eval(
+        "fmod CYCLE-BASE is sorts A B . subsort A < B . subsort B < A . op a : -> A . endfm",
+        false,
+    );
+    assert!(
+        redefined.output.starts_with("error:"),
+        "{}",
+        redefined.output
+    );
+    let base = session.eval("reduce in CYCLE-BASE : a .", false);
+    assert!(base.output.contains("result A: a"), "{}", base.output);
+
+    // The Session keeps working for new valid modules in the same and later submissions.
+    let later = session.eval(
+        "fmod CYCLE-BAD is sorts X Y . subsort X < Y . subsort Y < X . endfm
+         fmod CYCLE-AFTER is sort D . op d : -> D . endfm
+         reduce d .",
+        false,
+    );
+    assert!(later.output.starts_with("error:"), "{}", later.output);
+    assert!(later.output.contains("result D: d"), "{}", later.output);
+    assert_eq!(session.current(), Some("CYCLE-AFTER"));
+}

@@ -5930,7 +5930,15 @@ impl Engine {
     pub fn add_subsort(&mut self, sub: SortId, sup: SortId) {
         self.sig.add_subsort(sub, sup);
     }
+    /// A declared subsort cycle, if any, as a witness path `[s0, ..., s0]` (see
+    /// [`Sorts::subsort_cycle`]). [`close_sorts`](Self::close_sorts) requires an acyclic order;
+    /// callers handling untrusted input check this first and reject the signature.
+    pub fn subsort_cycle(&self) -> Option<Vec<SortId>> {
+        self.sig.sorts().subsort_cycle()
+    }
     /// Finish the sort poset (compute kinds + subsort closure). Call before building DAG nodes.
+    /// Panics if the declared subsorts contain a cycle; check [`subsort_cycle`](Self::subsort_cycle)
+    /// first when the declarations come from user input.
     pub fn close_sorts(&mut self) {
         self.sig.close_sorts();
     }

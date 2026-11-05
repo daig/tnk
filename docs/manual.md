@@ -100,6 +100,8 @@ A TNK signature contains named sorts and a strict declared subsort relation. Its
 
 **TNK-SORT-001 — Partial order.** Distinct user sorts MUST NOT be mutually reachable through subsort declarations. A subsort cycle invalidates the signature. Reflexivity and transitivity are implicit; users do not declare them.
 
+A cycle is checked on the flattened signature, so it is detected whether it lies within one module's own declarations (including a self-loop such as `subsort A < A`) or forms only through imports. It is a declaration-category failure (H.3): `Session::eval` reports an `error:` diagnostic naming the module, and the definition is not installed; any prior definition of that name, the current module, and later input in the same submission are unaffected.
+
 **TNK-SORT-002 — Kinds.** The undirected connected components of the subsort graph are kinds. Each kind has one synthesized error/top sort, written by the printer as a bracketed list of the component's maximal user sorts, for example `[Nat]` or `[Nat,Bool]`. Every user sort is below its kind error sort. Error sorts are not below user sorts.
 
 A term has a **least sort**. If no operator declaration applies to the argument sorts, the application has the result kind's error sort rather than becoming an untyped node.
@@ -1629,7 +1631,6 @@ Here, **silent** means that `Session::eval` adds no diagnostic text for the name
 | unknown token after a recognized first attribute in an equation/rule bracket group | silent for the unknown token | the token is consumed, recognized attributes still apply, and the statement remains installed if its terms build |
 | unknown token in a membership attribute group | silent for the unknown token | the token is consumed and the membership remains installed if its term and target sort build |
 | conditional rule carrying `[narrowing]` | `warning:` naming a dropped rule | the entire rule is omitted; the enclosing module and later valid statements are retained |
-| cyclic subsort declarations | Rust panic text is written by the panic hook, not returned as an `Eval` diagnostic | sort closure panics; under the default CLI build the process exits with status `101`, and no Session recovery or state-preservation guarantee applies |
 
 #### H.4.2 Unsupported and silent command/hook seams
 
