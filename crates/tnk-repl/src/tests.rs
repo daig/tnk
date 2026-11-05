@@ -633,6 +633,77 @@ red in META-LEVEL : metaParse(['LEXICAL-PARSE], 'A:List ; 'B:List, 'A 'B, anyTyp
     );
 }
 
+/// With the stock prelude, a nullary operator spelled as a literal token and the literal it spells both
+/// print `(t).Sort` in echoes and results when context does not fix the range, including the arguments of
+/// the polymorphic `_==_`. Printed text is reusable where a unique parse is required: as a `match`
+/// pattern, and through `metaParse` of `metaPrettyPrint` output.
+#[test]
+fn literal_spelled_constants_round_trip_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude"));
+    let out = r
+        .eval(
+            r#"fmod LITERAL-NAMED is
+  including STRING .
+  including RAT .
+  sort Foo .
+  op "hi" : -> Foo .
+  op -3 : -> Foo .
+  op 1/2 : -> Foo .
+endfm
+red ("hi").Foo == ("hi").Foo .
+red (-3).Foo .
+red (1/2).Foo .
+red 0 .
+red in META-LEVEL : metaParse(upModule('LITERAL-NAMED, false),
+  metaPrettyPrint(upModule('LITERAL-NAMED, false), '"hi".String), anyType) .
+red in META-LEVEL : metaParse(upModule('LITERAL-NAMED, false),
+  metaPrettyPrint(upModule('LITERAL-NAMED, false), '"hi".Foo), anyType) .
+"#,
+        )
+        .output;
+    assert!(
+        out.contains(r#"reduce in LITERAL-NAMED : ("hi").Foo == ("hi").Foo ."#),
+        "qualified polymorphic arguments: {out}"
+    );
+    let results: Vec<&str> = out
+        .lines()
+        .filter_map(|line| line.strip_prefix("result "))
+        .collect();
+    assert_eq!(
+        results,
+        [
+            "Bool: true",
+            "Foo: (-3).Foo",
+            "Foo: (1/2).Foo",
+            "Zero: 0",
+            r#"ResultPair: {'"hi".String, 'String}"#,
+            r#"ResultPair: {'"hi".Foo, 'Foo}"#,
+        ],
+        "{out}"
+    );
+    for sort in ["String", "Foo"] {
+        let reduced = r
+            .eval(&format!(r#"red in LITERAL-NAMED : ("hi").{sort} ."#))
+            .output;
+        let prefix = format!("result {sort}: ");
+        let printed = reduced
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .unwrap_or_else(|| panic!("no {sort} result: {reduced}"));
+        assert_eq!(printed, format!(r#"("hi").{sort}"#), "{reduced}");
+        let matched = r
+            .eval(&format!(
+                "match in LITERAL-NAMED : {printed} <=? {printed} ."
+            ))
+            .output;
+        assert!(
+            matched.contains("Matcher 1") && !matched.contains("error"),
+            "printed {sort} term as a unique-parse pattern: {matched}"
+        );
+    }
+}
+
 /// Qid-family free order-sorted unification follows sort order and ends with a typed exhaustion sentinel.
 #[test]
 fn free_meta_unify_indices_through_repl() {
@@ -3430,10 +3501,13 @@ fn reflected_term_map_matrix_survives_child_execution() {
     );
 }
 
-/// Context-free cross-kind output retains its classified suffix spelling.
+/// Context-free cross-kind output qualifies an ill-sorted application with a user sort of its kind
+/// (`(f(a2)).B`), not with the `[B]` kind name the qualifier grammar does not accept, so the echo and
+/// the result reparse (`TNK-OUT-002`); the result header still reports the kind.
 #[test]
-fn cross_kind_ill_sorted_suffix_remains_classified() {
-    let output = repl()
+fn cross_kind_ill_sorted_term_qualifies_with_a_user_sort() {
+    let mut r = repl();
+    let output = r
         .eval(conformance_file!(
             "probes/cross-kind-ill-sorted-output.maude"
         ))
@@ -3448,11 +3522,93 @@ fn cross_kind_ill_sorted_suffix_remains_classified() {
     );
     assert!(
         output.contains(
-            "reduce in COV002-ILL-SORTED-OUTPUT : (f(a2)).[B] .\n\
+            "reduce in COV002-ILL-SORTED-OUTPUT : (f(a2)).B .\n\
              rewrites: 0\n\
-             result [B]: (f(a2)).[B]"
+             result [B]: (f(a2)).B"
         ),
-        "classified ill-sorted spelling: {output}"
+        "ill-sorted spelling: {output}"
+    );
+    let reparsed = r
+        .eval("red in COV002-ILL-SORTED-OUTPUT : (f(a2)).B .")
+        .output;
+    assert!(
+        reparsed.contains("result [B]: (f(a2)).B") && !reparsed.contains("error"),
+        "printed form reparses: {reparsed}"
+    );
+}
+
+/// META-LEVEL renders and rebuilds kind-level constants with a user-sort qualifier: `with-sorts` printing
+/// writes `(e).Foo` for a `~>` constant, and an explicit meta-module whose identity element is the
+/// kind-level constant `'e.`[Foo`]` builds (its identity bubble reparses) and reduces with it.
+#[test]
+fn meta_kind_level_constants_qualify_with_a_user_sort() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude"));
+    let out = r
+        .eval(
+            r#"fmod KIND-CONSTANTS is
+  sorts Foo Bar .
+  op e : ~> Foo .
+  op c : -> Universal [poly (0)] .
+endfm
+red in META-LEVEL : metaPrintToString(upModule('KIND-CONSTANTS, false), none, 'e.`[Foo`],
+  mixfix with-sorts, none) .
+red in META-LEVEL : metaPrintToString(upModule('KIND-CONSTANTS, false), none, 'c.`[Bar`],
+  mixfix with-sorts, none) .
+red in META-LEVEL : metaReduce(fmod 'KIND-IDENTITY is including 'BOOL . sorts 'Foo . none
+  op '_+_ : '`[Foo`] '`[Foo`] -> '`[Foo`] [assoc comm id('e.`[Foo`])] .
+  op 'a : nil -> 'Foo [none] . op 'e : nil -> '`[Foo`] [none] . none none endfm,
+  '_+_['a.Foo, 'e.`[Foo`]]) .
+"#,
+        )
+        .output;
+    let results: Vec<&str> = out
+        .lines()
+        .filter_map(|line| line.strip_prefix("result "))
+        .collect();
+    assert_eq!(
+        results,
+        [
+            r#"String: "(e).Foo""#,
+            r#"String: "(c).Bar""#,
+            "ResultPair: {'a.Foo, 'Foo}",
+        ],
+        "{out}"
+    );
+}
+
+/// A generated variable at a kind with several maximal sorts prints with the kind's full name
+/// (`#1:[B,A]`, `TNK-SORT-002`); that printed binding reparses as the same kind-level variable, as a
+/// reduce subject and as a match pattern (`TNK-OUT-002`).
+#[test]
+fn generated_multi_sort_kind_variables_reparse() {
+    let mut r = repl();
+    let out = r
+        .eval(
+            "fmod MULTI-SORT-KIND is
+  sorts A B Sh .
+  subsorts Sh < A B .
+  op sh : -> Sh .
+  op f : [A] -> [A] .
+endfm
+unify f(X:[A]) =? f(Y:[B]) .
+",
+        )
+        .output;
+    let binding = out
+        .lines()
+        .find_map(|line| line.strip_prefix("X:[A] --> "))
+        .unwrap_or_else(|| panic!("unifier binding: {out}"));
+    assert_eq!(binding, "#1:[B,A]", "{out}");
+    let reduced = r.eval(&format!("red f({binding}) .")).output;
+    assert!(
+        reduced.contains("result [B,A]: f(#1:[B,A])") && !reduced.contains("error"),
+        "printed binding reparses: {reduced}"
+    );
+    let matched = r.eval(&format!("match f({binding}) <=? f(sh) .")).output;
+    assert!(
+        matched.contains("Matcher 1\n#1:[B,A] --> sh"),
+        "printed binding as a pattern variable: {matched}"
     );
 }
 

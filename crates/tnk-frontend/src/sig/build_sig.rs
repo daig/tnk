@@ -3,7 +3,7 @@
 //! operator and syntax profile; resolve built-in anchor symbols; then attach constructor, strategy,
 //! frozen, object-role, and `special` attributes. Statements remain raw until the module grammar exists.
 
-use crate::lex::{Frag, Interner, Sym, Token, is_punct, split_mixfix};
+use crate::lex::{Frag, Interner, Sym, TokKind, Token, is_punct, split_mixfix};
 use crate::sig::syntax::{BuiltModule, IdentitySpec, OpProfile, PendingHostBinding, SymbolSyntax};
 use crate::surface::ast::{Attrs, IdSide, PreModule, SpecialSpec};
 use std::collections::{HashMap, HashSet};
@@ -197,7 +197,7 @@ fn resolve_sort(engine: &Engine, sorts: &HashMap<String, SortId>, name: &str) ->
 /// The first comma-separated sort of a multi-sort kind bracket's inner text, respecting `{ … }` / `[ … ]`
 /// nesting so a structured sort (`Map{X,Y}`) is not split at its inner `,`. `[A,B]` → `A`; `[Map{X,Y}]`
 /// → `Map{X,Y}`.
-fn first_kind_component(inner: &str) -> &str {
+pub fn first_kind_component(inner: &str) -> &str {
     let mut depth = 0i32;
     for (idx, c) in inner.char_indices() {
         match c {
@@ -786,6 +786,46 @@ pub(crate) fn build_module_with_host_functions(
         })
         .collect();
 
+    // A nullary operator spelled as one literal token (TNK-LEX-003) that a literal production of this
+    // module also accepts has two parses. Each family follows its grammar terminal: a numeral needs a
+    // nonzero digit because the successor production accepts only positive values (`0` parses as the
+    // zero constant alone), and a glued rational needs both division and unary minus. String,
+    // quoted-identifier, and float values are decoded as the term builder decodes the literal token, so
+    // the printer can also qualify the literal that collides. SMT number kinds are not tracked here.
+    let mut literal_named_constants = HashSet::new();
+    let mut overloaded_strings = HashSet::new();
+    let mut overloaded_qids = HashSet::new();
+    let mut overloaded_floats = HashSet::new();
+    for (&sym, syn) in &syntax {
+        if !syn.domain.is_empty() {
+            continue;
+        }
+        let name = engine.symbol(sym).name();
+        let literal_spelled = match crate::lex::classify(name) {
+            TokKind::Str if string_sym.is_some() => {
+                overloaded_strings.insert(crate::build_term::unquote_string(name));
+                true
+            }
+            TokKind::Qid if qid_sym.is_some() => {
+                overloaded_qids.insert(name.strip_prefix('\'').unwrap_or(name).to_string());
+                true
+            }
+            TokKind::Float if float_sym.is_some() => {
+                if let Ok(value) = name.parse::<f64>() {
+                    overloaded_floats.insert(value.to_bits());
+                }
+                true
+            }
+            TokKind::Number => nat_succ.is_some() && name.bytes().any(|b| b != b'0'),
+            TokKind::NegNumber => minus_sym.is_some(),
+            TokKind::Rational => division_sym.is_some() && minus_sym.is_some(),
+            _ => false,
+        };
+        if literal_spelled {
+            literal_named_constants.insert(sym);
+        }
+    }
+
     Ok(BuiltModule {
         engine,
         name: pm.name.clone(),
@@ -812,6 +852,10 @@ pub(crate) fn build_module_with_host_functions(
         overload,
         integer_literal_kind_count,
         overloaded_naturals,
+        literal_named_constants,
+        overloaded_strings,
+        overloaded_qids,
+        overloaded_floats,
         strat_decls: pm.strat_decls.clone(),
         strat_defs: pm.strat_defs.clone(),
         identity_specs,
@@ -820,16 +864,18 @@ pub(crate) fn build_module_with_host_functions(
 
 /// Compute the per-symbol ad-hoc overloading flags ([`BuiltModule::overload`]) by comparing every pair of
 /// symbols that share a (canonical) name: same name ⇒ `ADHOC`; same name and per-position domain kinds ⇒
-/// `DOMAIN`; same name and range kind ⇒ `RANGE`. Only symbols that pick up at least one flag are recorded.
+/// `DOMAIN`; same name and range kind ⇒ `RANGE`; same name and both `iter` ⇒ `ITER`. Only symbols that
+/// pick up at least one flag are recorded.
 fn compute_overload_flags(
     engine: &Engine,
     syntax: &HashMap<SymbolId, SymbolSyntax>,
 ) -> HashMap<SymbolId, u8> {
-    use crate::sig::syntax::{OVL_ADHOC, OVL_DOMAIN, OVL_RANGE};
-    // Group symbols by `(name, arity)`, recording domain and range kinds. Only declarations with the
-    // same arity can compete for an application, so a different-arity overload does not force range
-    // disambiguation; for example, the four-argument `metaParse(M, none, Q, T)` can keep `none` bare.
-    type Profile = (SymbolId, Vec<KindId>, KindId);
+    use crate::sig::syntax::{OVL_ADHOC, OVL_DOMAIN, OVL_ITER, OVL_RANGE};
+    // Group symbols by `(name, arity)`, recording domain and range kinds and the effective `iter` flag.
+    // Only declarations with the same arity can compete for an application, so a different-arity
+    // overload does not force range disambiguation; for example, the four-argument
+    // `metaParse(M, none, Q, T)` can keep `none` bare.
+    type Profile = (SymbolId, Vec<KindId>, KindId, bool);
     let mut by_name: HashMap<(&str, usize), Vec<Profile>> = HashMap::new();
     for (&sym, syn) in syntax {
         let dom: Vec<KindId> = syn
@@ -841,16 +887,16 @@ fn compute_overload_flags(
         by_name
             .entry((engine.symbol(sym).name(), dom.len()))
             .or_default()
-            .push((sym, dom, range));
+            .push((sym, dom, range, syn.iter));
     }
     let mut flags: HashMap<SymbolId, u8> = HashMap::new();
     for group in by_name.values() {
         if group.len() < 2 {
             continue; // a unique name needs no disambiguation
         }
-        for (sym, dom, range) in group {
+        for (sym, dom, range, iter) in group {
             let mut f = OVL_ADHOC; // some other symbol in the group shares the name
-            for (other, odom, orange) in group {
+            for (other, odom, orange, oiter) in group {
                 if other == sym {
                     continue;
                 }
@@ -859,6 +905,9 @@ fn compute_overload_flags(
                 }
                 if orange == range {
                     f |= OVL_RANGE;
+                }
+                if *iter && *oiter {
+                    f |= OVL_ITER;
                 }
             }
             flags.insert(*sym, f);

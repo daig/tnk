@@ -165,6 +165,29 @@ pub fn build_grammar(m: &BuiltModule, interner: &mut Interner) -> Grammar {
             Action::MakeVariable(err),
         );
     }
+    // A kind with several maximal sorts is printed with all of them (`[B,A]`, `TNK-SORT-002`), and so is
+    // a generated kind-level variable (`#1:[B,A]`). That exact spelling also names the kind's error-sort
+    // variable; a single maximal sort's `[S]` spelling already has its production above.
+    for &k in &kinds {
+        let err = sorts.error_sort(k);
+        let kind_name = sorts.name(err);
+        let single_sort = kind_name
+            .strip_prefix('[')
+            .and_then(|name| name.strip_suffix(']'))
+            .is_none_or(|inner| m.sorts.contains_key(inner));
+        if single_sort {
+            continue;
+        }
+        let kind_sym = interner.intern(kind_name);
+        push(
+            &mut g,
+            Nt::Comp(k, NtType::Term),
+            vec![GSym::T(Terminal::ColonVar(kind_sym))],
+            0,
+            vec![],
+            Action::MakeVariable(err),
+        );
+    }
 
     // ---- symbol productions (per operator, in declaration order) ----
     let mut syms: Vec<SymbolId> = m.syntax.keys().copied().collect();

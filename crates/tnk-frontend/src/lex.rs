@@ -227,7 +227,7 @@ fn is_string_literal(text: &str) -> bool {
 
 /// Classify scanned identifier text in precedence order: quoted identifier/string, iteration, float,
 /// integer, rational, then ordinary identifier.
-fn classify(text: &str) -> TokKind {
+pub(crate) fn classify(text: &str) -> TokKind {
     if is_string_literal(text) {
         return TokKind::Str;
     }

@@ -1436,7 +1436,7 @@ The generated grammar carries one nonterminal per sort/kind applicability profil
 
 ### E.3 Variables, literals, and disambiguation
 
-Declared variables take their module sort. `X:Sort` creates an on-the-fly variable. A bare identifier may resolve as a declared variable, a zero-arity operator, or a recognized literal anchor; the applicable grammar and expected kind decide. Parentheses group, and `(term).Sort` forces the indicated result sort. Literal families and spacing boundaries are fixed by `TNK-LEX-003`.
+Declared variables take their module sort. `X:Sort` creates an on-the-fly variable, and `X:[S]` creates one at the kind of user sort `S`. A kind with several maximal sorts is also written with its printed name, `X:[M1,...,Mn]` (`TNK-SORT-002`), which is how generated kind-level variables print; other multi-sort bracket lists are not colon-variable spellings. A bare identifier may resolve as a declared variable, a zero-arity operator, or a recognized literal anchor; the applicable grammar and expected kind decide. Parentheses group, and `(term).Sort` selects the parse of `term` in the kind of the user sort `Sort`; it neither checks nor changes the term's least sort. The printer qualifies a kind-level term (least sort = its kind's error sort) with a user sort of that kind, never with the bracketed kind name, so the output reparses (`TNK-OUT-002`). Literal families and spacing boundaries are fixed by `TNK-LEX-003`.
 
 # Appendix F — Declaration and statement attributes
 

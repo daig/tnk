@@ -172,7 +172,8 @@ pub struct BuiltModule {
     pub false_sym: Option<SymbolId>,
     /// Per-symbol overload flags for print disambiguation. Cross-kind overloads print `(term).Sort`
     /// when context cannot determine a range. [`OVL_ADHOC`] means another symbol shares the name;
-    /// [`OVL_DOMAIN`] also shares domain kinds; [`OVL_RANGE`] also shares the range kind.
+    /// [`OVL_DOMAIN`] also shares domain kinds; [`OVL_RANGE`] also shares the range kind;
+    /// [`OVL_ITER`] marks two `iter` operators sharing the name.
     pub overload: HashMap<SymbolId, u8>,
     /// Number of kinds whose built-in values use positive decimal syntax. An unknown-range numeral
     /// requires sort qualification when more than one such kind exists.
@@ -180,6 +181,19 @@ pub struct BuiltModule {
     /// Canonical positive decimal spellings also declared as nullary user operators. These collide with
     /// built-in natural pseudo-literals even when there is only one numeral kind.
     pub(crate) overloaded_naturals: HashSet<String>,
+    /// Nullary operators whose declared name is a literal token that one of this module's literal
+    /// productions also accepts (`op "hi" : -> Foo` beside `STRING`, `op 42 : -> Foo` beside `NAT`).
+    /// Their bare spelling also denotes the literal, so printing qualifies them as `(c).Sort` whenever
+    /// context does not fix the range. Zero-valued numeral spellings are never included: the successor
+    /// production accepts only positive values, so `0` parses as the declared zero constant alone.
+    pub(crate) literal_named_constants: HashSet<SymbolId>,
+    /// String values (decoded bytes) spelled by a [`literal_named_constants`](Self::literal_named_constants)
+    /// member. Such a string literal prints `("…").Sort` when context does not fix the range.
+    pub(crate) overloaded_strings: HashSet<Vec<u8>>,
+    /// Quoted-identifier names (without the leading `'`) spelled by a literal-named constant.
+    pub(crate) overloaded_qids: HashSet<String>,
+    /// Float values (`f64` bit patterns) spelled by a literal-named constant.
+    pub(crate) overloaded_floats: HashSet<u64>,
     /// Strategy declarations after module flattening. The interpreter coalesces these by
     /// `(name, domain kinds, subject kind)` while retaining donation origins for conflict handling.
     pub strat_decls: Vec<crate::surface::ast::StratDecl>,
@@ -198,3 +212,6 @@ pub const OVL_ADHOC: u8 = 1;
 pub const OVL_DOMAIN: u8 = 2;
 /// Another symbol shares this one's name and range kind.
 pub const OVL_RANGE: u8 = 4;
+/// This `iter` operator and another `iter` operator share the name. They lie in different kinds, so
+/// the compact `f^N(t)` form parses as either and only context or the argument selects one.
+pub const OVL_ITER: u8 = 8;

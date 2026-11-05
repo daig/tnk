@@ -441,7 +441,16 @@ impl<'a> Printer<'a> {
                         text: Cow::Owned(count),
                     });
                 } else {
-                    self.layout_iter(*symbol, &count, Item::Term(arg), req_prec, lcap, rcap, out);
+                    self.layout_iter(
+                        *symbol,
+                        &count,
+                        Item::Term(arg),
+                        req_prec,
+                        lcap,
+                        rcap,
+                        true,
+                        out,
+                    );
                 }
             }
             // A built-in `Term` literal uses the DAG leaf renderer.
@@ -497,22 +506,37 @@ impl<'a> Printer<'a> {
             let node = self.m.engine.node(d);
             match node.repr() {
                 NodeRepr::App => None,
+                // A count-1 iteration that does not print as a numeral is the ordinary application
+                // `f(t)`, so the application path lays it out, including its overload qualification;
+                // only numerals and the compact `f^N(t)` form are iteration-specific.
+                NodeRepr::Iter { count, arg }
+                    if count == "1"
+                        && !(self.options.number
+                            && self.m.nat_succ == Some(symbol)
+                            && self.is_zero(arg)) =>
+                {
+                    None
+                }
                 NodeRepr::Iter { count, arg } => Some(Leaf::Iter { count, arg }),
                 NodeRepr::Str(s) => Some(Leaf::Atom {
                     text: render_string(s),
                     constant: true,
+                    collides: self.m.overloaded_strings.contains(s),
                 }),
                 NodeRepr::Qid(q) => Some(Leaf::Atom {
                     text: render_qid(q),
                     constant: true,
+                    collides: self.m.overloaded_qids.contains(q),
                 }),
                 NodeRepr::Float(f) => Some(Leaf::Atom {
                     text: render_float(f),
                     constant: true,
+                    collides: self.m.overloaded_floats.contains(&f.to_bits()),
                 }),
                 NodeRepr::SmtNum(number) => Some(Leaf::Atom {
                     text: self.smt_number_text(symbol, number),
                     constant: true,
+                    collides: false,
                 }),
                 // A symbolic variable leaf renders as `base:Sort`. Only generated `#n`, `%n`, and `@n`
                 // variables survive into printed unifiers, and each carries its sort.
@@ -536,13 +560,22 @@ impl<'a> Printer<'a> {
                     Some(Leaf::Atom {
                         text,
                         constant: false,
+                        collides: false,
                     })
                 }
             }
         };
         match leaf {
-            Some(Leaf::Atom { text, constant }) => {
-                self.layout_literal(d, text, constant && self.options.with_sorts, out);
+            Some(Leaf::Atom {
+                text,
+                constant,
+                collides,
+            }) => {
+                // A literal whose value a nullary operator also spells (`op "hi" : -> Foo`) is
+                // ambiguous with that constant unless context fixes the range; the top level counts.
+                let disambiguate =
+                    constant && (self.options.with_sorts || (!range_known && collides));
+                self.layout_literal(d, text, disambiguate, out);
             }
             Some(Leaf::Iter { count, arg }) => {
                 // A natural numeral is a pseudo-literal. In an unknown-range context it needs a qualifier
@@ -562,7 +595,19 @@ impl<'a> Printer<'a> {
                 {
                     self.layout_literal(d, count.clone(), true, out);
                 } else {
-                    self.layout_iter(symbol, &count, Item::Dag(arg), req_prec, lcap, rcap, out);
+                    // `f^N(t)` parses as any `iter` operator named `f`; those lie in different kinds, so
+                    // when another one exists only context or a qualified argument selects the kind.
+                    let arg_rk = range_known || !self.shares_iter_name(symbol);
+                    self.layout_iter(
+                        symbol,
+                        &count,
+                        Item::Dag(arg),
+                        req_prec,
+                        lcap,
+                        rcap,
+                        arg_rk,
+                        out,
+                    );
                 }
             }
             None => {
@@ -588,8 +633,9 @@ impl<'a> Printer<'a> {
                     self.layout_literal(d, rat, self.options.with_sorts, out);
                     return;
                 }
-                // An ad-hoc-overloaded symbol whose range is not determined by context receives a
-                // `(term).Sort` qualification so output round-trips. `with-sorts` qualifies all constants.
+                // An ad-hoc-overloaded or literal-spelled symbol whose range is not determined by context
+                // receives a `(term).Sort` qualification so output round-trips. `with-sorts` qualifies all
+                // constants.
                 let need_disambig = (!range_known && self.ambiguous(symbol))
                     || (self.options.with_sorts && children.is_empty());
                 let arg_rk = self.range_of_args_known(symbol, range_known, need_disambig);
@@ -623,7 +669,7 @@ impl<'a> Printer<'a> {
                     self.layout_app(symbol, &items, req_prec, lcap, rcap, arg_rk, out);
                 }
                 if need_disambig {
-                    let sort = self.m.engine.sorts().name(self.m.engine.sort_of(d));
+                    let sort = self.qualifier_sort(d);
                     out.push(Work::Text {
                         cat: Cat::Punct,
                         text: Cow::Owned(format!(").{sort}")),
@@ -631,6 +677,31 @@ impl<'a> Printer<'a> {
                 }
             }
         }
+    }
+
+    /// The sort named by `d`'s `(term).Sort` qualifier. A qualifier selects the parse in its sort's kind
+    /// and the grammar spells it only with a user sort, so the error sort's `[K]` name would not reparse.
+    /// A kind-level term (least sort = its kind's error sort) is instead qualified by its top symbol's
+    /// declared non-error range that comes first in the kind's index order (supersorts first) or, when
+    /// every declaration is kind-level (a `poly` range, `~>`, an explicit `[K]` range), by the kind's
+    /// first maximal sort.
+    fn qualifier_sort(&self, d: DagId) -> &'a str {
+        let sorts = self.m.engine.sorts();
+        let sort = self.m.engine.sort_of(d);
+        if !sorts.sort(sort).is_error {
+            return sorts.name(sort);
+        }
+        let chosen = self
+            .m
+            .engine
+            .symbol_declarations(self.m.engine.node(d).symbol())
+            .into_iter()
+            .map(|(_, range)| range)
+            .filter(|&range| !sorts.sort(range).is_error)
+            .min_by_key(|&range| sorts.component_index(range))
+            .or_else(|| sorts.kind(sorts.kind_of(sort)).index_order.get(1).copied())
+            .unwrap_or(sort);
+        sorts.name(chosen)
     }
 
     fn layout_literal<'t>(
@@ -651,7 +722,7 @@ impl<'a> Printer<'a> {
             text: Cow::Owned(text),
         });
         if disambiguate {
-            let sort = self.m.engine.sorts().name(self.m.engine.sort_of(d));
+            let sort = self.qualifier_sort(d);
             out.push(Work::Text {
                 cat: Cat::Punct,
                 text: Cow::Owned(format!(").{sort}")),
@@ -989,12 +1060,24 @@ impl<'a> Printer<'a> {
     }
 
     /// Whether `symbol` needs a range qualifier when context does not provide one: another symbol shares
-    /// its name and domain kinds, so arguments alone cannot select the declaration.
+    /// its name and domain kinds, so arguments alone cannot select the declaration; or it is a nullary
+    /// operator whose name this module's grammar also reads as a literal, so its bare spelling denotes
+    /// that literal too.
     fn ambiguous(&self, symbol: SymbolId) -> bool {
         self.m
             .overload
             .get(&symbol)
             .is_some_and(|f| f & crate::sig::syntax::OVL_DOMAIN != 0)
+            || self.m.literal_named_constants.contains(&symbol)
+    }
+
+    /// Whether another `iter` operator shares `symbol`'s name, so `symbol^N(t)` alone does not fix the
+    /// kind of `t`.
+    fn shares_iter_name(&self, symbol: SymbolId) -> bool {
+        self.m
+            .overload
+            .get(&symbol)
+            .is_some_and(|f| f & crate::sig::syntax::OVL_ITER != 0)
     }
 
     /// Whether argument ranges are known. Ad-hoc overloading leaves them unknown unless context or an
@@ -1026,7 +1109,8 @@ impl<'a> Printer<'a> {
     }
 
     /// Lay out `symbol^count(arg)`. A successor over zero becomes decimal. Counts of at least two use
-    /// compact `f^N(arg)` form; count one uses the operator's ordinary mixfix or prefix syntax.
+    /// compact `f^N(arg)` form, whose argument inherits `arg_range_known`; count one uses the operator's
+    /// ordinary mixfix or prefix syntax.
     #[allow(clippy::too_many_arguments)]
     fn layout_iter<'t>(
         &self,
@@ -1036,6 +1120,7 @@ impl<'a> Printer<'a> {
         req_prec: u32,
         lcap: Cap,
         rcap: Cap,
+        arg_range_known: bool,
         out: &mut Vec<Work<'a, 't>>,
     ) {
         if self.options.number && self.m.nat_succ == Some(symbol) && self.is_zero_item(arg.clone())
@@ -1058,7 +1143,7 @@ impl<'a> Printer<'a> {
                 req_prec: PREFIX_GATHER,
                 lcap: NONE_CAP,
                 rcap: NONE_CAP,
-                range_known: true,
+                range_known: arg_range_known,
                 top_level: false,
             });
             out.push(Work::Text {
@@ -1310,8 +1395,16 @@ impl Cat {
 
 /// Owned leaf rendering data, extracted from a node's `repr` so the borrow is released before recursion.
 enum Leaf {
-    Iter { count: String, arg: DagId },
-    Atom { text: String, constant: bool },
+    Iter {
+        count: String,
+        arg: DagId,
+    },
+    /// `collides` marks a literal whose value a nullary operator of the module also spells.
+    Atom {
+        text: String,
+        constant: bool,
+        collides: bool,
+    },
 }
 
 fn flush_qid_text(chunks: &mut Vec<QidChunk>, text: &mut String) {
@@ -1397,7 +1490,8 @@ mod tests {
     use crate::load::{load_source, parse_command_term, reduce_command};
     use crate::surface::ast::Command;
 
-    /// Round-trip every fixture command's reduced result through raw printing and reparsing.
+    /// Round-trip every fixture command's reduced result through raw printing and reparsing. The printed
+    /// text must parse uniquely, as a match pattern or statement term requires, and denote the same term.
     fn round_trips(src: &str) {
         let mut loaded = load_source(src).expect("load");
         let cmds: Vec<(usize, Vec<crate::lex::Token>)> = loaded
@@ -1417,6 +1511,9 @@ mod tests {
             // Re-lex + re-reduce the printed form; it must denote the same term.
             let toks = tokenize(&printed, &mut loaded.interner);
             let reparsed_term = parse_command_term(&loaded.modules[*m], &loaded.interner, &toks)
+                .unwrap_or_else(|e| panic!("command {idx} reparse of `{printed}`: {e}"));
+            reparsed_term
+                .unambiguous_tree(&loaded.interner)
                 .unwrap_or_else(|e| panic!("command {idx} reparse of `{printed}`: {e}"));
             let (reparsed, _) =
                 reduce_command(&mut loaded.modules[*m], &loaded.interner, &reparsed_term)
@@ -1515,6 +1612,292 @@ mod tests {
         renders_as(
             file!("correctness-disambig.maude"),
             &["(nil).A", "(nil).B", "a"],
+        );
+    }
+
+    /// Nullary operators spelled as string, quoted-identifier, and float tokens beside those literal
+    /// families.
+    const LITERAL_NAMED: &str = r#"fmod LITERAL-NAMED is
+  sorts Str Qid Flt Foo .
+  op <Strings> : -> Str [special (id-hook StringSymbol)] .
+  op <Qids> : -> Qid [special (id-hook QuotedIdentifierSymbol)] .
+  op <Floats> : -> Flt [special (id-hook FloatSymbol)] .
+  op "hi" : -> Foo .
+  op 'hi : -> Foo .
+  op 1.5 : -> Foo .
+  op wrap : Foo -> Foo .
+  op pair : Foo Foo -> Foo .
+  op pair : Str Str -> Str .
+endfm
+red ("hi").Foo .
+red ("hi").Str .
+red ('hi).Foo .
+red ('hi).Qid .
+red (1.5).Foo .
+red (1.5).Flt .
+red wrap("hi") .
+red pair(("hi").Str, "lo") .
+red "lo" .
+"#;
+
+    /// A literal-spelled constant and the literal it spells share one bare spelling, so both print
+    /// `(t).Sort` wherever context does not fix the range, the top level included. An argument whose
+    /// kind is fixed (`wrap`) and a literal that no operator spells stay bare.
+    #[test]
+    fn qualifies_literal_spelled_constants_and_their_literals() {
+        renders_as(
+            LITERAL_NAMED,
+            &[
+                r#"("hi").Foo"#,
+                r#"("hi").Str"#,
+                "('hi).Foo",
+                "('hi).Qid",
+                "(1.5).Foo",
+                "(1.5).Flt",
+                r#"wrap("hi")"#,
+                r#"pair(("hi").Str, "lo")"#,
+                r#""lo""#,
+            ],
+        );
+        round_trips(LITERAL_NAMED);
+    }
+
+    /// Numeral-spelled constants collide only with numeral families whose literal production exists.
+    /// `0` is the zero constant rather than a numeral token, `00` matches no numeral terminal, and a
+    /// rational or string spelling has no literal production here, so those stay bare.
+    #[test]
+    fn qualifies_numeral_spelled_constants_by_literal_terminal() {
+        let src = r#"fmod NUMERAL-NAMED is
+  sorts Zero NzNat Nat NzInt Int Foo .
+  subsorts Zero NzNat < Nat .
+  subsorts NzNat < NzInt .
+  subsorts Nat NzInt < Int .
+  op 0 : -> Zero [ctor] .
+  op s_ : Nat -> NzNat [ctor iter special (id-hook SuccSymbol term-hook zeroTerm (0))] .
+  op -_ : NzNat -> NzInt [ctor special (id-hook MinusSymbol op-hook succSymbol (s_ : Nat ~> NzNat) op-hook minusSymbol (-_ : NzNat ~> Int))] .
+  op -_ : Int -> Int [ditto] .
+  op 42 : -> Foo .
+  op -3 : -> Foo .
+  op 00 : -> Foo .
+  op 1/2 : -> Foo .
+  op "s" : -> Foo .
+  op pair : Foo Foo -> Foo .
+  op pair : Nat Nat -> Nat .
+endfm
+red (42).Foo .
+red (-3).Foo .
+red pair((42).Foo, (42).Foo) .
+red pair((42).Nat, 7) .
+red 0 .
+red 00 .
+red 1/2 .
+red "s" .
+"#;
+        renders_as(
+            src,
+            &[
+                "(42).Foo",
+                "(-3).Foo",
+                "pair((42).Foo, (42).Foo)",
+                "pair((42).NzNat, 7)",
+                "0",
+                "00",
+                "1/2",
+                r#""s""#,
+            ],
+        );
+        round_trips(src);
+    }
+
+    /// Kind-level terms that need a qualifier: `poly` range instances, a same-domain overload applied
+    /// outside its declared domain, `~>` and explicit `[K]` ranges, a kind with two maximal sorts
+    /// (`[Q,P]`), and a nested argument position.
+    const KIND_QUALIFIED: &str = r#"fmod KIND-QUALIFIED is
+  sorts Foo Foo2 Bar P Q R A B .
+  subsort Foo < Foo2 .
+  subsorts R < P Q .
+  op a : -> Foo .
+  op b : -> Foo2 .
+  op g : Foo -> Universal [poly (0)] .
+  op c : -> Universal [poly (0)] .
+  op k : Foo -> A .
+  op k : Foo -> B .
+  op m : Foo ~> P .
+  op m : Foo ~> Bar .
+  op e : -> [A] .
+  op e : -> [B] .
+  op h : A -> A .
+  op h : B -> B .
+endfm
+red (g(a)).Bar .
+red (g(a)).Foo .
+red (c).R .
+red (k(b)).A .
+red (k(b)).B .
+red (m(a)).P .
+red (e).B .
+red h((e).A) .
+"#;
+
+    /// A qualified kind-level term names a user sort of its kind, never the `[K]` kind name the
+    /// qualifier grammar lacks: its top symbol's declared non-error range, else the kind's first maximal
+    /// sort. Every printed form reparses uniquely to the same term (`TNK-OUT-002`).
+    #[test]
+    fn kind_level_qualifiers_name_a_user_sort() {
+        renders_as(
+            KIND_QUALIFIED,
+            &[
+                "(g(a)).Bar",
+                "(g(a)).Foo2",
+                "(c).Q",
+                "(k(b)).A",
+                "(k(b)).B",
+                "(m(a)).Q",
+                "(e).B",
+                "h((e).A)",
+            ],
+        );
+        round_trips(KIND_QUALIFIED);
+    }
+
+    /// Overloaded `iter` operators. `Bar` and `Foo` are declared so that a bare `h(a)` first parses in
+    /// the `Bar` kind, and `Foo` before `Bar` in the second module so that a bare `h(c)` first parses in
+    /// the `Foo` kind.
+    const ITER_OVERLOADS: &str = r#"fmod ITER-SAME-DOMAIN is
+  sorts Bar Foo M N .
+  op a : -> Foo .
+  op h : Foo -> Bar .
+  op h : Foo -> Foo [iter] .
+  op f : Foo -> Foo .
+  op o : -> M .
+  op o : -> N .
+  op p : M -> N .
+  op p : N -> N [iter] .
+endfm
+red (h(a)).Foo .
+red (h(a)).Bar .
+red f((h(a)).Foo) .
+red p((o).N) .
+red p((o).M) .
+fmod ITER-KINDS is
+  sorts Foo Bar .
+  op c : -> Foo .
+  op c : -> Bar .
+  op h : Foo -> Foo [iter] .
+  op h : Bar -> Bar [iter] .
+endfm
+red h((c).Bar) .
+red h((c).Foo) .
+"#;
+
+    /// A count-1 `iter` node prints as an ordinary application and is qualified like one: `(h(a)).Foo`
+    /// when a same-domain overload shares the name, and its argument when the operator is ad-hoc
+    /// overloaded and context does not fix the range. A range-fixing context keeps `h(a)` bare.
+    #[test]
+    fn count_one_iter_nodes_qualify_like_applications() {
+        renders_as(
+            ITER_OVERLOADS,
+            &[
+                "(h(a)).Foo",
+                "(h(a)).Bar",
+                "f(h(a))",
+                "p((o).N)",
+                "p((o).M)",
+                "h((c).Bar)",
+                "h((c).Foo)",
+            ],
+        );
+        round_trips(ITER_OVERLOADS);
+    }
+
+    /// Two `iter` operators named `h` in different kinds beside a constant `c` of both kinds, and an
+    /// `iter` operator `p` whose same-name overload is not `iter`.
+    const ITER_POWERS: &str = r#"fmod ITER-POWERS is
+  sorts Foo Bar M N .
+  op c : -> Foo .
+  op c : -> Bar .
+  op h : Foo -> Foo [iter] .
+  op h : Bar -> Bar [iter] .
+  op g : Bar -> Bar .
+  op o : -> M .
+  op o : -> N .
+  op p : M -> N .
+  op p : N -> N [iter] .
+endfm
+red h(h((c).Bar)) .
+red h^3((c).Foo) .
+red g(h^2((c).Bar)) .
+red p(p((o).N)) .
+"#;
+
+    /// `h^N(t)` parses as either `iter` operator named `h`, so its argument keeps a qualifier unless
+    /// context fixes the range (`g(h^2(c))`). Only `p` has the `p^N` form, which fixes its argument.
+    #[test]
+    fn iter_power_arguments_qualify_when_iter_operators_share_a_name() {
+        renders_as(
+            ITER_POWERS,
+            &["h^2((c).Bar)", "h^3((c).Foo)", "g(h^2(c))", "p^2(o)"],
+        );
+        round_trips(ITER_POWERS);
+    }
+
+    /// Kinds with two maximal sorts, printed `[B,A]` and `[List{Nat},Foo]` (`TNK-SORT-002`).
+    const MULTI_SORT_KINDS: &str = r#"fmod MULTI-SORT-KINDS is
+  sorts A B Sh Foo List{Nat} Sh2 .
+  subsorts Sh < A B .
+  subsorts Sh2 < Foo List{Nat} .
+  op f : [A] -> [A] .
+  op g : [Foo] -> [Foo] .
+endfm
+red f(X:[B,A]) .
+red g(Y:[List{Nat},Foo]) .
+red f(X:[Sh]) .
+red g(Y:[Foo]) .
+"#;
+
+    /// A colon variable spelled with its kind's printed name, the form generated kind-level variables
+    /// take (`#1:[B,A]`), parses as a variable at that kind's error sort, exactly as the single-sort
+    /// spelling `X:[Sh]` does, and prints back unchanged.
+    #[test]
+    fn multi_sort_kind_colon_variables_parse() {
+        renders_as(
+            MULTI_SORT_KINDS,
+            &[
+                "f(X:[B,A])",
+                "g(Y:[List{Nat},Foo])",
+                "f(X:[Sh])",
+                "g(Y:[Foo])",
+            ],
+        );
+        let mut loaded = load_source(MULTI_SORT_KINDS).expect("load");
+        let terms: Vec<(usize, Vec<crate::lex::Token>)> = loaded
+            .commands
+            .iter()
+            .map(|(m, c)| match c {
+                Command::Reduce { term, .. } => (*m, term.clone()),
+                _ => panic!("fixture uses only reduce"),
+            })
+            .collect();
+        let variable_sorts: Vec<_> = terms
+            .iter()
+            .map(|(m, term)| {
+                let parsed =
+                    parse_command_term(&loaded.modules[*m], &loaded.interner, term).expect("parse");
+                let (result, _) =
+                    reduce_command(&mut loaded.modules[*m], &loaded.interner, &parsed)
+                        .expect("reduce");
+                // A reduce subject's variable is a fresh constant of the variable's sort.
+                let engine = &loaded.modules[*m].built.engine;
+                let variable = engine.node(result).children().next().expect("argument");
+                let sort = engine.sort_of(variable);
+                assert!(engine.sorts().sort(sort).is_error, "kind-level variable");
+                sort
+            })
+            .collect();
+        assert_eq!(variable_sorts[0], variable_sorts[2], "`[B,A]` is `[Sh]`");
+        assert_eq!(
+            variable_sorts[1], variable_sorts[3],
+            "`[List{{Nat}},Foo]` is `[Foo]`"
         );
     }
     #[test]

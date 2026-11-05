@@ -46,7 +46,7 @@ use tnk_frontend::pretty::{
     PrintOptions, print_qid_tokens_with_options, print_raw, print_term, print_with_options,
     render_float, render_string,
 };
-use tnk_frontend::sig::build_sig::canonical_name;
+use tnk_frontend::sig::build_sig::{canonical_name, first_kind_component};
 use tnk_frontend::sig::syntax::{BuiltModule, EqTrace, MbTrace, RlTrace};
 use tnk_frontend::strategy::{StratSolution, StrategicRewriteError, srewrite_dag};
 use tnk_frontend::surface::ast::{
@@ -6237,8 +6237,16 @@ fn id_bubble(
         match atom.rsplit_once('.') {
             // Keep the meta-term's resolved sort qualification. A bare constant name is not an identity:
             // two copied/imported overloads may share that spelling, while `(c).S` selects the exact target
-            // symbol/kind when the down-translated signature parses and owns the rebuilt ground term.
-            Some((name, sort)) => Some(format!("({}).{sort}", strip_op_blanks(name))),
+            // symbol/kind when the down-translated signature parses and owns the rebuilt ground term. The
+            // qualifier grammar spells only user sorts, so a kind-level constant (`'e.`[Foo`]`) is
+            // qualified by its kind's first named sort, which selects the same kind.
+            Some((name, sort)) => {
+                let sort = sort
+                    .strip_prefix('[')
+                    .and_then(|kind| kind.strip_suffix(']'))
+                    .map_or(sort, |inner| first_kind_component(inner).trim());
+                Some(format!("({}).{sort}", strip_op_blanks(name)))
+            }
             None => Some(strip_op_blanks(&atom)),
         }
     }

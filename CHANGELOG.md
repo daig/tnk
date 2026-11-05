@@ -35,6 +35,15 @@ All notable user-visible changes are documented here. This project follows Seman
   - a `search` condition that named the goal variable by its other spelling panicked.
 
   A matchrew `by` variable may now use any spelling of a pattern variable. Object-pattern completion no longer reuses a written `V:Class` as its fresh class variable.
+- A nullary operator spelled as a literal token that the module also reads as a literal (for example `op "hi" : -> Foo` beside `STRING`, `op 'a : -> Foo` beside `QID`, or `op 42 : -> Foo` beside `NAT`) now prints as `(c).Sort` in results, substitution bindings, `metaPrettyPrint`, and the reduce, rewrite, and search command echoes whenever context does not fix its range. A string, quoted-identifier, or float literal whose value such an operator spells is qualified the same way, the top level included. Previously both printed bare, so the text reparsed as the other term or was rejected as ambiguous where a unique parse is required (`TNK-OUT-002`). The zero constant `0` and spellings that no literal production of the module accepts still print bare.
+
+- A term whose least sort is its kind's error sort and that needs a range qualifier (a `poly` range instance, a `~>` or `[K]`-range operator, or an overload applied outside its declared domain) now prints as `(t).S` with a user sort `S` of its kind, for example `(f(a2)).B` instead of `(f(a2)).[B]`; the `(t).[K]` form is rejected by tnk's own parser (`TNK-OUT-002`). This applies to results, command echoes, and META-LEVEL `with-sorts` printing; the `result [K]:` header still names the kind. META down-translation likewise qualifies a kind-level identity element such as `` id('e.`[Foo`]) `` with a user sort, so such a meta-module now builds instead of failing.
+
+- A single application of an `iter` operator now prints like any other application of an overloaded operator. When a same-name operator shares its domain kind, it prints `(h(a)).Foo` instead of a bare `h(a)` that reparsed as the other operator; when the operator is ad-hoc overloaded and context does not fix its range, its argument keeps its qualifier (`p((o).N)` instead of `p(o)`) (`TNK-OUT-002`).
+
+- When two `iter` operators share a name (necessarily in different kinds), the argument of their compact `h^N(t)` form keeps its qualifier unless context fixes the range: `h^2((c).Bar)` instead of `h^2(c)`, which reparsed in the other kind (`TNK-OUT-002`).
+
+- A colon variable spelled with the printed name of a kind that has several maximal sorts, such as `X:[B,A]`, now parses as a variable of that kind. Generated variables print in this form (`#1:[B,A]` in unifiers and variants), which previously failed with `no parse` when fed back (`TNK-OUT-002`). Other multi-sort bracket lists, such as `X:[A,B]`, are still rejected; `X:[S]` with one sort of the kind is unchanged.
 
 ### Documentation
 
