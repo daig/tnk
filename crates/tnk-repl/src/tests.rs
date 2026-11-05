@@ -428,6 +428,663 @@ endsm
     }
 }
 
+/// Evaluate `setup`, then each command, in one REPL on a worker thread. A command that does not finish
+/// within `limit` fails the test instead of hanging the run. Returns each command's output in order.
+fn eval_commands_within(setup: &str, commands: &[&str], limit: std::time::Duration) -> Vec<String> {
+    let setup = setup.to_owned();
+    let owned: Vec<String> = commands
+        .iter()
+        .map(|command| (*command).to_owned())
+        .collect();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut r = repl();
+        for input in std::iter::once(setup).chain(owned) {
+            if sender.send(r.eval(&input).output).is_err() {
+                return;
+            }
+        }
+    });
+    let wait = |what: &str| match receiver.recv_timeout(limit) {
+        Ok(output) => output,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("`{what}` did not finish within {limit:?}")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("evaluating `{what}` panicked")
+        }
+    };
+    let setup = wait("module setup");
+    assert!(
+        !setup.contains("error") && !setup.contains("no parse"),
+        "setup: {setup}"
+    );
+    commands.iter().map(|command| wait(command)).collect()
+}
+
+/// `try(E)` yields every `E` solution, or the unchanged subject when `E` has none; `test(E)` yields the
+/// unchanged subject once exactly when `E` has a solution (TNK-STRAT-002).
+#[test]
+fn try_and_test_derived_forms_through_repl() {
+    let mut r = repl();
+    let setup = r.eval(
+        r#"
+smod DERIVED-BRANCH is
+  sort S .
+  ops a b c d : -> S [ctor] .
+  op f : S S -> S [ctor] .
+  rl [r1] : a => b .
+  rl [r2] : a => c .
+  strat walk : @ S .
+  sd walk := try(matchrew f(X:S, Y:S) by X:S using r1, Y:S using walk) .
+endsm
+"#,
+    );
+    assert!(
+        !setup.output.contains("error") && !setup.output.contains("no parse"),
+        "derived-branch module: {}",
+        setup.output
+    );
+    let cases = [
+        ("srewrite b using try(r1) .", "b"),
+        ("srewrite a using try(fail) .", "a"),
+        ("srewrite d using try(all) .", "d"),
+        ("srewrite a using try(r1 | r2) .", "b ; c"),
+        ("dsrewrite a using try(r1 | r2) .", "b ; c"),
+        ("srewrite a using try(r1 ; r1) ; r2 .", "c"),
+        // A recursive definition whose base case is `try` keeping a subterm that does not match.
+        ("srewrite f(a, f(a, d)) using walk .", "f(b, f(b, d))"),
+        ("srewrite f(b, f(a, d)) using walk .", "f(b, f(a, d))"),
+        ("srewrite a using test(r1) .", "a"),
+        ("srewrite a using test(r1 | r2) .", "a"),
+        ("dsrewrite a using test(r1 | r2) .", "a"),
+        ("srewrite d using test(r1) .", "(no solution)"),
+        ("srewrite a using test(r1 | r2) ; (r1 | r2) .", "b ; c"),
+    ];
+    for (command, expected) in cases {
+        let out = r.eval(command).output;
+        assert_eq!(strategy_solutions(&out), [expected], "{command}\n{out}");
+    }
+}
+
+/// `T ? S : F` runs `S` on every `T` solution, including through `or-else`, a definition body, and a
+/// `matchrew` by-strategy (TNK-STRAT-002).
+#[test]
+fn branch_success_runs_on_every_test_solution_through_repl() {
+    let mut r = repl();
+    let setup = r.eval(
+        r#"
+smod BRANCH-EVERY is
+  sort S .
+  ops a b c d e : -> S [ctor] .
+  op f : S S -> S [ctor] .
+  rl [r1] : a => b .
+  rl [r2] : a => c .
+  rl [r3] : b => d .
+  rl [r4] : c => e .
+  strat pick : @ S .
+  sd pick := (r1 | r2) ? idle : fail .
+endsm
+"#,
+    );
+    assert!(
+        !setup.output.contains("error") && !setup.output.contains("no parse"),
+        "branch module: {}",
+        setup.output
+    );
+    let cases = [
+        ("srewrite a using (r1 | r2) ? (r3 | r4) : idle .", "d ; e"),
+        ("dsrewrite a using (r1 | r2) ? (r3 | r4) : idle .", "d ; e"),
+        ("srewrite a using (r1 | r2) ? idle : fail .", "b ; c"),
+        ("srewrite a using or-else(r1 | r2, idle) .", "b ; c"),
+        ("srewrite a using pick .", "b ; c"),
+        (
+            "srewrite f(a, a) using matchrew f(X:S, Y:S) by X:S using ((r1 | r2) ? idle : fail) .",
+            "f(b, a) ; f(c, a)",
+        ),
+        (
+            "srewrite a using (r1 | r2) ? fail : idle .",
+            "(no solution)",
+        ),
+        ("srewrite b using (r1 | r2) ? idle : r3 .", "d"),
+    ];
+    for (command, expected) in cases {
+        let out = r.eval(command).output;
+        assert_eq!(strategy_solutions(&out), [expected], "{command}\n{out}");
+    }
+}
+
+/// A committed `one`, `not`, or `test` discards its whole remaining sub-search, including nested named-call
+/// bodies, branches, `one`, and normalizations, so an infinite discarded sub-search cannot keep the command
+/// running. A branch over an infinite test inside a committed task stops with it.
+#[test]
+fn committed_strategies_discard_nested_sub_searches_through_repl() {
+    let setup = r#"
+smod COMMIT-DISCARD is
+  sort S .
+  ops a b : -> S [ctor] .
+  ops g h : S -> S [ctor] .
+  rl [deeper] : h(X:S) => h(g(X:S)) .
+  strat grow : @ S .
+  sd grow := deeper * .
+endsm
+"#;
+    let cases = [
+        ("srewrite h(a) using one(grow) .", "h(a)"),
+        ("srewrite h(a) using not(grow) .", "(no solution)"),
+        ("srewrite h(a) using test(grow) .", "h(a)"),
+        ("dsrewrite h(a) using not(grow) .", "(no solution)"),
+        ("srewrite h(a) using one(try(grow)) .", "h(a)"),
+        ("srewrite h(a) using one(grow ? idle : idle) .", "h(a)"),
+        ("srewrite h(a) using grow ? fail : idle .", "(no solution)"),
+        (
+            "srewrite h(a) using one(idle | one(deeper * ; match h(b))) .",
+            "h(a)",
+        ),
+        (
+            "srewrite h(a) using one(idle | ((deeper * ; match h(b)) ? idle : idle)) .",
+            "h(a)",
+        ),
+        (
+            "srewrite h(a) using one(idle | (deeper * ; match h(b)) !) .",
+            "h(a)",
+        ),
+        (
+            "srewrite h(a) using one((deeper *) ? idle : fail) .",
+            "h(a)",
+        ),
+        ("srewrite h(a) using one(try(deeper *)) .", "h(a)"),
+        ("srewrite h(a) using not(try(deeper *)) .", "(no solution)"),
+        ("srewrite h(a) using test(try(deeper *)) .", "h(a)"),
+        ("srewrite h(a) using one(or-else(deeper *, idle)) .", "h(a)"),
+        // A literal `fail` success arm commits by itself.
+        (
+            "srewrite h(a) using (deeper *) ? fail : idle .",
+            "(no solution)",
+        ),
+        ("srewrite h(a) using test(deeper *) .", "h(a)"),
+    ];
+    let commands: Vec<&str> = cases.iter().map(|(command, _)| *command).collect();
+    let outputs = eval_commands_within(setup, &commands, std::time::Duration::from_secs(30));
+    for ((command, expected), out) in cases.iter().zip(outputs) {
+        assert_eq!(strategy_solutions(&out), [*expected], "{command}\n{out}");
+    }
+}
+
+/// Variables bound by a `matchrew` pattern or a `:=` condition fragment are bound in every `using`
+/// substrategy, with the match's values before rewriting: in call arguments, application substitutions,
+/// nested patterns and conditions, nested matchrews, and definition bodies (TNK-STRAT-002).
+#[test]
+fn matchrew_variables_are_bound_in_using_substrategies_through_repl() {
+    let mut r = repl();
+    let setup = r.eval(
+        r#"
+smod MATCHREW-SCOPE is
+  sorts E P Elt Set Pair .
+  subsort Elt < Set .
+  ops a b c : -> E [ctor] .
+  op g : E -> E [ctor] .
+  op h : E E -> E [ctor] .
+  op f : E E -> P [ctor] .
+  op k : E -> E .
+  eq k(a) = b .
+  ops x y z xy : -> Elt [ctor] .
+  op empty : -> Set [ctor] .
+  op _,_ : Set Set -> Set [ctor assoc comm id: empty] .
+  op <_|_> : Set Set -> Pair [ctor] .
+  vars U V : E .
+  rl [ab] : a => b .
+  rl [bc] : b => c .
+  rl [gg] : g(V) => V .
+  crl [wrap] : g(V) => g(U) if V => U .
+  rl [cat] : x, y => xy .
+  rl [drop] : x => empty .
+  rl [drop] : y => empty .
+  rl [drop] : z => empty .
+  strat keep : E @ E .
+  strats s1 s2 s3 : @ P .
+  strat filter : Set @ Set .
+  sd keep(V) := match V .
+  sd s1 := matchrew f(X:E, Y:E) by X:E using ab, Y:E using keep(X:E) .
+  sd s2 := matchrew f(X:E, Y:E) by Y:E using gg[V <- X:E] .
+  sd s3 := matchrew f(X:E, Y:E) by Y:E using match X:E .
+  sd filter(S1:Set) := (matchrew Q:Elt, S:Set such that (Q:Elt, R:Set) := S1:Set
+                          by Q:Elt using drop, S:Set using filter(S1:Set)) ? idle : idle .
+endsm
+"#,
+    );
+    assert!(
+        !setup.output.contains("error") && !setup.output.contains("no parse"),
+        "matchrew scope module: {}",
+        setup.output
+    );
+    let cases = [
+        // Strategy-call arguments and application substitution values.
+        (
+            "srewrite f(a, a) using matchrew f(X:E, Y:E) by Y:E using keep(X:E) .",
+            "f(a, a)",
+        ),
+        (
+            "srewrite f(a, b) using matchrew f(X:E, Y:E) by Y:E using keep(X:E) .",
+            "(no solution)",
+        ),
+        (
+            "srewrite f(a, g(a)) using matchrew f(X:E, Y:E) by Y:E using gg[V <- X:E] .",
+            "f(a, a)",
+        ),
+        (
+            "srewrite f(a, g(b)) using matchrew f(X:E, Y:E) by Y:E using gg[V <- X:E] .",
+            "(no solution)",
+        ),
+        // Another substrategy sees X's value before its own substrategy rewrites it.
+        (
+            "srewrite f(a, a) using matchrew f(X:E, Y:E) by X:E using ab, Y:E using keep(X:E) .",
+            "f(b, a)",
+        ),
+        (
+            "dsrewrite f(a, a) using matchrew f(X:E, Y:E) by X:E using ab, Y:E using keep(X:E) .",
+            "f(b, a)",
+        ),
+        // Nested patterns and conditions are instantiated, not given fresh variables.
+        (
+            "srewrite f(a, b) using matchrew f(X:E, Y:E) by Y:E using match X:E .",
+            "(no solution)",
+        ),
+        (
+            "srewrite f(a, a) using matchrew f(X:E, Y:E) by Y:E using match X:E .",
+            "f(a, a)",
+        ),
+        (
+            "srewrite f(a, g(b)) using matchrew f(X:E, Y:E) by Y:E using amatch X:E .",
+            "(no solution)",
+        ),
+        (
+            "srewrite f(a, b) using matchrew f(X:E, Y:E) by Y:E using (match Z:E such that Z:E = X:E) .",
+            "(no solution)",
+        ),
+        (
+            "srewrite f(a, h(c, b)) using matchrew f(X:E, Y:E) by Y:E using (matchrew h(X:E, W:E) by W:E using bc) .",
+            "(no solution)",
+        ),
+        (
+            "srewrite f(a, h(a, b)) using matchrew f(X:E, Y:E) by Y:E using (matchrew h(X:E, W:E) by W:E using bc) .",
+            "f(a, h(a, c))",
+        ),
+        (
+            "srewrite < x, y | z, y, x > using matchrew < S1:Set | S2:Set > by S2:Set using match (S1:Set, R:Set) .",
+            "< x, y | x, y, z >",
+        ),
+        (
+            "srewrite < x, y | z, x > using matchrew < S1:Set | S2:Set > by S2:Set using match (S1:Set, R:Set) .",
+            "(no solution)",
+        ),
+        // A `:=` condition variable, per-match values under amatchrew, a rewrite-condition substrategy,
+        // and the outer match's variable two levels down.
+        (
+            "srewrite f(a, b) using matchrew f(X:E, Y:E) such that W:E := k(X:E) by Y:E using keep(W:E) .",
+            "f(a, b)",
+        ),
+        (
+            "srewrite f(a, a) using amatchrew X:E by X:E using (keep(X:E) ; ab) .",
+            "f(b, a) ; f(a, b)",
+        ),
+        (
+            "srewrite f(a, g(a)) using matchrew f(X:E, Y:E) by Y:E using wrap{keep(X:E) ; ab} .",
+            "f(a, g(b))",
+        ),
+        (
+            "srewrite f(b, h(a, b)) using matchrew f(X:E, Y:E) by X:E using bc, Y:E using (matchrew h(Z:E, W:E) by Z:E using ab, W:E using keep(X:E)) .",
+            "f(c, h(b, b))",
+        ),
+        // A recursive definition called with an outer matchrew variable.
+        (
+            "srewrite < x, y | x, z > using matchrew < S1:Set | S2:Set > by S1:Set using one(cat), S2:Set using filter(S1:Set) .",
+            "< xy | z >",
+        ),
+        // Definition bodies used to be dropped when a substrategy used a matchrew variable.
+        ("srewrite f(a, a) using s1 .", "f(b, a)"),
+        ("srewrite f(a, g(a)) using s2 .", "f(a, a)"),
+        ("srewrite f(a, b) using s3 .", "(no solution)"),
+        ("srewrite f(a, a) using s3 .", "f(a, a)"),
+    ];
+    for (command, expected) in cases {
+        let out = r.eval(command).output;
+        assert_eq!(strategy_solutions(&out), [expected], "{command}\n{out}");
+    }
+}
+
+/// A `matchrew` by-variable must be a distinct variable of the pattern, and a substrategy must not use a
+/// condition variable that the pattern or a `:=` fragment does not bind. Each is a resolution error rather
+/// than a panic or a discarded substrategy result, and later commands still run.
+#[test]
+fn matchrew_by_variables_and_substrategy_variables_are_validated_through_repl() {
+    let mut r = repl();
+    let setup = r.eval(
+        r#"
+smod MATCHREW-BY is
+  sorts E P .
+  ops a b c : -> E [ctor] .
+  op g : E -> E [ctor] .
+  op f : E E -> P [ctor] .
+  var V : E .
+  rl [ab] : a => b .
+  rl [bc] : b => c .
+  rl [gg] : g(V) => V .
+  strat keep : E @ E .
+  sd keep(V) := match V .
+endsm
+"#,
+    );
+    assert!(
+        !setup.output.contains("error") && !setup.output.contains("no parse"),
+        "by-variable module: {}",
+        setup.output
+    );
+    let not_in_pattern = "error: matchrew variable `Z:E` does not occur in the pattern";
+    let unbound = "error: matchrew substrategy variable `Z:E` is not bound by the pattern or a `:=` condition fragment";
+    let cases = [
+        // A by-variable only in an equality condition used to panic; one bound only by `:=` had its
+        // rewritten value discarded.
+        (
+            "srewrite f(a, a) using matchrew f(X:E, Y:E) such that Z:E = X:E by Z:E using ab .",
+            not_in_pattern,
+        ),
+        (
+            "srewrite f(a, a) using matchrew f(X:E, Y:E) such that Z:E := X:E by Z:E using ab .",
+            not_in_pattern,
+        ),
+        // A repeated by-variable used to let the last substrategy overwrite the others.
+        (
+            "srewrite f(a, a) using matchrew f(X:E, Y:E) by X:E using ab, X:E using bc .",
+            "error: matchrew variable `X:E` is repeated",
+        ),
+        (
+            "srewrite f(a, a) using matchrew f(X:E, Y:E) by X:E using ab, Y:E using idle, X:E using idle .",
+            "error: matchrew variable `X:E` is repeated",
+        ),
+        // Condition variables that only an equality, a sort test, or a `:=` subject mentions.
+        (
+            "srewrite f(a, b) using matchrew f(X:E, Y:E) such that Z:E = X:E by Y:E using keep(Z:E) .",
+            unbound,
+        ),
+        (
+            "srewrite f(a, b) using matchrew f(X:E, Y:E) such that Z:E = X:E by Y:E using match Z:E .",
+            unbound,
+        ),
+        (
+            "srewrite f(a, g(a)) using matchrew f(X:E, Y:E) such that Z:E : E by Y:E using gg[V <- Z:E] .",
+            unbound,
+        ),
+        (
+            "srewrite f(a, g(a)) using matchrew f(X:E, Y:E) such that X:E := Z:E by Y:E using gg[V <- Z:E] .",
+            unbound,
+        ),
+        // Names bound nowhere stay unbound.
+        (
+            "srewrite f(a, a) using matchrew f(X:E, Y:E) by Y:E using keep(Q:E) .",
+            "error: strategy call `keep` contains an unbound argument variable",
+        ),
+        (
+            "srewrite f(a, g(a)) using matchrew f(X:E, Y:E) by Y:E using gg[V <- Q:E] .",
+            "error: an application substitution value contains an unbound strategy variable",
+        ),
+    ];
+    for (command, expected) in cases {
+        let out = r.eval(command).output;
+        assert_eq!(out, wrap::auto_wrap(expected), "{command}");
+    }
+    // In a definition body the rejected matchrew leaves the definition unusable; a call must not panic.
+    let module = r
+        .eval(
+            "smod MATCHREW-BY-SD is\n\
+               protecting MATCHREW-BY .\n\
+               strat dropped : @ P .\n\
+               sd dropped := matchrew f(X:E, Y:E) such that Z:E = X:E by Y:E using gg[V <- Z:E] .\n\
+             endsm",
+        )
+        .output;
+    let out = r.eval("srewrite f(a, g(a)) using dropped .").output;
+    assert!(!out.contains("Solution"), "{module}\n{out}");
+    let out = r
+        .eval("srewrite f(a, a) using matchrew f(X:E, Y:E) by X:E using ab .")
+        .output;
+    assert_eq!(strategy_solutions(&out), ["f(b, a)"], "{out}");
+}
+
+/// A `matchrew` by-variable that the enclosing definition or matchrew already binds is matched at its bound
+/// value, and its occurrences are rebuilt from the substrategy results (TNK-STRAT-002). This used to panic.
+#[test]
+fn context_bound_matchrew_by_variable_is_matched_at_its_value_through_repl() {
+    let mut r = repl();
+    let setup = r.eval(
+        r#"
+smod PREBOUND-BY is
+  sorts E P Elt Set .
+  subsort Elt < Set .
+  ops a b : -> E [ctor] .
+  op g : E -> E [ctor] .
+  op f : E E -> P [ctor] .
+  ops x y : -> Elt [ctor] .
+  op empty : -> Set [ctor] .
+  op _,_ : Set Set -> Set [ctor assoc comm id: empty] .
+  op w : Set -> Set [ctor] .
+  rl [r] : a => b .
+  rl [xy] : x => y .
+  strat s : E @ P .
+  strats t u : Set @ Set .
+  vars X Y : E .
+  vars S R : Set .
+  sd s(X) := matchrew f(X, Y) by X using r .
+  sd t(S) := matchrew w((S, R)) by S using xy .
+  sd u(S) := matchrew w((S, R)) by S using idle, R using idle .
+endsm
+"#,
+    );
+    assert!(
+        !setup.output.contains("error") && !setup.output.contains("no parse"),
+        "prebound by-variable module: {}",
+        setup.output
+    );
+    let cases = [
+        ("srewrite f(a, a) using s(a) .", "f(b, a)"),
+        ("srewrite f(b, a) using s(a) .", "(no solution)"),
+        (
+            "srewrite f(a, g(a)) using matchrew f(X, Y) by Y using (matchrew g(X) by X using r) .",
+            "f(a, g(b))",
+        ),
+        (
+            "srewrite f(a, g(b)) using matchrew f(X, Y) by Y using (matchrew g(X) by X using r) .",
+            "(no solution)",
+        ),
+        ("srewrite w(x, x, y) using t(x) .", "w(x, y, y)"),
+        ("srewrite w(y, y) using t(x) .", "(no solution)"),
+        ("srewrite w(x, y) using u(empty) .", "w(x, y)"),
+        ("srewrite w(x, y) using u((x, y)) .", "w(x, y)"),
+    ];
+    for (command, expected) in cases {
+        let out = r.eval(command).output;
+        assert_eq!(strategy_solutions(&out), [expected], "{command}\n{out}");
+    }
+}
+
+/// `matchrew` and `amatchrew` by-variable strategies run as child searches of the command (TNK-STRAT-001). A
+/// match is rebuilt as soon as every by-variable has a solution, so `one`, `not`, `test`, and a fair union
+/// sibling finish even when a by-variable search is infinite, and fair `srewrite` order decides which
+/// result `one` keeps. `dsrewrite` explores the by-variables in order. These searches used to run to
+/// completion before any combination was built, so an infinite one never let the command finish.
+#[test]
+fn matchrew_substrategies_are_scheduled_child_searches_through_repl() {
+    let setup = r#"
+smod MATCHREW-SCHEDULED is
+  sorts S P T .
+  ops a b c : -> S [ctor] .
+  op f : S -> S [ctor] .
+  op k : S S -> S [ctor] .
+  op <_|_> : S S -> P [ctor] .
+  op t : S S S -> T [ctor] .
+  var X : S .
+  rl [wrap] : f(X) => f(f(X)) .
+  rl [r1] : a => b .
+  rl [r2] : a => c .
+  rl [q] : b => c .
+  strat step @ S .
+  sd step := (top(r1) ; top(q)) | top(q) .
+endsm
+"#;
+    let cases = [
+        // An infinite by-variable search still yields the first combination.
+        (
+            "srewrite < f(a) | b > using one(matchrew < X:S | Y:S > by X:S using wrap *, Y:S using idle) .",
+            "< f(a) | b >",
+        ),
+        (
+            "srewrite < f(a) | f(a) > using one(matchrew < X:S | Y:S > by X:S using wrap *, Y:S using wrap *) .",
+            "< f(a) | f(a) >",
+        ),
+        (
+            "srewrite < f(a) | b > using one(matchrew < X:S | Y:S > by X:S using (wrap * ; match f(f(a))), Y:S using idle) .",
+            "< f(f(a)) | b >",
+        ),
+        (
+            "srewrite < f(a) | b > using not(matchrew < X:S | Y:S > by X:S using wrap *, Y:S using idle) .",
+            "(no solution)",
+        ),
+        (
+            "srewrite < f(a) | b > using test(matchrew < X:S | Y:S > by X:S using wrap *, Y:S using idle) .",
+            "< f(a) | b >",
+        ),
+        // Depth-first exploration finishes the first by-variable before the infinite second one.
+        (
+            "dsrewrite < b | f(a) > using one(matchrew < X:S | Y:S > by X:S using idle, Y:S using wrap *) .",
+            "< b | f(a) >",
+        ),
+        // A fair sibling of an infinite matchrew is not starved.
+        (
+            "srewrite < f(a) | b > using one(idle | matchrew < X:S | Y:S > by X:S using wrap *, Y:S using idle) .",
+            "< f(a) | b >",
+        ),
+        // The one-step derivation at position 2 completes first under fair scheduling.
+        (
+            "srewrite k(a, b) using one(amatchrew X:S by X:S using step) .",
+            "k(a, c)",
+        ),
+        (
+            "dsrewrite k(a, b) using one(amatchrew X:S by X:S using step) .",
+            "k(c, b)",
+        ),
+        (
+            "srewrite k(a, b) using amatchrew X:S by X:S using step .",
+            "k(a, c) ; k(c, b)",
+        ),
+        // Every combination, the first by-variable varying fastest within each new solution.
+        (
+            "dsrewrite t(a, a, a) using matchrew t(X:S, Y:S, Z:S) by X:S using (r1 | r2), Y:S using (r1 | r2), Z:S using (r1 | r2) .",
+            "t(b, b, b) ; t(c, b, b) ; t(b, c, b) ; t(c, c, b) ; t(b, b, c) ; t(c, b, c) ; t(b, c, c) ; t(c, c, c)",
+        ),
+    ];
+    let mut commands: Vec<&str> = cases.iter().map(|(command, _)| *command).collect();
+    let fair_product = "srewrite t(a, a, a) using matchrew t(X:S, Y:S, Z:S) by X:S using (r1 | r2), Y:S using (r1 | r2), Z:S using (r1 | r2) .";
+    commands.push(fair_product);
+    let mut outputs = eval_commands_within(setup, &commands, std::time::Duration::from_secs(30));
+    let fair = outputs.pop().expect("fair product output");
+    for ((command, expected), out) in cases.iter().zip(outputs) {
+        assert_eq!(strategy_solutions(&out), [*expected], "{command}\n{out}");
+    }
+    let mut found: Vec<String> = strategy_solutions(&fair)[0]
+        .split(" ; ")
+        .map(str::to_owned)
+        .collect();
+    found.sort();
+    let mut expected: Vec<String> = Vec::new();
+    for z in ["b", "c"] {
+        for y in ["b", "c"] {
+            for x in ["b", "c"] {
+                expected.push(format!("t({x}, {y}, {z})"));
+            }
+        }
+    }
+    expected.sort();
+    assert_eq!(found, expected, "{fair_product}\n{fair}");
+}
+
+/// The rewrite-condition substrategies of a strategy-controlled rule application run as child searches of
+/// the command (TNK-STRAT-001). Each condition solution rewrites the subject at once, so `one`, `not`, and a
+/// fair union sibling finish even when a condition search is infinite, and fair `srewrite` order decides
+/// which result `one` keeps. These searches used to run to completion before the rule produced any result.
+#[test]
+fn rewrite_condition_substrategies_are_scheduled_child_searches_through_repl() {
+    let setup = r#"
+smod RWCOND-SCHEDULED is
+  sorts S P .
+  ops a b c : -> S [ctor] .
+  ops f g h : S -> S [ctor] .
+  op k : S S -> S [ctor] .
+  op p : S S -> P [ctor] .
+  vars X X' Y Y' : S .
+  rl [wrap] : f(X) => f(f(X)) .
+  rl [r1] : a => b .
+  rl [q] : b => c .
+  crl [lift] : g(X) => X' if X => X' .
+  crl [keep] : h(X) => h(Y) if X => Y .
+  crl [both] : p(X, Y) => p(X', Y') if X => X' /\ Y => Y' .
+  strat step @ S .
+  sd step := (top(r1) ; top(q)) | top(q) .
+endsm
+"#;
+    let cases = [
+        ("srewrite g(f(a)) using one(lift{wrap *}) .", "f(a)"),
+        (
+            "srewrite g(f(a)) using not(lift{wrap *}) .",
+            "(no solution)",
+        ),
+        (
+            "srewrite g(f(a)) using one(idle | lift{wrap *}) .",
+            "g(f(a))",
+        ),
+        ("srewrite g(f(a)) using lift{wrap} .", "f(f(a))"),
+        // Either fragment of a two-fragment condition may have an infinite search.
+        (
+            "srewrite p(f(a), b) using one(both{wrap *, idle}) .",
+            "p(f(a), b)",
+        ),
+        (
+            "srewrite p(b, f(a)) using one(both{idle, wrap *}) .",
+            "p(b, f(a))",
+        ),
+        (
+            "dsrewrite p(b, f(a)) using one(both{idle, wrap *}) .",
+            "p(b, f(a))",
+        ),
+        (
+            "srewrite p(b, f(a)) using not(both{idle, wrap *}) .",
+            "(no solution)",
+        ),
+        // Each solution of the first fragment solves the second one; the shorter derivation comes first.
+        (
+            "srewrite p(a, a) using both{r1 | idle, r1} .",
+            "p(a, b) ; p(b, b)",
+        ),
+        (
+            "dsrewrite p(a, a) using both{r1 | idle, r1} .",
+            "p(b, b) ; p(a, b)",
+        ),
+        // The condition at position 2 completes first under fair scheduling.
+        (
+            "srewrite k(h(a), h(b)) using one(keep{step}) .",
+            "k(h(a), h(c))",
+        ),
+        (
+            "dsrewrite k(h(a), h(b)) using one(keep{step}) .",
+            "k(h(c), h(b))",
+        ),
+    ];
+    let commands: Vec<&str> = cases.iter().map(|(command, _)| *command).collect();
+    let outputs = eval_commands_within(setup, &commands, std::time::Duration::from_secs(30));
+    for ((command, expected), out) in cases.iter().zip(outputs) {
+        assert_eq!(strategy_solutions(&out), [*expected], "{command}\n{out}");
+    }
+}
+
 fn prelude_results(out: &str) -> Vec<String> {
     let lines: Vec<&str> = out.lines().collect();
     let mut results = Vec::new();

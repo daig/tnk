@@ -8,7 +8,7 @@ the recording fails the suite.
 - `acu-match.diff` — AC match-solution enumeration order; programmatically
   verified set-equal.
 - `strategy.diff`, `prelude-meta.diff` — per-solution rewrite counts only; values, solution order, and
-  echoes remain byte-identical. The differing counts come from matchrew/amatchrew sub-search scheduling
+  echoes remain byte-identical. The differing counts come from `amatchrew` sub-search scheduling
   and indexed `metaSearch` exploration order. Object-level search and strategy counts remain exact.
 
 Only these four recorded diffs are accepted. Every other fixture must match the live oracle under the

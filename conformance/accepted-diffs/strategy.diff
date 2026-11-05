@@ -1,19 +1,5 @@
 --- oracle
 +++ tnk
-@@ -236,11 +236,11 @@
-     r2), Y:S using (r1 | r2) .
- 
- Solution 1
--rewrites: 3
-+rewrites: 4
- result S: f(b, b)
- 
- Solution 2
--rewrites: 3
-+rewrites: 4
- result S: f(c, b)
- 
- Solution 3
 @@ -269,7 +269,7 @@
  srewrite in STRAT-D : f(a, a) using amatchrew X:S by X:S using r1 .
  
@@ -21,14 +7,5 @@
 -rewrites: 3
 +rewrites: 4
  result S: f(b, a)
- 
- Solution 2
-@@ -297,7 +297,7 @@
- dsrewrite in STRAT-D : a using wrap{r1 | r2} .
- 
- Solution 1
--rewrites: 2
-+rewrites: 4
- result S: g(b)
  
  Solution 2

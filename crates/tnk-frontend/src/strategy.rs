@@ -9,15 +9,28 @@
 //! stack is empty emits a solution to its task. `srewrite` appends successors for FIFO round-robin search;
 //! `dsrewrite` prepends them, preserving local successor order for depth-first search.
 //!
-//! Branching, `one`, and normalization run sub-searches as child tasks in the same queue. A task's `slaves`
-//! count includes its live processes and child tasks; reaching zero triggers exhaustion behavior such as a
-//! branch failure arm or normal-form emission. Shared scheduling determines both solution order and the
-//! cumulative rewrite count recorded when each solution is emitted.
+//! Branching, `one`, normalization, named-call bodies, `matchrew` by-variable strategies, and
+//! rewrite-condition substrategies run sub-searches as child tasks in the same queue, so every sub-search
+//! interleaves with the rest of the command under its scheduling policy. A task's `slaves` count includes its
+//! live processes and child tasks; reaching zero triggers exhaustion behavior such as a branch failure arm or
+//! normal-form emission, and the exhausted task in turn leaves its parent. That cascade is a loop, so the
+//! nesting depth of sub-searches lives in the task tree rather than on the native stack. A branch runs its
+//! success arm on every test solution. `one`, and a branch whose success arm is `fail`, commit after their
+//! first solution: the committed task and every descendant task die, so no remaining sub-search keeps
+//! running. Shared scheduling determines both solution order and the cumulative rewrite count recorded when
+//! each solution is emitted.
 //!
-//! `matchrew` and `amatchrew` run each selected by-variable strategy to exhaustion before rebuilding the
-//! Cartesian product of their results. These eager sub-searches share the cumulative rewrite counter, so
-//! unequal branch depths affect later emitted counts. Resolution rejects `xmatchrew` and calls that have only
-//! conditional `csd` definitions.
+//! Each selected `matchrew` or `amatchrew` match is a coordinator task with one child task per by-variable.
+//! The coordinator records each child solution; once every by-variable has one, every new solution rebuilds
+//! the match for its combinations with the solutions already recorded for the other by-variables. By-variable
+//! strategies resolve with the pattern and condition variables bound; each match specializes the strategies
+//! that use them with that match's values, as a call specializes a definition body. A by-variable already
+//! bound by the context keeps its pattern positions and seeds the match with its value. Resolution rejects
+//! `xmatchrew` and calls that have only conditional `csd` definitions.
+//!
+//! A strategy-controlled application of a conditional rule solves the equational condition fragments of each
+//! rule match within the step. Each rewrite fragment runs its condition substrategy as a child task whose
+//! solutions resume the remaining fragments; each solved condition rewrites the subject.
 
 use crate::build_term::{VarIndex, build_term};
 use crate::cfparser::compile::CompiledGrammar;
@@ -27,7 +40,9 @@ use crate::load::{
 };
 use crate::surface::ast::{StratExpr, StratSugar, TestKind};
 use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::ops::Range;
 use std::rc::Rc;
+use tnk_core::RewriteMatchContext;
 use tnk_core::dag::{DagId, NodeRepr};
 use tnk_core::engine::Engine;
 use tnk_core::host::ReducerFault;
@@ -120,7 +135,10 @@ enum RStrat {
         pattern: Term,
         nr_vars: u32,
         cond: Vec<ConditionFragment>,
-        by: Vec<(u32, Rc<RStrat>)>,
+        by: Vec<ByStrategy>,
+        /// Values of by-variables that the enclosing definition or matchrew already binds. Each stays a
+        /// pattern variable and seeds the match with its value, so its occurrences are still rebuilt.
+        prebound: Vec<(u32, Term)>,
     },
     Call {
         name: String,
@@ -132,6 +150,14 @@ enum RStrat {
         bodies: Rc<Vec<Rc<RStrat>>>,
         next: usize,
     },
+}
+
+/// A `matchrew` by-variable slot and its substrategy. `uses` lists the matchrew's own pattern and condition
+/// slots that the substrategy mentions; each match substitutes their values into it.
+struct ByStrategy {
+    slot: u32,
+    strategy: Rc<RStrat>,
+    uses: Vec<u32>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -160,12 +186,14 @@ struct StrategyProgram {
 }
 
 /// The evaluation context: the engine, the compiled strategy-definition program, the cumulative
-/// rewrite count, and the first strict-reducer fault raised by an internal equational normalization.
+/// rewrite count, the first strict-reducer fault raised by an internal equational normalization, and the
+/// first input found during execution that the executor cannot run. Either one stops the search.
 struct Cx<'a> {
     eng: &'a mut Engine,
     program: &'a StrategyProgram,
     count: u64,
     reducer_fault: Option<ReducerFault>,
+    invalid: Option<String>,
 }
 
 /// A pending continuation: an immutable stack of resolved strategy frames (top = the next to decompose).
@@ -229,13 +257,42 @@ struct OneMatch {
     result: DagId,
 }
 
+/// One strategy-controlled match of a conditional rule whose condition is being solved: the `RStrat::Apply`
+/// node and the index of the rule in it, the subject and match position, the matcher's extension context,
+/// and the application's continuation.
+struct CondState {
+    apply: Rc<RStrat>,
+    rule: usize,
+    dag: DagId,
+    path: Vec<usize>,
+    context: RewriteMatchContext,
+    rest: Pending,
+}
+
+impl CondState {
+    /// The rule being applied and the application's condition substrategies.
+    fn application(&self) -> (&RRule, &[Rc<RStrat>]) {
+        let RStrat::Apply {
+            rules, substrats, ..
+        } = &*self.apply
+        else {
+            unreachable!("a rule condition belongs to a rule application");
+        };
+        (&rules[self.rule], substrats)
+    }
+}
+
 /// A sub-search whose solutions feed a continuation. `slaves` counts live processes and child tasks;
-/// reaching zero exhausts the task and runs its completion action.
+/// reaching zero exhausts the task and runs its completion action. `children` lists the child tasks created
+/// under it so that killing a task also kills its sub-search. `seen` holds the `(term, pending-key)` states
+/// this task has already run; a dead task releases them.
 struct TaskState {
     parent: usize,
+    children: Vec<usize>,
     slaves: i32,
     alive: bool,
     kind: TaskKind,
+    seen: Vec<(DagId, Vec<usize>)>,
 }
 
 enum TaskKind {
@@ -244,8 +301,9 @@ enum TaskKind {
     /// A named-call body task. Each solution resumes the call's outer continuation in the parent task;
     /// exhaustion has no fallback action.
     Call { rest: Pending },
-    /// `E ? success : failure` on `dag`: the first `E` solution schedules `success` and commits; exhaustion
-    /// without a solution schedules `failure` on the original `dag`.
+    /// `E ? success : failure` on `dag`: every `E` solution schedules `success` on that solution; exhaustion
+    /// without a solution schedules `failure` on the original `dag`. A literal `fail` success arm (`not`, and
+    /// both layers of `test`) commits after the first solution, which no later solution could change.
     Branch {
         dag: DagId,
         success: Rc<RStrat>,
@@ -262,6 +320,31 @@ enum TaskKind {
         normalize: Rc<RStrat>,
         rest: Pending,
         had_success: bool,
+    },
+    /// One selected match of the `matchrew` or `amatchrew` `strat`, at `path` in `dag`, with the match's
+    /// `bindings`. Its `MatchRewChild` tasks run the by-variable strategies; `results` records each
+    /// by-variable's solutions so far, and `empty` counts the by-variables that have none yet. It runs no
+    /// processes of its own, and exhaustion has no action.
+    MatchRew {
+        strat: Rc<RStrat>,
+        dag: DagId,
+        path: Vec<usize>,
+        bindings: Vec<Option<DagId>>,
+        results: Vec<Vec<DagId>>,
+        empty: usize,
+        rest: Pending,
+    },
+    /// The sub-search of by-variable `index` of the parent `MatchRew` task. Each solution is recorded there
+    /// and rebuilds the match for every new combination, in the coordinator's parent task.
+    MatchRewChild { index: usize },
+    /// The sub-search of rewrite fragment `frag` of a rule condition, run by condition substrategy `sub_idx`
+    /// from the fragment's instantiated left-hand side under `bindings`. Each solution that matches the
+    /// fragment's pattern resumes the remaining fragments in the parent task. Exhaustion has no action.
+    CondRewrite {
+        state: Rc<CondState>,
+        frag: usize,
+        sub_idx: usize,
+        bindings: Vec<Option<DagId>>,
     },
 }
 
@@ -289,7 +372,9 @@ pub fn srewrite_command(
     srewrite_dag(lm, i, subj, strat, depth_first)
 }
 
-/// Run a strategy over an already-built ground subject, bypassing subject parsing and construction.
+/// Run a strategy over an already-built subject, bypassing subject parsing and construction. A non-ground
+/// subject is rejected as invalid once a `matchrew` substrategy uses a variable bound to a non-ground
+/// subterm: substituting it would turn the subject variable into a strategy variable.
 pub fn srewrite_dag(
     lm: &mut LoadedModule,
     i: &Interner,
@@ -304,6 +389,7 @@ pub fn srewrite_dag(
         program: &program,
         count: 0,
         reducer_fault: None,
+        invalid: None,
     };
     cx.eng.reset_rewrites();
     let subj = cx.eng.try_reduce(subj)?;
@@ -311,6 +397,9 @@ pub fn srewrite_dag(
     let sols = run_search(&mut cx, subj, rstrat, !depth_first);
     if let Some(fault) = cx.reducer_fault.take() {
         return Err(StrategicRewriteError::Reducer(fault));
+    }
+    if let Some(message) = cx.invalid.take() {
+        return Err(StrategicRewriteError::Invalid(message));
     }
     let total = cx.count;
     let out = dedup(
@@ -637,7 +726,7 @@ fn resolve_in(
         StratExpr::Star(child) => RStrat::Star(resolve_in(child, lm, grammar, i, seed)?),
         StratExpr::Plus(child) => RStrat::Plus(resolve_in(child, lm, grammar, i, seed)?),
         StratExpr::Normalize(child) => RStrat::Normalize(resolve_in(child, lm, grammar, i, seed)?),
-        // Lower surface sugar to branch combinators; printing retains the original form.
+        // Lower surface sugar to branch combinators (TNK-STRAT-002); printing retains the original form.
         StratExpr::Sugar { kind, args } => {
             let branch =
                 |test: &StratExpr, success: StratExpr, failure: StratExpr| StratExpr::Branch {
@@ -646,10 +735,17 @@ fn resolve_in(
                     failure: Box::new(failure),
                 };
             let desugared = match kind {
-                StratSugar::Try | StratSugar::TestS => {
-                    branch(&args[0], StratExpr::Idle, StratExpr::Fail)
-                }
+                // `try(E) = E ? idle : idle`: every `E` solution, or the unchanged subject when `E` has none.
+                StratSugar::Try => branch(&args[0], StratExpr::Idle, StratExpr::Idle),
+                // `test(E) = not(not(E))`: the unchanged subject once when `E` has a solution, else none.
+                StratSugar::TestS => branch(
+                    &branch(&args[0], StratExpr::Fail, StratExpr::Idle),
+                    StratExpr::Fail,
+                    StratExpr::Idle,
+                ),
+                // `not(E) = E ? fail : idle`.
                 StratSugar::NotS => branch(&args[0], StratExpr::Fail, StratExpr::Idle),
+                // `or-else(E, F) = E ? idle : F`.
                 StratSugar::OrElse => branch(&args[0], StratExpr::Idle, args[1].clone()),
             };
             return resolve_in(&desugared, lm, grammar, i, seed);
@@ -675,7 +771,7 @@ fn resolve_in(
             };
             let mut vars = seed.clone();
             let pattern = parse_build(pattern, grammar, &lm.built, i, &mut vars)?;
-            let cond = resolve_test_cond(
+            let (cond, _) = resolve_test_cond(
                 cond.as_deref(),
                 &pattern,
                 &mut vars,
@@ -708,7 +804,7 @@ fn resolve_in(
             };
             let mut vars = seed.clone();
             let pattern = parse_build(pattern, grammar, &lm.built, i, &mut vars)?;
-            let cond = resolve_test_cond(
+            let (cond, bound) = resolve_test_cond(
                 cond.as_deref(),
                 &pattern,
                 &mut vars,
@@ -718,14 +814,36 @@ fn resolve_in(
                 seed.count(),
                 "matchrew `such that`",
             )?;
-            let mut by = Vec::new();
+            let mut pattern_vars = Vec::new();
+            term_var_indices(&pattern, &mut pattern_vars);
+            // This matchrew's own slots; enclosing specializations bind only the slots below them.
+            let own = seed.count()..vars.count();
+            let mut by: Vec<ByStrategy> = Vec::new();
             for (variable, child) in subs {
                 let name = token_text(variable, i);
-                let index = matchrew_variable_slot(variable, &name, &vars, lm, grammar, i)
+                let slot = matchrew_variable_slot(variable, &name, &vars, lm, grammar, i)
+                    .filter(|slot| pattern_vars.contains(slot))
                     .ok_or_else(|| {
                         format!("matchrew variable `{name}` does not occur in the pattern")
                     })?;
-                by.push((index, resolve_in(child, lm, grammar, i, seed)?));
+                if by.iter().any(|selected| selected.slot == slot) {
+                    return Err(format!("matchrew variable `{name}` is repeated"));
+                }
+                // The pattern and condition variables are bound in every substrategy.
+                let strategy = resolve_in(child, lm, grammar, i, &vars)?;
+                let mut uses = BTreeSet::new();
+                strategy_slots(&strategy, &own, &mut uses);
+                if let Some(&unbound) = uses.iter().find(|slot| !bound.contains(slot)) {
+                    return Err(format!(
+                        "matchrew substrategy variable `{}` is not bound by the pattern or a `:=` condition fragment",
+                        vars.name(unbound)
+                    ));
+                }
+                by.push(ByStrategy {
+                    slot,
+                    strategy,
+                    uses: uses.into_iter().collect(),
+                });
             }
             RStrat::MatchRew {
                 anywhere,
@@ -733,6 +851,7 @@ fn resolve_in(
                 nr_vars: vars.count(),
                 cond,
                 by,
+                prebound: Vec::new(),
             }
         }
         StratExpr::Call { name, args } => {
@@ -763,7 +882,9 @@ fn matchrew_variable_slot(
     }
 }
 
-/// Resolve an optional test or matchrew condition, rejecting rewrite (`=>`) fragments.
+/// Resolve an optional test or matchrew condition, rejecting rewrite (`=>`) fragments. Also returns the
+/// slots a successful match binds: the first `bound_prefix` (context) slots, the pattern variables, and
+/// the variables of `:=` fragment patterns.
 #[allow(clippy::too_many_arguments)]
 fn resolve_test_cond(
     cond: Option<&[Token]>,
@@ -774,14 +895,14 @@ fn resolve_test_cond(
     i: &Interner,
     bound_prefix: u32,
     owner: &str,
-) -> Result<Vec<ConditionFragment>, String> {
-    let Some(cond) = cond else {
-        return Ok(Vec::new());
-    };
+) -> Result<(Vec<ConditionFragment>, BTreeSet<u32>), String> {
     let mut bound: BTreeSet<u32> = (0..bound_prefix).collect();
     let mut pattern_vars = Vec::new();
     term_var_indices(pattern, &mut pattern_vars);
     bound.extend(pattern_vars);
+    let Some(cond) = cond else {
+        return Ok((Vec::new(), bound));
+    };
     let fragments = parse_condition(cond, grammar, &lm.built, i, vars, &mut bound)?;
     if fragments
         .iter()
@@ -791,11 +912,103 @@ fn resolve_test_cond(
             "a rewrite condition (`=>`) is not allowed in a {owner}"
         ));
     }
-    Ok(fragments)
+    Ok((fragments, bound))
+}
+
+/// Add to `out` the slots in `range` that `strategy`'s terms mention: test and matchrew patterns and
+/// conditions, call arguments, and application substitution values, through every nested substrategy.
+/// Rule terms use rule-local slots and are not scanned.
+fn strategy_slots(strategy: &RStrat, range: &Range<u32>, out: &mut BTreeSet<u32>) {
+    fn term(term: &Term, range: &Range<u32>, out: &mut BTreeSet<u32>) {
+        let mut slots = Vec::new();
+        term_var_indices(term, &mut slots);
+        out.extend(slots.into_iter().filter(|slot| range.contains(slot)));
+    }
+    fn condition(fragments: &[ConditionFragment], range: &Range<u32>, out: &mut BTreeSet<u32>) {
+        for fragment in fragments {
+            match fragment {
+                ConditionFragment::Equality { lhs, rhs } => {
+                    term(lhs, range, out);
+                    term(rhs, range, out);
+                }
+                ConditionFragment::SortTest { term: tested, .. } => term(tested, range, out),
+                ConditionFragment::Matching {
+                    pattern, subject, ..
+                } => {
+                    term(pattern, range, out);
+                    term(subject, range, out);
+                }
+                ConditionFragment::Rewrite { lhs, pattern, .. } => {
+                    term(lhs, range, out);
+                    term(pattern, range, out);
+                }
+            }
+        }
+    }
+    match strategy {
+        RStrat::Idle | RStrat::Fail => {}
+        RStrat::Apply {
+            subst, substrats, ..
+        } => {
+            for (_, value) in subst {
+                term(value, range, out);
+            }
+            for child in substrats {
+                strategy_slots(child, range, out);
+            }
+        }
+        RStrat::One(child)
+        | RStrat::Star(child)
+        | RStrat::Plus(child)
+        | RStrat::Normalize(child) => strategy_slots(child, range, out),
+        RStrat::Seq(left, right) | RStrat::Union(left, right) => {
+            strategy_slots(left, range, out);
+            strategy_slots(right, range, out);
+        }
+        RStrat::Branch {
+            test,
+            success,
+            failure,
+        } => {
+            strategy_slots(test, range, out);
+            strategy_slots(success, range, out);
+            strategy_slots(failure, range, out);
+        }
+        RStrat::Test { pattern, cond, .. } => {
+            term(pattern, range, out);
+            condition(cond, range, out);
+        }
+        RStrat::MatchRew {
+            pattern,
+            cond,
+            by,
+            prebound,
+            ..
+        } => {
+            term(pattern, range, out);
+            condition(cond, range, out);
+            for selected in by {
+                strategy_slots(&selected.strategy, range, out);
+            }
+            for (_, value) in prebound {
+                term(value, range, out);
+            }
+        }
+        RStrat::Call { args, .. } => {
+            for arg in args {
+                term(arg, range, out);
+            }
+        }
+        RStrat::CallGenerator { bodies, .. } => {
+            for body in bodies.iter() {
+                strategy_slots(body, range, out);
+            }
+        }
+    }
 }
 
 /// Resolve a rule application's initial substitution. Values may use variables from the enclosing strategy
-/// definition but cannot introduce variables.
+/// definition or matchrew but cannot introduce variables.
 fn resolve_subst(
     subst: &[(Vec<Token>, Vec<Token>)],
     lm: &LoadedModule,
@@ -1095,11 +1308,12 @@ fn run_search(cx: &mut Cx, dag: DagId, strat: Rc<RStrat>, fifo: bool) -> Vec<(Da
         q: VecDeque::new(),
         tasks: vec![TaskState {
             parent: 0,
+            children: Vec::new(),
             slaves: 0,
             alive: true,
             kind: TaskKind::Root,
+            seen: Vec::new(),
         }],
-        seen: Vec::new(),
         fifo,
         out: Vec::new(),
     };
@@ -1109,7 +1323,7 @@ fn run_search(cx: &mut Cx, dag: DagId, strat: Rc<RStrat>, fifo: bool) -> Vec<(Da
         app: None,
         task: 0,
     }]);
-    while cx.reducer_fault.is_none() {
+    while cx.reducer_fault.is_none() && cx.invalid.is_none() {
         let Some(process) = s.q.pop_front() else {
             break;
         };
@@ -1118,13 +1332,12 @@ fn run_search(cx: &mut Cx, dag: DagId, strat: Rc<RStrat>, fifo: bool) -> Vec<(Da
     s.out
 }
 
-/// Runnable processes and the task tree that routes sub-search results and detects exhaustion.
+/// Runnable processes and the task tree that routes sub-search results and detects exhaustion. Each task's
+/// `seen` states prune repeated `(term, pending-key)` states of that task, including repeated solution
+/// states; per-task sets keep independent sub-searches separate.
 struct Search {
     q: VecDeque<Process>,
     tasks: Vec<TaskState>,
-    /// Prunes repeated `(term, pending-key, task)` states, including repeated solution states. Task identity
-    /// keeps independent sub-searches separate.
-    seen: Vec<(DagId, Vec<usize>, usize)>,
     fifo: bool,
     out: Vec<(DagId, u64)>,
 }
@@ -1149,29 +1362,48 @@ impl Search {
 
     /// Register a child task, which counts as one live slave of `parent`.
     fn new_task(&mut self, parent: usize, kind: TaskKind) -> usize {
+        let id = self.tasks.len();
         self.tasks[parent].slaves += 1;
+        self.tasks[parent].children.push(id);
         self.tasks.push(TaskState {
             parent,
+            children: Vec::new(),
             slaves: 0,
             alive: true,
             kind,
+            seen: Vec::new(),
         });
-        self.tasks.len() - 1
+        id
     }
 
-    /// Remove one live slave. Losing the last slave exhausts the task and may cascade into its parent.
+    /// Remove one live slave. A task that loses its last slave exhausts, and its parent then loses it as a
+    /// slave in turn. The cascade climbs the task tree in a loop, so a deep tree of nested calls, matchrew
+    /// by-variables, and condition searches needs no native stack.
     fn dec_slave(&mut self, task: usize) {
-        self.tasks[task].slaves -= 1;
-        if self.tasks[task].slaves == 0 && self.tasks[task].alive {
-            self.exhaust(task);
+        let mut task = task;
+        loop {
+            self.tasks[task].slaves -= 1;
+            if self.tasks[task].slaves != 0 || !self.tasks[task].alive {
+                return;
+            }
+            match self.exhaust(task) {
+                Some(parent) => task = parent,
+                None => return,
+            }
         }
     }
 
-    /// Run a task's exhaustion action, then detach the task from its parent.
-    fn exhaust(&mut self, task: usize) {
+    /// Run a task's exhaustion action and mark it dead. Returns the parent that must lose the task as a slave
+    /// ([`Search::dec_slave`]), or `None` for the root.
+    fn exhaust(&mut self, task: usize) -> Option<usize> {
         let parent = self.tasks[task].parent;
         let succ = match &mut self.tasks[task].kind {
-            TaskKind::Root | TaskKind::One { .. } | TaskKind::Call { .. } => Vec::new(),
+            TaskKind::Root
+            | TaskKind::One { .. }
+            | TaskKind::Call { .. }
+            | TaskKind::MatchRew { .. }
+            | TaskKind::MatchRewChild { .. }
+            | TaskKind::CondRewrite { .. } => Vec::new(),
             TaskKind::Branch {
                 dag,
                 failure,
@@ -1209,19 +1441,33 @@ impl Search {
             }
         };
         self.tasks[task].alive = false;
+        self.tasks[task].seen = Vec::new();
         self.schedule(succ);
-        if task != parent {
-            self.dec_slave(parent);
-        }
+        (task != parent).then_some(parent)
     }
 
     /// Route a completed process through its task's continuation.
-    fn emit(&mut self, task: usize, dag: DagId, count: u64) {
+    fn emit(&mut self, cx: &mut Cx, task: usize, dag: DagId, count: u64) {
         let parent = self.tasks[task].parent;
         let succ = match &mut self.tasks[task].kind {
             TaskKind::Root => {
                 self.out.push((dag, count));
                 return;
+            }
+            TaskKind::MatchRew { .. } => unreachable!("a matchrew coordinator runs no processes"),
+            TaskKind::MatchRewChild { index } => {
+                let index = *index;
+                self.matchrew_solution(cx, parent, index, dag)
+            }
+            TaskKind::CondRewrite {
+                state,
+                frag,
+                sub_idx,
+                bindings,
+            } => {
+                let (state, frag, sub_idx, bindings) =
+                    (state.clone(), *frag, *sub_idx, bindings.clone());
+                self.rewrite_fragment_solution(cx, &state, frag, sub_idx, &bindings, dag, parent)
             }
             TaskKind::Call { rest } => vec![Process {
                 dag,
@@ -1235,17 +1481,13 @@ impl Search {
                 had_success,
                 ..
             } => {
-                if *had_success {
-                    Vec::new()
-                } else {
-                    *had_success = true;
-                    vec![Process {
-                        dag,
-                        pending: push(rest, success.clone()),
-                        app: None,
-                        task: parent,
-                    }]
-                }
+                *had_success = true;
+                vec![Process {
+                    dag,
+                    pending: push(rest, success.clone()),
+                    app: None,
+                    task: parent,
+                }]
             }
             TaskKind::One { rest, taken } => {
                 if *taken {
@@ -1275,34 +1517,359 @@ impl Search {
                 }]
             }
         };
-        let commit = matches!(
-            self.tasks[task].kind,
-            TaskKind::One { .. } | TaskKind::Branch { .. }
-        );
+        // `one` keeps only its first solution. A branch runs its success arm on every test solution, except
+        // that a `fail` success arm can gain nothing from later solutions, so that branch commits.
+        let commit = match &self.tasks[task].kind {
+            TaskKind::One { .. } => true,
+            TaskKind::Branch { success, .. } => matches!(**success, RStrat::Fail),
+            _ => false,
+        };
         self.schedule(succ);
-        // `one` and conditional branching discard their remaining sub-search after the first solution.
         if commit {
             self.kill(task);
         }
     }
 
-    /// Mark a task dead and detach it; any queued processes are discarded when dequeued.
+    /// Discard a task's remaining sub-search: mark it and every live descendant task dead, then detach it
+    /// from its parent. Queued processes of dead tasks are discarded when dequeued; a dead task never
+    /// exhausts, so only the detached task's parent loses a slave.
     fn kill(&mut self, task: usize) {
         if !self.tasks[task].alive {
             return;
         }
-        self.tasks[task].alive = false;
+        let mut stack = vec![task];
+        while let Some(dying) = stack.pop() {
+            self.tasks[dying].alive = false;
+            self.tasks[dying].seen = Vec::new();
+            // A dead child is exhausted or already killed, so its own subtree is dead too.
+            let children = std::mem::take(&mut self.tasks[dying].children);
+            stack.extend(
+                children
+                    .into_iter()
+                    .filter(|&child| self.tasks[child].alive),
+            );
+        }
         let parent = self.tasks[task].parent;
         if task != parent {
             self.dec_slave(parent);
         }
     }
 
+    /// Start a `matchrew` or `amatchrew` on `dag` in task `t`. Each selected match that satisfies the
+    /// condition becomes a coordinator task with one child task per by-variable, whose process runs that
+    /// variable's strategy on its subterm. A strategy that uses match variables is specialized with this
+    /// match's values (the subterms before rewriting); `prebound` by-variables are matched at their context
+    /// values. Returns the child processes in match order and, within a match, by-variable order.
+    fn start_matchrew(
+        &mut self,
+        cx: &mut Cx,
+        dag: DagId,
+        strat: &Rc<RStrat>,
+        rest: &Pending,
+        t: usize,
+    ) -> Vec<Process> {
+        let RStrat::MatchRew {
+            anywhere,
+            pattern,
+            nr_vars,
+            cond,
+            by,
+            prebound,
+        } = &**strat
+        else {
+            unreachable!("start_matchrew runs a matchrew");
+        };
+        let positions = if *anywhere {
+            all_positions(cx.eng, dag)
+        } else {
+            vec![Vec::new()]
+        };
+        let mut base = vec![None; *nr_vars as usize];
+        for (slot, value) in prebound {
+            base[*slot as usize] = Some(inst_reduce(cx, value, &[]));
+        }
+        // Slots used by some substrategy; their values are converted once per match.
+        let used: BTreeSet<u32> = by
+            .iter()
+            .flat_map(|selected| selected.uses.iter().copied())
+            .collect();
+        let mut succ = Vec::new();
+        for path in positions {
+            let sub = subterm_at(cx.eng, dag, &path);
+            for b in match_extend_with(cx.eng, pattern, &base, sub, false, true) {
+                for fb in solve_frags(cx, cond, b) {
+                    let mut bindings: Vec<Option<Term>> = Vec::new();
+                    if !used.is_empty() {
+                        bindings.resize(*nr_vars as usize, None);
+                        for &slot in &used {
+                            // Resolution admits only uses of slots that the pattern or a `:=` fragment binds.
+                            let value =
+                                fb[slot as usize].expect("matchrew substrategy variable bound");
+                            let value = term_from_dag_slots(cx.eng, value);
+                            let mut subject_vars = Vec::new();
+                            term_var_indices(&value, &mut subject_vars);
+                            if !subject_vars.is_empty() {
+                                cx.invalid = Some(
+                                    "a matchrew substrategy uses a variable bound to a non-ground subterm"
+                                        .to_string(),
+                                );
+                                return succ;
+                            }
+                            bindings[slot as usize] = Some(value);
+                        }
+                    }
+                    // An own pattern variable, or a context variable that the enclosing specialization moved
+                    // to `prebound`, so the match bound it.
+                    let subterms: Vec<DagId> = by
+                        .iter()
+                        .map(|selected| {
+                            fb[selected.slot as usize]
+                                .expect("matchrew by-variable bound by the match")
+                        })
+                        .collect();
+                    // The parser requires at least one by-variable, so every coordinator has a child.
+                    let coordinator = self.new_task(
+                        t,
+                        TaskKind::MatchRew {
+                            strat: strat.clone(),
+                            dag,
+                            path: path.clone(),
+                            bindings: fb,
+                            results: vec![Vec::new(); by.len()],
+                            empty: by.len(),
+                            rest: rest.clone(),
+                        },
+                    );
+                    for (index, (selected, subterm)) in by.iter().zip(subterms).enumerate() {
+                        let strategy = if selected.uses.is_empty() {
+                            selected.strategy.clone()
+                        } else {
+                            specialize_strategy(&selected.strategy, &bindings)
+                        };
+                        let child = self.new_task(coordinator, TaskKind::MatchRewChild { index });
+                        succ.push(Process {
+                            dag: subterm,
+                            pending: push(&None, strategy),
+                            app: None,
+                            task: child,
+                        });
+                    }
+                }
+            }
+        }
+        succ
+    }
+
+    /// Record `dag` as a solution of by-variable `index` of the matchrew `coordinator`. Once every
+    /// by-variable has a solution, rebuild the match for each combination of `dag` with the solutions already
+    /// recorded for the other by-variables, the first by-variable varying fastest, as processes of the
+    /// coordinator's parent with the matchrew's continuation. Each combination is rebuilt once, when its last
+    /// component arrives.
+    fn matchrew_solution(
+        &mut self,
+        cx: &mut Cx,
+        coordinator: usize,
+        index: usize,
+        dag: DagId,
+    ) -> Vec<Process> {
+        let target = self.tasks[coordinator].parent;
+        let TaskKind::MatchRew {
+            strat,
+            dag: subject,
+            path,
+            bindings,
+            results,
+            empty,
+            rest,
+        } = &mut self.tasks[coordinator].kind
+        else {
+            unreachable!("a matchrew child task's parent is its coordinator");
+        };
+        if results[index].is_empty() {
+            *empty -= 1;
+        }
+        results[index].push(dag);
+        if *empty > 0 {
+            return Vec::new();
+        }
+        let RStrat::MatchRew { pattern, by, .. } = &**strat else {
+            unreachable!("a coordinator holds its matchrew");
+        };
+        let sizes: Vec<usize> = results
+            .iter()
+            .enumerate()
+            .map(|(k, found)| if k == index { 1 } else { found.len() })
+            .collect();
+        let total: usize = sizes.iter().product();
+        let mut out = Vec::with_capacity(total);
+        for n in 0..total {
+            let mut rem = n;
+            let mut bnd = bindings.clone();
+            for (k, selected) in by.iter().enumerate() {
+                let value = if k == index {
+                    dag
+                } else {
+                    let choice = rem % sizes[k];
+                    rem /= sizes[k];
+                    results[k][choice]
+                };
+                bnd[selected.slot as usize] = Some(value);
+            }
+            let new_sub = inst(cx, pattern, &bnd);
+            let whole = replace_at(cx.eng, *subject, path, new_sub);
+            cx.eng.reset_rewrites();
+            let whole = reduce_or_capture(cx, whole);
+            cx.count += cx.eng.rewrites();
+            out.push(Process {
+                dag: whole,
+                pending: rest.clone(),
+                app: None,
+                task: target,
+            });
+        }
+        out
+    }
+
+    /// Apply rules under strategy control when a rule has a condition or the application supplies condition
+    /// substrategies. Rule matches are enumerated in position, rule, and matcher order, and each match solves
+    /// its condition in task `t` ([`Search::solve_rule_condition`]).
+    fn apply_conditional(
+        &mut self,
+        cx: &mut Cx,
+        dag: DagId,
+        apply: &Rc<RStrat>,
+        rest: &Pending,
+        t: usize,
+    ) -> Vec<Process> {
+        let RStrat::Apply {
+            rules, top, subst, ..
+        } = &**apply
+        else {
+            unreachable!("apply_conditional runs a rule application");
+        };
+        let positions = if *top {
+            vec![Vec::new()]
+        } else {
+            all_positions(cx.eng, dag)
+        };
+        let mut succ = Vec::new();
+        for path in &positions {
+            let sub = subterm_at(cx.eng, dag, path);
+            for (rule, r) in rules.iter().enumerate() {
+                let Some(initial) = initial_bindings(cx, r, subst) else {
+                    continue;
+                };
+                let mut matching = cx.eng.rewrite_match_solutions_with_bindings(
+                    r.lhs.clone(),
+                    r.nr_vars,
+                    sub,
+                    &initial,
+                );
+                let mut candidates = Vec::new();
+                while matching.advance() {
+                    let bindings = (0..r.nr_vars).map(|slot| matching.binding(slot)).collect();
+                    let context = matching.rewrite_context();
+                    candidates.push((bindings, context));
+                }
+                for (bindings, context) in candidates {
+                    let state = Rc::new(CondState {
+                        apply: apply.clone(),
+                        rule,
+                        dag,
+                        path: path.clone(),
+                        context,
+                        rest: rest.clone(),
+                    });
+                    succ.extend(self.solve_rule_condition(cx, &state, 0, 0, bindings, t));
+                }
+            }
+        }
+        succ
+    }
+
+    /// Solve the condition of `state`'s rule from fragment `frag` under `bindings`, where `sub_idx` selects
+    /// the condition substrategy of the next rewrite fragment. Equality, sort-test, and matching fragments
+    /// are solved within this step. A rewrite fragment becomes a child task of `target` that runs its
+    /// substrategy from the fragment's instantiated left-hand side; without a substrategy the fragment has no
+    /// solution. Each solved condition rewrites the subject as a process of `target` with the application's
+    /// continuation.
+    fn solve_rule_condition(
+        &mut self,
+        cx: &mut Cx,
+        state: &Rc<CondState>,
+        frag: usize,
+        sub_idx: usize,
+        bindings: Vec<Option<DagId>>,
+        target: usize,
+    ) -> Vec<Process> {
+        let (rule, substrats) = state.application();
+        let mut out = Vec::new();
+        for (at, bindings) in solve_until_rewrite(cx, &rule.condition, frag, bindings) {
+            match rule.condition.get(at) {
+                None => out.push(rewrite_with_rule(cx, state, bindings, target)),
+                Some(ConditionFragment::Rewrite { lhs, .. }) => {
+                    let Some(strategy) = substrats.get(sub_idx) else {
+                        continue;
+                    };
+                    let start = inst_reduce(cx, lhs, &bindings);
+                    let task = self.new_task(
+                        target,
+                        TaskKind::CondRewrite {
+                            state: state.clone(),
+                            frag: at,
+                            sub_idx,
+                            bindings,
+                        },
+                    );
+                    out.push(Process {
+                        dag: start,
+                        pending: push(&None, strategy.clone()),
+                        app: None,
+                        task,
+                    });
+                }
+                Some(_) => unreachable!("condition solving stops only at a rewrite fragment"),
+            }
+        }
+        out
+    }
+
+    /// Resume a rule condition after its rewrite fragment `frag` reached `dag`: match the fragment's pattern
+    /// against it under `bindings`, then solve the remaining fragments with the next substrategy in `target`.
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite_fragment_solution(
+        &mut self,
+        cx: &mut Cx,
+        state: &Rc<CondState>,
+        frag: usize,
+        sub_idx: usize,
+        bindings: &[Option<DagId>],
+        dag: DagId,
+        target: usize,
+    ) -> Vec<Process> {
+        let (rule, _) = state.application();
+        let ConditionFragment::Rewrite { pattern, .. } = &rule.condition[frag] else {
+            unreachable!("a condition sub-search solves a rewrite fragment");
+        };
+        let mut out = Vec::new();
+        for extended in match_extend(cx.eng, pattern, bindings, dag, false) {
+            out.extend(self.solve_rule_condition(
+                cx,
+                state,
+                frag + 1,
+                sub_idx + 1,
+                extended,
+                target,
+            ));
+        }
+        out
+    }
+
     /// Run one process step.
     fn run_one(&mut self, cx: &mut Cx, mut p: Process) {
         let t = p.task;
         if !self.tasks[t].alive {
-            // A committed `one` or branch can leave already-queued processes behind.
+            // A committed task and its killed descendants can leave already-queued processes behind.
             self.dec_slave(t);
             return;
         }
@@ -1332,17 +1899,18 @@ impl Search {
         }
         // Repeated decomposition states within one task cannot produce new continuations.
         let key = pending_key(&p.pending);
-        if self
+        if self.tasks[t]
             .seen
             .iter()
-            .any(|(d, k, tt)| *tt == t && *k == key && cx.eng.deep_equal(*d, p.dag))
+            .any(|(d, k)| *k == key && cx.eng.deep_equal(*d, p.dag))
         {
             self.dec_slave(t);
             return;
         }
-        self.seen.push((p.dag, key, t));
+        self.tasks[t].seen.push((p.dag, key));
         let Some(frame) = p.pending.clone() else {
-            self.emit(t, p.dag, cx.count);
+            let count = cx.count;
+            self.emit(cx, t, p.dag, count);
             self.dec_slave(t);
             return;
         };
@@ -1351,8 +1919,9 @@ impl Search {
         self.dec_slave(t);
     }
 
-    /// Turn the next frame into successor processes. Branch, `one`, and normalization instead create child
-    /// tasks so their sub-search completion can control the outer continuation.
+    /// Turn the next frame into successor processes. Branch, `one`, normalization, named calls, `matchrew`,
+    /// and rewrite-condition substrategies instead create child tasks so their sub-search solutions and
+    /// completion can control the outer continuation.
     fn decompose(
         &mut self,
         cx: &mut Cx,
@@ -1427,15 +1996,7 @@ impl Search {
                         task: t,
                     }]
                 } else {
-                    apply_eager(cx, dag, *top, rules, subst, substrats, self.fifo)
-                        .into_iter()
-                        .map(|r| Process {
-                            dag: r,
-                            pending: rest.clone(),
-                            app: None,
-                            task: t,
-                        })
-                        .collect()
+                    self.apply_conditional(cx, dag, strat, rest, t)
                 }
             }
             RStrat::Star(child) => {
@@ -1516,21 +2077,7 @@ impl Search {
                     task: nt,
                 }]
             }
-            RStrat::MatchRew {
-                anywhere,
-                pattern,
-                nr_vars,
-                cond,
-                by,
-            } => matchrew_solutions(cx, dag, *anywhere, pattern, *nr_vars, cond, by, self.fifo)
-                .into_iter()
-                .map(|r| Process {
-                    dag: r,
-                    pending: rest.clone(),
-                    app: None,
-                    task: t,
-                })
-                .collect(),
+            RStrat::MatchRew { .. } => self.start_matchrew(cx, dag, strat, rest, t),
             RStrat::Call { name, args } => {
                 let bodies = Rc::new(call_bodies(cx, dag, name, args));
                 if bodies.is_empty() {
@@ -1689,19 +2236,39 @@ fn specialize_strategy(strategy: &Rc<RStrat>, bindings: &[Option<Term>]) -> Rc<R
             nr_vars,
             cond,
             by,
-        } => RStrat::MatchRew {
-            anywhere: *anywhere,
-            pattern: specialize_term(pattern, bindings),
-            nr_vars: *nr_vars,
-            cond: cond
-                .iter()
-                .map(|fragment| specialize_condition(fragment, bindings))
-                .collect(),
-            by: by
-                .iter()
-                .map(|(variable, child)| (*variable, specialize_strategy(child, bindings)))
-                .collect(),
-        },
+            prebound,
+        } => {
+            // A by-variable bound here keeps its pattern positions for the rebuild and instead seeds the
+            // match with its value. Only context slots can be bound: `bindings` never reaches this
+            // matchrew's own slots.
+            let mut prebound = prebound.clone();
+            let mut pattern_bindings = None;
+            for selected in by {
+                if let Some(Some(value)) = bindings.get(selected.slot as usize) {
+                    prebound.push((selected.slot, value.clone()));
+                    pattern_bindings.get_or_insert_with(|| bindings.to_vec())
+                        [selected.slot as usize] = None;
+                }
+            }
+            RStrat::MatchRew {
+                anywhere: *anywhere,
+                pattern: specialize_term(pattern, pattern_bindings.as_deref().unwrap_or(bindings)),
+                nr_vars: *nr_vars,
+                cond: cond
+                    .iter()
+                    .map(|fragment| specialize_condition(fragment, bindings))
+                    .collect(),
+                by: by
+                    .iter()
+                    .map(|selected| ByStrategy {
+                        slot: selected.slot,
+                        strategy: specialize_strategy(&selected.strategy, bindings),
+                        uses: selected.uses.clone(),
+                    })
+                    .collect(),
+                prebound,
+            }
+        }
         RStrat::Call { name, args } => RStrat::Call {
             name: name.clone(),
             args: args
@@ -1862,82 +2429,52 @@ fn initial_bindings(
     Some(initial)
 }
 
-/// Apply rules eagerly when conditions or rewrite-condition substrategies require nested searches.
-fn apply_eager(
+/// Rewrite `state`'s subject with its rule under the bindings of a solved condition, as a process of `target`
+/// with the application's continuation.
+fn rewrite_with_rule(
     cx: &mut Cx,
-    dag: DagId,
-    top: bool,
-    rules: &[RRule],
-    subst: &[(String, Term)],
-    substrats: &[Rc<RStrat>],
-    fifo: bool,
-) -> Vec<DagId> {
-    let positions = if top {
-        vec![Vec::new()]
-    } else {
-        all_positions(cx.eng, dag)
-    };
-    let mut out = Vec::new();
-    for path in &positions {
-        let sub = subterm_at(cx.eng, dag, path);
-        for r in rules {
-            let Some(initial) = initial_bindings(cx, r, subst) else {
-                continue;
-            };
-            let mut matching = cx.eng.rewrite_match_solutions_with_bindings(
-                r.lhs.clone(),
-                r.nr_vars,
-                sub,
-                &initial,
-            );
-            let mut candidates = Vec::new();
-            while matching.advance() {
-                let bindings = (0..r.nr_vars).map(|slot| matching.binding(slot)).collect();
-                let context = matching.rewrite_context();
-                candidates.push((bindings, context));
-            }
-            for (bindings, context) in candidates {
-                for bindings in solve_frags(cx, &r.condition, 0, bindings, substrats, 0, fifo) {
-                    let bindings: Vec<DagId> = bindings
-                        .into_iter()
-                        .map(|binding| {
-                            binding.expect("successful rule condition left an RHS variable unbound")
-                        })
-                        .collect();
-                    let result = cx
-                        .eng
-                        .instantiate_rewrite_result(&r.rhs, &bindings, &context);
-                    let whole = replace_at(cx.eng, dag, path, result);
-                    cx.eng.reset_rewrites();
-                    let whole = reduce_or_capture(cx, whole);
-                    cx.count += 1 + cx.eng.rewrites();
-                    out.push(whole);
-                }
-            }
-        }
+    state: &CondState,
+    bindings: Vec<Option<DagId>>,
+    target: usize,
+) -> Process {
+    let (rule, _) = state.application();
+    let bindings: Vec<DagId> = bindings
+        .into_iter()
+        .map(|binding| binding.expect("successful rule condition left an RHS variable unbound"))
+        .collect();
+    let result = cx
+        .eng
+        .instantiate_rewrite_result(&rule.rhs, &bindings, &state.context);
+    let whole = replace_at(cx.eng, state.dag, &state.path, result);
+    cx.eng.reset_rewrites();
+    let whole = reduce_or_capture(cx, whole);
+    cx.count += 1 + cx.eng.rewrites();
+    Process {
+        dag: whole,
+        pending: state.rest.clone(),
+        app: None,
+        task: target,
     }
-    out
 }
 
-/// Solve `frags[i..]` in order and return every completed binding vector.
-fn solve_frags(
+/// Solve the equality, sort-test, and matching fragments of `frags` in order from `i`, stopping at the next
+/// rewrite fragment. Returns every consistent extension of `bindings`, each with the index where solving
+/// stopped: that rewrite fragment, or `frags.len()` when the whole condition holds.
+fn solve_until_rewrite(
     cx: &mut Cx,
     frags: &[ConditionFragment],
     i: usize,
     bindings: Vec<Option<DagId>>,
-    substrats: &[Rc<RStrat>],
-    sub_idx: usize,
-    fifo: bool,
-) -> Vec<Vec<Option<DagId>>> {
+) -> Vec<(usize, Vec<Option<DagId>>)> {
     let Some(frag) = frags.get(i) else {
-        return vec![bindings];
+        return vec![(i, bindings)];
     };
     match frag {
         ConditionFragment::Equality { lhs, rhs } => {
             let l = inst_reduce(cx, lhs, &bindings);
             let r = inst_reduce(cx, rhs, &bindings);
             if cx.eng.deep_equal(l, r) {
-                solve_frags(cx, frags, i + 1, bindings, substrats, sub_idx, fifo)
+                solve_until_rewrite(cx, frags, i + 1, bindings)
             } else {
                 Vec::new()
             }
@@ -1946,7 +2483,7 @@ fn solve_frags(
             let tt = inst_reduce(cx, term, &bindings);
             let ls = cx.eng.sort_of(tt);
             if cx.eng.sorts().same_kind(ls, *sort) && cx.eng.sorts().leq(ls, *sort) {
-                solve_frags(cx, frags, i + 1, bindings, substrats, sub_idx, fifo)
+                solve_until_rewrite(cx, frags, i + 1, bindings)
             } else {
                 Vec::new()
             }
@@ -1957,91 +2494,25 @@ fn solve_frags(
             let subj = inst_reduce(cx, subject, &bindings);
             let mut out = Vec::new();
             for nb in match_extend(cx.eng, pattern, &bindings, subj, false) {
-                out.extend(solve_frags(cx, frags, i + 1, nb, substrats, sub_idx, fifo));
+                out.extend(solve_until_rewrite(cx, frags, i + 1, nb));
             }
             out
         }
-        ConditionFragment::Rewrite { lhs, pattern, .. } => {
-            if sub_idx >= substrats.len() {
-                return Vec::new();
-            }
-            let start = inst_reduce(cx, lhs, &bindings);
-            let states = run_search(cx, start, substrats[sub_idx].clone(), fifo);
-            let mut out = Vec::new();
-            for (s, _) in states {
-                for nb in match_extend(cx.eng, pattern, &bindings, s, false) {
-                    out.extend(solve_frags(
-                        cx,
-                        frags,
-                        i + 1,
-                        nb,
-                        substrats,
-                        sub_idx + 1,
-                        fifo,
-                    ));
-                }
-            }
-            out
-        }
+        ConditionFragment::Rewrite { .. } => vec![(i, bindings)],
     }
 }
 
-/// For each selected `matchrew` or `amatchrew` match satisfying `cond`, run every by-variable strategy to
-/// exhaustion and rebuild the Cartesian product of their results. The first by-variable varies fastest.
-#[allow(clippy::too_many_arguments)]
-fn matchrew_solutions(
+/// Solve the equational condition of a strategy test or a `matchrew` and return every completed binding
+/// vector. Resolution rejects rewrite fragments there; one would have no substrategy, so it has no solution.
+fn solve_frags(
     cx: &mut Cx,
-    dag: DagId,
-    anywhere: bool,
-    pattern: &Term,
-    nr_vars: u32,
-    cond: &[ConditionFragment],
-    by: &[(u32, Rc<RStrat>)],
-    fifo: bool,
-) -> Vec<DagId> {
-    let positions = if anywhere {
-        all_positions(cx.eng, dag)
-    } else {
-        vec![Vec::new()]
-    };
-    let mut out = Vec::new();
-    for path in &positions {
-        let sub = subterm_at(cx.eng, dag, path);
-        let base = vec![None; nr_vars as usize];
-        for b in match_extend(cx.eng, pattern, &base, sub, false) {
-            for fb in solve_frags(cx, cond, 0, b, &[], 0, fifo) {
-                let mut per: Vec<Vec<DagId>> = Vec::new();
-                for (vi, st) in by {
-                    let subterm =
-                        fb[*vi as usize].expect("matchrew by-variable bound by the match");
-                    per.push(
-                        run_search(cx, subterm, st.clone(), fifo)
-                            .into_iter()
-                            .map(|(d, _)| d)
-                            .collect(),
-                    );
-                }
-                let counts: Vec<usize> = per.iter().map(|s| s.len()).collect();
-                let total: usize = counts.iter().product();
-                for n in 0..total {
-                    let mut rem = n;
-                    let mut bnd = fb.clone();
-                    for (k, (vi, _)) in by.iter().enumerate() {
-                        let choice = rem % counts[k];
-                        rem /= counts[k];
-                        bnd[*vi as usize] = Some(per[k][choice]);
-                    }
-                    let new_sub = inst(cx, pattern, &bnd);
-                    let whole = replace_at(cx.eng, dag, path, new_sub);
-                    cx.eng.reset_rewrites();
-                    let whole = reduce_or_capture(cx, whole);
-                    cx.count += cx.eng.rewrites();
-                    out.push(whole);
-                }
-            }
-        }
-    }
-    out
+    frags: &[ConditionFragment],
+    bindings: Vec<Option<DagId>>,
+) -> Vec<Vec<Option<DagId>>> {
+    solve_until_rewrite(cx, frags, 0, bindings)
+        .into_iter()
+        .filter_map(|(at, bindings)| (at == frags.len()).then_some(bindings))
+        .collect()
 }
 
 /// Whether `pattern` matches `dag` (top / extension / anywhere) with `cond` holding under the match.
@@ -2064,7 +2535,7 @@ fn test_holds(
         let sub = subterm_at(cx.eng, dag, &path);
         let base = vec![None; nr_vars as usize];
         for b in match_extend(cx.eng, pattern, &base, sub, extension) {
-            if cond.is_empty() || !solve_frags(cx, cond, 0, b, &[], 0, false).is_empty() {
+            if cond.is_empty() || !solve_frags(cx, cond, b).is_empty() {
                 return true;
             }
         }
@@ -2081,13 +2552,32 @@ fn match_extend(
     subject: DagId,
     extension: bool,
 ) -> Vec<Vec<Option<DagId>>> {
+    match_extend_with(eng, pattern, base, subject, extension, false)
+}
+
+/// [`match_extend`]. With `prebind`, `base`'s values for pattern variables reach the matcher as initial
+/// bindings, the contract that rule-application substitutions use, instead of being checked after each
+/// match.
+fn match_extend_with(
+    eng: &mut Engine,
+    pattern: &Term,
+    base: &[Option<DagId>],
+    subject: DagId,
+    extension: bool,
+    prebind: bool,
+) -> Vec<Vec<Option<DagId>>> {
     let mut pvars = Vec::new();
     term_var_indices(pattern, &mut pvars);
     let rpat = renumber_term(pattern, &pvars);
     let m = pvars.len() as u32;
+    let initial: Vec<Option<DagId>> = if prebind {
+        pvars.iter().map(|&slot| base[slot as usize]).collect()
+    } else {
+        Vec::new()
+    };
     let mut raw: Vec<Vec<DagId>> = Vec::new();
     {
-        let mut sols = eng.match_solutions(rpat, m, subject, extension);
+        let mut sols = eng.match_solutions_with_bindings(rpat, m, subject, extension, &initial);
         while sols.advance() {
             let mut row = Vec::with_capacity(m as usize);
             let mut ok = true;
@@ -2250,6 +2740,213 @@ mod tests {
         (loaded, interner)
     }
 
+    /// The module of `source` and the strategy of each of its `srewrite` commands.
+    fn loaded_module_and_strategies(source: &str) -> (LoadedModule, Interner, Vec<StratExpr>) {
+        let mut interner = Interner::new();
+        let tokens = tokenize(source, &mut interner);
+        let mut source = Parser::new(&tokens, &interner)
+            .parse_source()
+            .expect("parse strategy module and commands");
+        assert_eq!(source.modules.len(), 1);
+        let module = source.modules.remove(0);
+        let loaded = build_loaded_module(&module, &mut interner).expect("build strategy module");
+        let strategies = source
+            .commands
+            .into_iter()
+            .map(|(_, command)| match command {
+                crate::surface::ast::Command::Srewrite { strategy, .. } => strategy,
+                _ => panic!("expected only srewrite commands"),
+            })
+            .collect();
+        (loaded, interner, strategies)
+    }
+
+    /// Build `text` as a subject whose variables are variable DAG leaves, as the META-LEVEL descent builds a
+    /// non-ground meta term.
+    fn subject_with_variables(
+        loaded: &mut LoadedModule,
+        interner: &mut Interner,
+        text: &str,
+    ) -> DagId {
+        let tokens = tokenize(text, interner);
+        let mut vars = VarIndex::new();
+        let term = parse_build(&tokens, &loaded.grammar, &loaded.built, interner, &mut vars)
+            .expect("build subject");
+        let leaves: Vec<DagId> = (0..vars.count())
+            .map(|slot| {
+                let base = vars.name(slot).split(':').next().expect("variable name");
+                let name = interner.intern(base).index();
+                loaded.built.engine.make_var(vars.sort(slot), name, slot)
+            })
+            .collect();
+        loaded.built.engine.instantiate_bindings(&term, &leaves)
+    }
+
+    #[test]
+    fn matchrew_substrategies_resolve_with_pattern_and_condition_variables() {
+        let (loaded, interner, strategies) = loaded_module_and_strategies(
+            "smod STRAT-MATCHREW-SCOPE is
+               sorts E P .
+               ops a b : -> E .
+               op f : E E -> P .
+               op h : E -> E .
+               strat keep : E @ E .
+               sd keep(V:E) := match V:E .
+             endsm
+             srew f(a, b) using matchrew f(X:E, Y:E) such that W:E := h(X:E)
+               by Y:E using (keep(X:E) ; match W:E), X:E using idle .",
+        );
+        let resolved = resolve(&strategies[0], &loaded, &interner)
+            .expect("pattern and `:=` condition variables are in substrategy scope");
+        let RStrat::MatchRew { by, nr_vars, .. } = &*resolved else {
+            panic!("expected a matchrew");
+        };
+        assert_eq!(*nr_vars, 3, "slots X, Y, and W");
+        assert_eq!(
+            by.iter().map(|selected| selected.slot).collect::<Vec<_>>(),
+            [1, 0],
+            "by-variables Y and X select their pattern slots"
+        );
+        assert_eq!(
+            by[0].uses,
+            [0, 2],
+            "the Y substrategy uses the pattern's X and the condition's W"
+        );
+        assert!(
+            by[1].uses.is_empty(),
+            "`idle` uses no match variable, so matches never specialize it"
+        );
+        let RStrat::Seq(call, test) = &*by[0].strategy else {
+            panic!("expected a sequence");
+        };
+        let RStrat::Call { args, .. } = &**call else {
+            panic!("expected a call");
+        };
+        assert!(
+            matches!(args.as_slice(), [Term::Var(x)] if x.index == 0),
+            "the call argument is the matchrew's X slot, not a fresh variable"
+        );
+        let RStrat::Test {
+            pattern: Term::Var(w),
+            nr_vars,
+            ..
+        } = &**test
+        else {
+            panic!("expected a test");
+        };
+        assert_eq!(
+            (w.index, *nr_vars),
+            (2, 3),
+            "the nested pattern reuses W's slot and adds none"
+        );
+    }
+
+    #[test]
+    fn context_bound_by_variable_seeds_the_match_instead_of_the_pattern() {
+        let (loaded, mut interner) = loaded_strategy_module(
+            "smod STRAT-PREBOUND is
+               sort S .
+               ops a b : -> S .
+               op f : S S -> S .
+               rl [r] : a => b .
+               strats rewrite-x rewrite-y : S @ S .
+               vars X Y : S .
+               sd rewrite-x(X) := matchrew f(X, Y) by X using r .
+               sd rewrite-y(X) := matchrew f(X, Y) by Y using r .
+             endsm",
+        );
+        let program = compile_strategy_program(&loaded, &interner);
+        let body = |name: &str| {
+            program
+                .defs
+                .iter()
+                .find(|definition| definition.key.name == name)
+                .expect("definition")
+                .body
+                .clone()
+        };
+        let tokens = tokenize("a", &mut interner);
+        let a = parse_build(
+            &tokens,
+            &loaded.grammar,
+            &loaded.built,
+            &interner,
+            &mut VarIndex::new(),
+        )
+        .expect("constant a");
+        let bindings = [Some(a.clone())];
+
+        let rewrite_x = body("rewrite-x");
+        let RStrat::MatchRew {
+            pattern: original,
+            by,
+            ..
+        } = &*rewrite_x
+        else {
+            panic!("expected a matchrew body");
+        };
+        assert_eq!(by[0].slot, 0, "the by-variable is the parameter slot");
+        let specialized = specialize_strategy(&rewrite_x, &bindings);
+        let RStrat::MatchRew {
+            pattern, prebound, ..
+        } = &*specialized
+        else {
+            panic!("expected a matchrew");
+        };
+        assert_eq!(
+            pattern, original,
+            "the bound by-variable keeps its positions for the rebuild"
+        );
+        assert_eq!(prebound, &[(0, a.clone())], "its value seeds the match");
+
+        let specialized = specialize_strategy(&body("rewrite-y"), &bindings);
+        let RStrat::MatchRew {
+            pattern, prebound, ..
+        } = &*specialized
+        else {
+            panic!("expected a matchrew");
+        };
+        assert!(prebound.is_empty());
+        assert!(
+            matches!(pattern, Term::Op { args, .. } if args[0] == a),
+            "a bound non-by-variable is still substituted into the pattern"
+        );
+    }
+
+    #[test]
+    fn matchrew_substrategy_rejects_a_non_ground_match_value() {
+        let (mut loaded, mut interner, strategies) = loaded_module_and_strategies(
+            "smod STRAT-NONGROUND is
+               sorts E P .
+               op a : -> E .
+               op g : E -> E .
+               op f : E E -> P .
+               var V : E .
+               rl [gg] : g(V) => V .
+             endsm
+             srew f(a, g(a)) using matchrew f(X:E, Y:E) by Y:E using gg[V <- X:E] .",
+        );
+        let strategy = &strategies[0];
+        let ground = subject_with_variables(&mut loaded, &mut interner, "f(a, g(a))");
+        let unused = subject_with_variables(&mut loaded, &mut interner, "f(a, g(Z:E))");
+        let used = subject_with_variables(&mut loaded, &mut interner, "f(Z:E, g(Z:E))");
+
+        let (solutions, _) =
+            srewrite_dag(&mut loaded, &interner, ground, strategy, false).expect("ground subject");
+        assert_eq!(solutions.len(), 1, "gg[V <- a] rewrites g(a)");
+        let (solutions, _) = srewrite_dag(&mut loaded, &interner, unused, strategy, false)
+            .expect("the used value X = a is ground");
+        assert!(solutions.is_empty(), "gg[V <- a] does not match g(Z:E)");
+        // Substituting X = Z:E would turn the subject variable into a strategy variable.
+        match srewrite_dag(&mut loaded, &interner, used, strategy, false) {
+            Err(StrategicRewriteError::Invalid(message)) => {
+                assert!(message.contains("non-ground"), "{message}");
+            }
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("a non-ground value used by a substrategy must be rejected"),
+        }
+    }
+
     #[test]
     fn declaration_profiles_use_kinds_not_exact_sorts() {
         let (loaded, interner) = loaded_strategy_module(
@@ -2348,5 +3045,79 @@ mod tests {
             body.index, left.index,
             "the lhs binding is shared with the resolved definition body"
         );
+    }
+
+    /// A search holding only its root task.
+    fn root_search() -> Search {
+        Search {
+            q: VecDeque::new(),
+            tasks: vec![TaskState {
+                parent: 0,
+                children: Vec::new(),
+                slaves: 0,
+                alive: true,
+                kind: TaskKind::Root,
+                seen: Vec::new(),
+            }],
+            fifo: true,
+            out: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn kill_discards_descendant_tasks_and_detaches_once() {
+        let mut search = root_search();
+        let one = || TaskKind::One {
+            rest: None,
+            taken: false,
+        };
+        let committed = search.new_task(0, one());
+        let sibling = search.new_task(0, one());
+        let call = search.new_task(committed, TaskKind::Call { rest: None });
+        let nested = search.new_task(call, one());
+        let finished = search.new_task(committed, one());
+        // The last process of `finished` ends, so it exhausts and detaches.
+        search.tasks[finished].slaves += 1;
+        search.dec_slave(finished);
+        assert!(!search.tasks[finished].alive);
+        assert_eq!(search.tasks[committed].slaves, 1, "only `call` remains");
+
+        search.kill(committed);
+        for task in [committed, call, nested, finished] {
+            assert!(!search.tasks[task].alive, "task {task} is discarded");
+        }
+        assert!(search.tasks[sibling].alive, "a sibling sub-search survives");
+        assert!(search.tasks[0].alive);
+        assert_eq!(
+            search.tasks[0].slaves, 1,
+            "the root loses exactly the committed task's slave"
+        );
+        assert_eq!(
+            (search.tasks[call].slaves, search.tasks[nested].slaves),
+            (1, 0),
+            "descendants die in place; only the committed task detaches"
+        );
+    }
+
+    #[test]
+    fn exhaustion_cascades_up_a_deep_task_chain_without_native_recursion() {
+        // A failing recursion nests one task per level and no result ever leaves the innermost one. The chain
+        // is far deeper than a test thread's stack could hold with native frames per level.
+        let mut search = root_search();
+        let mut innermost = 0;
+        for _ in 0..100_000 {
+            innermost = search.new_task(innermost, TaskKind::Call { rest: None });
+        }
+        // The innermost task's last process fails.
+        search.tasks[innermost].slaves += 1;
+        search.dec_slave(innermost);
+        assert!(
+            search
+                .tasks
+                .iter()
+                .all(|task| !task.alive && task.slaves == 0),
+            "every task up to the root exhausts"
+        );
+        assert!(search.q.is_empty(), "exhausted calls schedule nothing");
     }
 }

@@ -94,9 +94,39 @@ All notable user-visible changes are documented here. This project follows Seman
 
 - Skipping unrecognized top-level tokens and source `set` directives no longer uses a stack frame per skipped token. A long unrecognized statement, or a long run of them, could abort a debug build with a stack overflow after a few hundred skipped tokens, or fewer on a thread with a smaller stack, losing all output of the submission. Release builds were protected only by an optimization that Rust does not guarantee. The skip is still silent (Reference H.4.1).
 
+- Strategy branches now follow `TNK-STRAT-002`. `T ? S : F`, `or-else`, and `try` run their success arm on every solution of the test, not only the first. `try(E)` keeps the unchanged subject when `E` has no solution; it used to fail. `test(E)` returns the unchanged subject once; it used to return `E`'s first rewritten result. These are behavior changes:
+  - Normalizing over `try`, as in `try(E) !`, has no normal form, because `try` never fails.
+  - A branch, `try`, or `or-else` whose test has infinitely many solutions now diverges under the eager `srewrite` and `dsrewrite` commands. It used to return a truncated result.
+  - A recursive definition such as `sd loop := step ? loop : idle` follows every solution of `step`, which can take exponentially longer.
+  - `one(T) ? S : F` keeps only the first test solution, as `T ? S : F` used to.
+
+- A committed `one`, `not`, or `test` now discards its whole remaining sub-search, including nested named-call bodies, branches, `one` sub-searches, and normalizations. These nested tasks used to keep running after the commit, so `one(s)`, `not(s)`, or `test(s)` with `sd s := r *` over an infinite `r *` never finished, although the inlined `one(r *)` did.
+
+- `matchrew` and `amatchrew` `using` strategies now see the variables bound by the pattern and by `:=` fragments of the `such that` condition, with the match's values before rewriting (`TNK-STRAT-002`). A `using` strategy that mentions any other condition variable, for example one that only an equality fragment mentions, is now rejected. A reflected strategy rewrite of a non-ground term is rejected when such a strategy uses a variable bound to a non-ground subterm. Such a variable used to be out of scope:
+  - In a strategy-call argument or a `[V <- t]` value, the command was rejected as using an unbound variable.
+  - In a nested pattern or condition, it was a fresh variable, so the command gave wrong results.
+  - In a strategy definition, the definition was silently dropped, so its calls answered `No solution.`.
+
+- A `matchrew` `by` variable must be a distinct variable of the pattern. A `by` variable that occurred only in the condition used to panic (equality fragment) or silently discard its substrategy's result (`:=` fragment). A repeated one kept only the last substrategy's result. Both are now rejected.
+
+- A `matchrew` `by` variable that the enclosing strategy definition or matchrew already binds is matched at that value, and its occurrences are rebuilt from the substrategy results. Such a variable used to panic.
+
+- `matchrew` and `amatchrew` `using` strategies, and the condition substrategies of a rule application such as `lift{S}`, now run as child searches of the strategy command (`TNK-STRAT-001`). They used to run to completion before any result was combined, so an infinite one never let the command finish, even under `one`, `not`, or `test`, and it starved every fair `srewrite` sibling. A match is now rebuilt as soon as each of its by-variables has a result, and a conditional rule rewrites as soon as its condition has a solution. For example, `one(matchrew f(X:S) by X:S using r *)` and `one(lift{r *})` now finish. Behavior changes:
+  - Under `srewrite`, results follow the fair order across matches and condition solutions, so their order can change and `one(...)` can keep a different result: the first one to complete.
+  - Per-solution rewrite counts can change.
+  - Under `dsrewrite`, an infinite search for an earlier `matchrew` by-variable still prevents any result, because depth-first exploration does not reach the later by-variables.
+
+- A strategy that recurses through `matchrew` by-variables or rewrite-condition substrategies no longer overflows the native stack. From about 5,000 levels such recursion aborted the process with a stack overflow (exit status `134`), and all output of the input was lost. These nested sub-searches now live in the command's task tree, and abandoning a deep failed nest, including a deep chain of named calls, is a loop rather than native recursion.
+
 ### Documentation
 
 - Documented the public reducer API, source attachment grammar, purity/trust boundary, fault policy, supported typed adapters, feature status, and end-to-end configured Session workflow.
+
+- `TNK-STRAT-002` now spells out how `try`, `not`, `test`, and `or-else` desugar to `? :`.
+
+- `TNK-STRAT-002` now states the variable scope of `matchrew` `using` strategies and the rules for `by` variables. Appendix K.1 lists the reflected non-ground case.
+
+- `TNK-STRAT-001` and `TNK-STRAT-002` now state that `matchrew` by-variable strategies and rule-application condition substrategies are child tasks of the command's schedule, when a match is rebuilt or a conditional rule rewrites, and that `dsrewrite` explores the by-variables in order.
 
 - Recorded the current variable-left-hand-side boundary for source and reflected statements in Appendix H.4.1 and K.3 of the reference, as current behavior pending a decision rather than a static requirement.
 
