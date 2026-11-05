@@ -132,14 +132,14 @@ pub fn complete_statement(
     for obj in &objs {
         // Class constant → a fresh `V:class_sort` variable, shared across all occurrences.
         let class_replace = obj.class_var.is_none().then(|| {
-            let name = choose_fresh("V", vars);
+            let name = choose_fresh("V", obj.class_sort, vars);
             Term::var(vars.index_of(&name, obj.class_sort), obj.class_sort)
         });
         // The attribute-set variable: the pattern's own one, or a fresh `Atts:AttributeSet`.
         let atts_var = match &obj.pattern.set_var {
             Some(v) => Term::Var(v.clone()),
             None => {
-                let name = choose_fresh("Atts", vars);
+                let name = choose_fresh("Atts", info.attr_set_sort, vars);
                 Term::var(vars.index_of(&name, info.attr_set_sort), info.attr_set_sort)
             }
         };
@@ -151,7 +151,7 @@ pub fn complete_statement(
             for (sym, _) in &subj.attrs {
                 if !pattern_syms.contains(sym) && !added_attrs.iter().any(|(s, _)| s == sym) {
                     let kind_sort = attribute_kind_sort(m, info, *sym);
-                    let name = choose_fresh("A", vars);
+                    let name = choose_fresh("A", kind_sort, vars);
                     let var = Term::var(vars.index_of(&name, kind_sort), kind_sort);
                     added_attrs.push((*sym, Term::op(*sym, vec![var])));
                 }
@@ -521,9 +521,13 @@ fn condition_terms(frag: &ConditionFragment) -> Vec<&Term> {
     }
 }
 
-/// Choose an unused variable name: `base`, then `base2`, `base3`, and so on.
-fn choose_fresh(base: &str, vars: &VarIndex) -> String {
-    let used = |name: &str| (0..vars.count()).any(|i| vars.name(i) == name);
+/// Choose an unused name for a fresh variable of `sort`: `base`, then `base2`, `base3`, and so on. A name
+/// is used when a slot is already spelled that way, or when a variable of that name and `sort` already
+/// exists under another spelling (a written `V:Cls`), which [`VarIndex::index_of`] would otherwise reuse.
+fn choose_fresh(base: &str, sort: SortId, vars: &VarIndex) -> String {
+    let used = |name: &str| {
+        vars.find(name, sort).is_some() || (0..vars.count()).any(|i| vars.name(i) == name)
+    };
     if !used(base) {
         return base.to_string();
     }

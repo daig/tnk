@@ -721,8 +721,7 @@ fn resolve_in(
             let mut by = Vec::new();
             for (variable, child) in subs {
                 let name = token_text(variable, i);
-                let index = (0..vars.count())
-                    .find(|&slot| vars.name(slot) == name)
+                let index = matchrew_variable_slot(variable, &name, &vars, lm, grammar, i)
                     .ok_or_else(|| {
                         format!("matchrew variable `{name}` does not occur in the pattern")
                     })?;
@@ -741,6 +740,27 @@ fn resolve_in(
         }
     };
     Ok(Rc::new(r))
+}
+
+/// The slot of the pattern variable that a matchrew `by` variable names. A variable is identified by its
+/// base name and sort, so a spelling other than the slot's first-seen one (`X:S` for a pattern written
+/// with the declared `X : S`, or the reverse) is parsed and resolved through the same [`VarIndex`].
+fn matchrew_variable_slot(
+    variable: &[Token],
+    name: &str,
+    vars: &VarIndex,
+    lm: &LoadedModule,
+    grammar: &CompiledGrammar,
+    i: &Interner,
+) -> Option<u32> {
+    if let Some(slot) = (0..vars.count()).find(|&slot| vars.name(slot) == name) {
+        return Some(slot);
+    }
+    let mut probe = vars.clone();
+    match parse_build(variable, grammar, &lm.built, i, &mut probe) {
+        Ok(Term::Var(var)) if var.index < vars.count() => Some(var.index),
+        _ => None,
+    }
 }
 
 /// Resolve an optional test or matchrew condition, rejecting rewrite (`=>`) fragments.

@@ -17,8 +17,17 @@ use tnk_core::sort::SortId;
 use tnk_core::symbol::SymbolId;
 use tnk_core::term::Term;
 
-/// Assign each distinct variable name a statement-local index. One index is shared across a
-/// statement's left side, right side, and condition.
+/// The base name of a written variable: the text before the first `:` of an on-the-fly `X:Sort` token,
+/// or the whole name of a declared variable. Together with the resolved sort it identifies the variable,
+/// and it is the name the kernel records on a variable leaf.
+pub fn variable_base_name(written: &str) -> &str {
+    written.split_once(':').map_or(written, |(base, _)| base)
+}
+
+/// Assign each distinct variable a statement-local index. One index is shared across a statement's left
+/// side, right side, and condition. A variable is identified by its base name and resolved sort, so
+/// every spelling of one variable shares an index: a declared `X : S` and an on-the-fly `X:S`, or the
+/// kind spellings `X:[A]` and `X:[B]` of one kind. The first-seen spelling names the slot.
 #[derive(Debug, Default, Clone)]
 pub struct VarIndex {
     entries: Vec<(String, SortId)>,
@@ -29,13 +38,23 @@ impl VarIndex {
         Self::default()
     }
 
-    /// The index for `name` (declared at `sort`), assigning a fresh one in first-seen order.
+    /// The index for the variable spelled `name` at `sort`, assigning a fresh one in first-seen order.
     pub fn index_of(&mut self, name: &str, sort: SortId) -> u32 {
-        if let Some(p) = self.entries.iter().position(|(n, _)| n == name) {
-            return p as u32;
+        if let Some(p) = self.find(name, sort) {
+            return p;
         }
         self.entries.push((name.to_string(), sort));
         (self.entries.len() - 1) as u32
+    }
+
+    /// The index already assigned to the variable spelled `name` at `sort`, if any. Any spelling with the
+    /// same base name and sort finds the same index.
+    pub fn find(&self, name: &str, sort: SortId) -> Option<u32> {
+        let base = variable_base_name(name);
+        self.entries
+            .iter()
+            .position(|(n, s)| *s == sort && variable_base_name(n) == base)
+            .map(|p| p as u32)
     }
 
     /// The number of distinct variables seen (a statement's `nr_vars`).
@@ -43,7 +62,8 @@ impl VarIndex {
         self.entries.len() as u32
     }
 
-    /// The source name of the variable at `index` (for rendering a `match` solution's `X --> …` lines).
+    /// The first-seen source spelling of the variable at `index` (for rendering a `match` solution's
+    /// `X --> …` lines).
     pub fn name(&self, index: u32) -> &str {
         &self.entries[index as usize].0
     }
@@ -425,7 +445,7 @@ fn build_dag_inner(
                 let name = token.text(i);
                 let index = vars.index_of(name, sort);
                 // Store the base-name token code; the full `X:Sort` token is not the variable identity.
-                let base = name.split_once(':').map_or(name, |(base, _)| base);
+                let base = variable_base_name(name);
                 let name = i.get(base).unwrap_or(token.sym).index();
                 Ok(engine.make_var(sort, name, index))
             }
@@ -607,8 +627,13 @@ endfm
     }
 
     fn natb() -> Natb {
+        built(NATB)
+    }
+
+    /// Parse and build the first module of `src` with its compiled grammar.
+    fn built(src: &str) -> Natb {
         let mut i = Interner::new();
-        let toks = tokenize(NATB, &mut i);
+        let toks = tokenize(src, &mut i);
         let s = Parser::new(&toks, &i).parse_source().expect("parse");
         let m = build_module(&s.modules[0], &mut i).expect("build");
         let g = CompiledGrammar::compile(&build_grammar(&m, &mut i));
@@ -695,6 +720,61 @@ endfm
         let (r, _) = e.reduce("2 < 3");
         assert_eq!(e.sort_name(r), "Truth", "2 < 3 : Truth");
     }
+
+    /// Parse and build an application `term` with a fresh [`VarIndex`]; return its arguments' variable
+    /// slots and the index.
+    fn arg_slots(e: &mut Natb, term: &str) -> (Vec<u32>, VarIndex) {
+        let tokens = tokenize(term, &mut e.i);
+        let mut effort = ParseEffort::default();
+        let chart =
+            earley::parse(&e.g, &tokens, Nt::Term, &e.i, &mut effort).expect("parse effort");
+        let parse =
+            forest::extract(&e.g, &chart, tokens.len(), Nt::Term, &mut effort).expect("parse");
+        assert!(!parse.ambiguous, "`{term}` parsed ambiguously");
+        let mut vars = VarIndex::new();
+        let t = build_term(&parse.tree, &e.g, &e.m, &tokens, &e.i, &mut vars).expect("build_term");
+        let Term::Op { args, .. } = t else {
+            panic!("`{term}` is not an application: {t:?}");
+        };
+        let slots = args
+            .iter()
+            .map(|arg| match arg {
+                Term::Var(v) => v.index,
+                other => panic!("`{term}` has a non-variable argument {other:?}"),
+            })
+            .collect();
+        (slots, vars)
+    }
+
+    /// A variable is identified by its base name and resolved sort. The declared `X : Q` and the
+    /// on-the-fly `X:Q` are one variable whose slot keeps the first-seen spelling; `X:P` has another
+    /// sort; and the kind spellings `X:[P]` and `X:[Q]` both name the one `[Q]`-kind variable.
+    #[test]
+    fn spellings_with_one_base_name_and_sort_share_a_slot() {
+        let mut e = built(
+            "fmod VARID is sorts P Q . subsort P < Q . op f : Q Q Q -> Q . var X : Q . endfm",
+        );
+        let (slots, vars) = arg_slots(&mut e, "f(X, X:Q, X:P)");
+        assert_eq!(slots, [0, 0, 1]);
+        assert_eq!((vars.count(), vars.name(0), vars.name(1)), (2, "X", "X:P"));
+
+        let (slots, vars) = arg_slots(&mut e, "f(X:Q, X, Y:Q)");
+        assert_eq!(slots, [0, 0, 1]);
+        assert_eq!(vars.name(0), "X:Q", "the first spelling names the slot");
+        let q = e.m.sorts["Q"];
+        assert_eq!(vars.find("X", q), Some(0));
+        assert_eq!(vars.find("Y", q), Some(1));
+        assert_eq!(vars.find("Y", e.m.sorts["P"]), None);
+
+        let (slots, vars) = arg_slots(&mut e, "f(X:[P], X:[Q], X)");
+        assert_eq!(slots, [0, 0, 1]);
+        assert_eq!(
+            vars.count(),
+            2,
+            "the kind variable differs from the declared `X : Q`"
+        );
+    }
+
     #[test]
     fn static_prefix_iteration_is_one_bignum_term_node() {
         let mut e = natb();

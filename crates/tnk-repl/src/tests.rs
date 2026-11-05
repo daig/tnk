@@ -2112,8 +2112,8 @@ fn rewrite_condition_dropped_in_equation() {
 }
 
 /// On-the-fly colon variables `X:Sort` (one token) parse anywhere a term is expected — in an `eq`
-/// (mixed with declared vars), a `match` pattern, and a `search` goal — without a `var` declaration. The
-/// whole token is the variable name, echoed back with its sort.
+/// (mixed with declared vars), a `match` pattern, and a `search` goal — without a `var` declaration. A
+/// variable with no declared spelling is echoed back with its sort.
 #[test]
 fn on_the_fly_colon_variables() {
     let mut r = repl();
@@ -2140,6 +2140,121 @@ fn on_the_fly_colon_variables() {
     assert!(
         s.contains("Y:T --> q"),
         "on-the-fly var in a search goal:\n{s}"
+    );
+}
+
+/// A variable is identified by its base name and resolved sort, so within one statement or command the
+/// declared `X : Q` and the on-the-fly `X:Q` are one variable, as are the kind spellings `X:[P]` and
+/// `X:[Q]`. The equation is kept, matching demands one value, and each unifier is sound.
+#[test]
+fn declared_and_colon_spellings_are_one_variable() {
+    let mut r = repl();
+    let load = r.eval(
+        "fmod VARID is sorts P Q R . subsorts P < Q R . ops p p2 : -> P . \
+         op f : [Q] [Q] -> [Q] . op g : Q -> Q . var X : Q . eq g(X) = X:Q . endfm",
+    );
+    assert!(!load.output.contains("dropped"), "{}", load.output);
+    let red = r.eval("red g(p) .").output;
+    assert!(
+        red.contains("rewrites: 1") && red.contains("result P: p"),
+        "{red}"
+    );
+    let matched = r.eval("match f(X, X:Q) <=? f(p, p2) .").output;
+    assert!(matched.contains("No match."), "{matched}");
+    let matched = r.eval("match f(X, X:Q) <=? f(p, p) .").output;
+    assert!(
+        matched.trim_end().ends_with("Matcher 1\nX --> p"),
+        "{matched}"
+    );
+    let unified = r.eval("unify f(X, p) =? f(X:Q, p) /\\ X:Q =? p .").output;
+    assert!(
+        unified.trim_end().ends_with("Unifier 1\nX --> p"),
+        "{unified}"
+    );
+    let unified = r
+        .eval("unify f(X:[P], p) =? f(X:[Q], p) /\\ X:[Q] =? p2 .")
+        .output;
+    assert!(
+        unified.trim_end().ends_with("Unifier 1\nX:[P] --> p2"),
+        "{unified}"
+    );
+}
+
+/// A search condition may name the goal variable by its other spelling; the condition is then bound by
+/// the goal rather than reaching instantiation unbound.
+#[test]
+fn search_condition_may_use_another_spelling_of_a_goal_variable() {
+    let mut r = repl();
+    r.eval(
+        "mod VSC is sorts P Q . subsort P < Q . ops p p2 : -> P . op c : Q -> Q . var X : Q . \
+         rl c(X) => X . endm",
+    );
+    let out = r.eval("search c(p) =>1 X:Q such that X = p .").output;
+    assert!(
+        out.contains("Solution 1 (state 1)") && out.contains("X:Q --> p"),
+        "{out}"
+    );
+    let out = r.eval("search c(p2) =>1 X such that X:Q = p .").output;
+    assert!(
+        out.contains("No more solutions.") && !out.contains("Solution 1"),
+        "{out}"
+    );
+}
+
+/// A matchrew `by` variable may be written in any spelling of a pattern variable.
+#[test]
+fn matchrew_by_resolves_any_spelling_of_a_pattern_variable() {
+    let mut r = repl();
+    r.eval(
+        "mod VMR is sorts P Q . subsort P < Q . ops p p2 : -> P . op f : Q Q -> Q . var X : Q . \
+         rl [two] : p => p2 . endm",
+    );
+    let both = r
+        .eval("srew f(p, p) using matchrew f(X, X:Q) by X:Q using two .")
+        .output;
+    assert!(both.contains("result Q: f(p2, p2)"), "{both}");
+    let declared = r
+        .eval("srew f(p, p) using matchrew f(X, Y:Q) by X:Q using two .")
+        .output;
+    assert!(declared.contains("result Q: f(p2, p)"), "{declared}");
+    let absent = r
+        .eval("srew f(p, p) using matchrew f(X, Y:Q) by Z:Q using two .")
+        .output;
+    assert!(
+        absent.contains("matchrew variable `Z:Q` does not occur in the pattern"),
+        "{absent}"
+    );
+}
+
+/// Object completion's fresh class variable for `Account` must not be the written `V:Account`, which is
+/// the variable `V` of sort `Account`: the two objects may belong to different subclasses.
+#[test]
+fn object_completion_fresh_variable_avoids_written_spelling() {
+    let mut r = repl();
+    let load = r.eval(
+        "omod SWAP is
+  sort Val .
+  ops v1 v2 : -> Val [ctor] .
+  class Account | bal : Val .
+  class Savings | rate : Val .
+  subclass Savings < Account .
+  ops a b : -> Oid [ctor] .
+  msg swap : Oid Oid -> Msg .
+  vars A B : Oid .
+  vars N M : Val .
+  rl [swap] : swap(A, B) < A : V:Account | bal : N > < B : Account | bal : M >
+    => < A : V:Account | bal : M > < B : Account | bal : N > .
+endom",
+    );
+    assert!(!load.output.contains("error"), "{}", load.output);
+    let out = r
+        .eval(
+            "rewrite swap(b, a) < a : Savings | bal : v1, rate : v1 > < b : Account | bal : v2 > .",
+        )
+        .output;
+    assert!(
+        out.contains("rewrites: 1") && out.contains("< a : Savings | bal : v2, rate : v1 >"),
+        "{out}"
     );
 }
 

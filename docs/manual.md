@@ -118,7 +118,7 @@ An operator declaration has a canonical name, arity, domain sorts, range sort, a
 
 ### 1.3 Variables and substitutions
 
-A variable is identified by a written name, declared sort, and command- or statement-local slot. A colon variable such as `X:Nat` declares its sort at the occurrence. A bare variable must be declared by `var` or `vars` in its source scope.
+A variable is identified by a written name, declared sort, and command- or statement-local slot. A colon variable such as `X:Nat` declares its sort at the occurrence; its written name is `X`. A bare variable must be declared by `var` or `vars` in its source scope. Within one statement or command, occurrences with the same written name and the same resolved sort are one variable, whatever their spelling. A declared `X` of sort `Nat` and `X:Nat` are one variable, and so are `X:[A]` and `X:[B]` when `A` and `B` lie in one kind. The same name at another sort is another variable. Which spelling names the variable in command output is Implementation-defined.
 
 **TNK-SORT-006 — Sort-respecting substitution.** A substitution may bind a variable of sort `S` only to a term whose least sort is `<= S`. Repeated occurrences of the same variable MUST receive equal values modulo the operator axioms and equations applicable at the operation's semantic boundary.
 

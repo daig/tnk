@@ -28,6 +28,13 @@ All notable user-visible changes are documented here. This project follows Seman
 - `I ^ N` no longer returns a wrong value, panics, or aborts when `N` fits 64 bits but the power's size bound, the bit length of `|I|` times `N`, overflows 64 bits (such a power has more than `2^63` bits). In these cases the numeric backend's unchecked size arithmetic wrapped: `2 ^ 9223372036854775808` reduced to `1`, `7 ^ 6148914691236517206` panicked (the CLI exited with status `101`), and `3 ^ 18446744073709551615` aborted. Both crashes lost the whole submission's output. Such a power now stays unreduced, as one with an exponent of `2^64` or more already did. Other powers too large to allocate, such as `3 ^ 9223372036854775807`, are unchanged by this fix.
 
 - Each `CounterSymbol` operator now has its own `0, 1, 2, ...` sequence. Previously all counter operators in a module drew from one shared value. This affected two directly declared counters as well as a renamed copy such as `COUNTER * (op counter to counter2)`. With such a copy, `rewrite counter counter2 counter counter2 .` gave `0 1 2 3` instead of `0 0 1 1`, and in a fresh `rewrite counter2 counter2 counter .` the `counter` gave `2` instead of `0`. The fix applies to `rewrite`, `frewrite`, `erewrite`, `continue`, `metaRewrite`, and `metaFrewrite`. All counters still restart at `0` for each top-level rewriting command. Modules with a single counter operator are unaffected.
+- Within one statement or command, a variable is now identified by its written name and resolved sort. A declared `X : S` and an on-the-fly `X:S` are therefore one variable, and so are the kind spellings `X:[A]` and `X:[B]` of one kind. Previously each spelling got its own slot, but the unifier treated them as one, which caused four failures:
+  - `unify` and `metaUnify` could return unsound unifiers;
+  - `match`, `search`, variant, and narrowing commands bound the spellings independently;
+  - equations such as `eq g(X) = X:S` were dropped as having an unbound right-hand-side variable;
+  - a `search` condition that named the goal variable by its other spelling panicked.
+
+  A matchrew `by` variable may now use any spelling of a pattern variable. Object-pattern completion no longer reuses a written `V:Class` as its fresh class variable.
 
 ### Documentation
 
