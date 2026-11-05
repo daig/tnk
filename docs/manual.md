@@ -352,8 +352,8 @@ msgs ...
 
 strat Name+ [ ":" SortName* ] "@" SortName .
 strats ...
-sd  Name [ "(" TermBubble ("," TermBubble)* ")" ] ":=" Strategy .
-csd Name [ "(" TermBubble ("," TermBubble)* ")" ] ":=" Strategy "if" Condition .
+sd  Name [ "(" [ TermBubble ("," TermBubble)* ] ")" ] ":=" Strategy .
+csd Name [ "(" [ TermBubble ("," TermBubble)* ] ")" ] ":=" Strategy "if" Condition .
 ```
 
 `pr`, `ex`, and `inc` abbreviate the three ordinary import modes. `generated-by` is accepted as a protecting-equivalent donation form; because import-mode obligations are Experimental, reflected mode-tag distinctions for this spelling are not portable. `class`/`subclass`/`msg` are object-only; `strat`/`sd`/`csd` are strategy-only. `csd` parses but is Unsupported at strategy resolution.
@@ -626,10 +626,10 @@ Strategy ::= Strategy "?" Strategy ":" Strategy
                ("," Var "using" Strategy)*
            | Label [ "[" Var "<-" Term ("," Var "<-" Term)* "]" ]
                [ "{" Strategy ("," Strategy)* "}" ]
-           | StrategyName [ "(" Term ("," Term)* ")" ]
+           | StrategyName [ "(" [ Term ("," Term)* ] ")" ]
 ```
 
-`idle` succeeds unchanged; `fail` has no result; `all` applies every applicable rule at the current strategy seam. A label application may carry an initial substitution and one condition substrategy per rewrite-condition fragment. A named call resolves an `sd` whose declaration profile and left pattern match its arguments.
+`idle` succeeds unchanged; `fail` has no result; `all` applies every applicable rule at the current strategy seam. A label application may carry an initial substitution and one condition substrategy per rewrite-condition fragment. A named call resolves an `sd` whose declaration profile and left pattern match its arguments. A bare name is the application of the module's executable rules with that label when there are any, even if a strategy without arguments has the same name, and otherwise a call of that strategy; `Name()` always calls the strategy.
 
 **TNK-STRAT-001 — Scheduling.** `srewrite` schedules processes FIFO and interleaves child tasks fairly. `dsrewrite` schedules depth-first. A process with no pending strategy emits one solution. `one(E)` emits at most the first `E` solution in this scheduling order; `E!` continues until `E` fails and then emits the normal form. Sub-searches are child tasks of the same schedule, including `matchrew` by-variable strategies and the condition substrategies of a rule application. A strategy-controlled conditional rule rewrites the subject for each condition solution as soon as that solution is found.
 
@@ -1307,7 +1307,7 @@ CondFrag     ::= Term "=" Term | Term ":=" Term | Term ":" SortName
 
 StrategyDecl ::= ("strat" | "strats") Name+
                  [":" SortName*] "@" SortName "."
-StrategyDef  ::= ("sd" | "csd") Name ["(" Term ("," Term)* ")"]
+StrategyDef  ::= ("sd" | "csd") Name ["(" [Term ("," Term)*] ")"]
                  ":=" Strategy ["if" Condition] "."
 ObjectDecl   ::= ("class" | "classes") ClassSpec+
                | ("subclass" | "subclasses") SortName+
@@ -1427,10 +1427,10 @@ UsingClause  ::= Term "using" Strategy
 RuleApplication ::= Name ["[" Term "<-" Term
                           ("," Term "<-" Term)* "]"]
                      ["{" Strategy ("," Strategy)* "}"]
-StrategyCall ::= Name ["(" Term ("," Term)* ")"]
+StrategyCall ::= Name ["(" [Term ("," Term)*] ")"]
 ```
 
-Rule applications may carry a label, substitutions, and `using` strategies for rule-condition fragments. Strategy calls retain term arguments as source bubbles and resolve them against declarations in the selected module. The parser accepts `csd`; resolution rejects conditional strategy definitions.
+Rule applications may carry a label, substitutions, and `using` strategies for rule-condition fragments. Strategy calls retain term arguments as source bubbles and resolve them against declarations in the selected module. A bare `Name` is a `RuleApplication` when an executable rule of the module carries that label and a `StrategyCall` otherwise (§11). The parser accepts `csd`; resolution rejects conditional strategy definitions.
 
 # Appendix E — Mixfix precedence and term resolution
 
@@ -1645,7 +1645,7 @@ Here, **silent** means that `Session::eval` adds no diagnostic text for the name
 | mixfix operator name whose `_` count differs from its arity | silent | no mixfix production is installed; the declaration remains callable in prefix form using its full declared name and arity |
 | nonbinary or kind-incompatible `assoc`, `comm`, `idem`, identity, or `iter` attribute | silent | the invalid algebraic flag is cleared; the declaration remains installed with any independently valid surviving flags, otherwise as a free operator |
 | `frozen (...)` containing an argument position outside the declaration's arity | silent | the complete `frozen` attribute is ignored and the declaration remains installed |
-| operator or variable declaration at a kind spelling whose later component is not a sort of the first component's kind (`[P,Nope]`, or `[P,Z]` with `Z` in another kind) | silent | only the first component is resolved; the declaration is installed at that component's kind |
+| operator, variable, or strategy declaration at a kind spelling whose later component is not a sort of the first component's kind (`[P,Nope]`, or `[P,Z]` with `Z` in another kind) | silent | only the first component is resolved; the declaration is installed at that component's kind |
 | unknown operator attribute or unknown `special` subdirective | `parse error:` | the submitted module definition is not installed; this differs from an unknown `id-hook` class below |
 | ordinary statement whose term, variables, condition, or `[print ...]` data fails frontend construction, including in a dependent rebuilt after a module or view redefinition | `warning:` naming a dropped equation, membership, or rule; it is not repeated while some built module still produces it, except when the module it names is redefined, and once no built module produces it a recurrence is reported again | that statement is omitted; the enclosing buildable module and later valid statements are retained |
 | trailing equation/rule bracket group whose first token is not a recognized statement attribute | no attribute-specific diagnostic; a downstream dropped-statement warning is emitted if the resulting term bubble does not parse | the bracket group remains part of the statement term bubble rather than being peeled as attributes; if that bubble parses, its term meaning controls |
@@ -1654,6 +1654,9 @@ Here, **silent** means that `Session::eval` adds no diagnostic text for the name
 | conditional rule carrying `[narrowing]` | `warning:` naming a dropped rule | the entire rule is omitted; the enclosing module and later valid statements are retained |
 | executable equation, membership, or rule whose whole left-hand side is a variable, such as `X` or `X:S` (`[nonexec]` statements and `[narrowing]` rules excepted), including an instance statement that a view maps to a variable | `warning:` naming a dropped equation, membership, or rule whose left-hand side is a variable | the statement is not executed and is omitted from reflection; the enclosing module and later valid statements are retained. A reflected module value containing such a statement does not down-translate: metalevel descent operations on it remain inert (`getKinds`, which reads only the sort signature, still answers), `wellFormed` returns `false`, and `insertModule` receives an interpreter error. This is the current boundary pending a decision on these statements; §5.4 does not make them invalid |
 | reflected module value containing an executable statement that the source loader drops for its variables or condition: a right-side or condition variable that neither the left side nor an earlier `:=` or `=>` fragment binds (`TNK-COND-002`; an executable `[narrowing]` rule is included), or an equation or membership with a rewrite (`=>`) condition | silent | the module value does not down-translate, as for a variable left-hand side above: metalevel descent operations on it remain inert (`getKinds`, which reads only the sort signature, still answers), `wellFormed` returns `false`, and `insertModule` receives an interpreter error. `[nonexec]` statements are exempt, as at the source level: a reflected rule with a fresh right-side variable descends when it is `[nonexec]`, and narrowing uses it when it is `[nonexec narrowing]` |
+| unconditional strategy definition (`sd`) whose parameter or body does not resolve, such as a term that does not parse, a name that is neither a rule label nor a strategy, an unbound variable, or a call of a strategy that only `csd` or `xmatchrew` definitions define; or whose name and parameter kinds match no strategy declaration | `warning:` naming the dropped strategy definition and the reason, when the module is built, with the repetition rules of the dropped-statement warning above | the definition is never executed: a call uses the strategy's other definitions and answers `No solution.` when none of them applies. The enclosing module and its other declarations and definitions are retained, and reflection still includes the definition (`upSds` and `upModule` of the module do not reduce when one of its terms does not parse). This is the current boundary pending a decision: `TNK-STMT-001` covers only the statements of §5.4, and whether such a definition should instead make the module definition invalid (`TNK-DOC-006`) is not decided |
+| `csd` definition, or `sd` whose body contains `xmatchrew`, beside an unconditional definition of the same name and arity without `xmatchrew` | silent | the Unsupported definition is skipped, and calls run the other definitions alone; a call whose name and arity have only Unsupported definitions is rejected (`TNK-STRAT-003`) |
+| strategy declaration naming a sort that is not declared (`strat s @ Nope`) | silent for the declaration | the declaration provides no call profile: calls of its name and arity resolve but answer `No solution.`, and a definition that no other declaration matches is dropped with the strategy-definition warning above |
 
 #### H.4.2 Unsupported and silent command/hook seams
 

@@ -38,7 +38,8 @@ use crate::lex::{Interner, Token};
 use crate::load::{
     LoadedModule, ParsedCommandTerm, parse_build, parse_condition, term_var_indices,
 };
-use crate::surface::ast::{StratExpr, StratSugar, TestKind};
+use crate::sig::build_sig::resolve_sort;
+use crate::surface::ast::{Diagnostic, StratDef, StratExpr, StratSugar, TestKind};
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
@@ -411,8 +412,10 @@ pub fn srewrite_dag(
     Ok((out, total))
 }
 
-/// Format a strategy expression for command echoing.
-pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
+/// Format a strategy expression for command echoing in `lm`. A zero-argument call prints as `name()` when a
+/// rule of `lm` is labelled `name`, because resolution reads the bare `name` as that rule's application;
+/// otherwise it prints as the bare `name`, which resolves to the call.
+pub fn print_strategy(e: &StratExpr, lm: &LoadedModule, i: &Interner) -> String {
     /// Surface-syntax precedence, tightest first: atoms and keyword forms, postfix iteration, sequence,
     /// union, then branch. Parenthesize children that exceed their allowed precedence and right children
     /// of left-associative sequence or union nodes.
@@ -425,8 +428,8 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
             _ => 0,
         }
     }
-    fn child(e: &StratExpr, i: &Interner, max: u8, group_equal: bool) -> String {
-        let s = print_strategy(e, i);
+    fn child(e: &StratExpr, lm: &LoadedModule, i: &Interner, max: u8, group_equal: bool) -> String {
+        let s = print_strategy(e, lm, i);
         let p = prec(e);
         if p > max || (group_equal && p == max) {
             format!("({s})")
@@ -434,11 +437,11 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
             s
         }
     }
-    fn iteration(a: &StratExpr, i: &Interner, op: &str) -> String {
+    fn iteration(a: &StratExpr, lm: &LoadedModule, i: &Interner, op: &str) -> String {
         if prec(a) <= 1 {
-            format!("{} {op}", print_strategy(a, i))
+            format!("{} {op}", print_strategy(a, lm, i))
         } else {
-            format!("({}){op}", print_strategy(a, i))
+            format!("({}){op}", print_strategy(a, lm, i))
         }
     }
     // Punctuation-aware token spacing: no space after an opener or before a closer/comma.
@@ -479,24 +482,32 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
             if !substrats.is_empty() {
                 let ss = substrats
                     .iter()
-                    .map(|e| print_strategy(e, i))
+                    .map(|e| print_strategy(e, lm, i))
                     .collect::<Vec<_>>()
                     .join(", ");
                 s.push_str(&format!("{{{ss}}}"));
             }
             s
         }
-        StratExpr::Top(a) => format!("top({})", print_strategy(a, i)),
-        StratExpr::One(a) => format!("one({})", print_strategy(a, i)),
+        StratExpr::Top(a) => format!("top({})", print_strategy(a, lm, i)),
+        StratExpr::One(a) => format!("one({})", print_strategy(a, lm, i)),
         StratExpr::Seq(a, b) => {
-            format!("{} ; {}", child(a, i, 2, false), child(b, i, 2, true))
+            format!(
+                "{} ; {}",
+                child(a, lm, i, 2, false),
+                child(b, lm, i, 2, true)
+            )
         }
         StratExpr::Union(a, b) => {
-            format!("{} | {}", child(a, i, 3, false), child(b, i, 3, true))
+            format!(
+                "{} | {}",
+                child(a, lm, i, 3, false),
+                child(b, lm, i, 3, true)
+            )
         }
-        StratExpr::Star(a) => iteration(a, i, "*"),
-        StratExpr::Plus(a) => iteration(a, i, "+"),
-        StratExpr::Normalize(a) => iteration(a, i, "!"),
+        StratExpr::Star(a) => iteration(a, lm, i, "*"),
+        StratExpr::Plus(a) => iteration(a, lm, i, "+"),
+        StratExpr::Normalize(a) => iteration(a, lm, i, "!"),
         StratExpr::Branch {
             test,
             success,
@@ -504,9 +515,9 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
         } => {
             format!(
                 "{} ? {} : {}",
-                child(test, i, 3, false),
-                child(success, i, 4, false),
-                child(failure, i, 4, false)
+                child(test, lm, i, 3, false),
+                child(success, lm, i, 4, false),
+                child(failure, lm, i, 4, false)
             )
         }
         StratExpr::Test {
@@ -541,7 +552,7 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
                 .map(|(v, st)| {
                     // A by-clause strategy binds tighter than its comma; sequence, union, and branch
                     // children therefore need parentheses.
-                    let s = print_strategy(st, i);
+                    let s = print_strategy(st, lm, i);
                     let s = if prec(st) >= 2 { format!("({s})") } else { s };
                     format!("{} using {}", join(v, i), s)
                 })
@@ -562,14 +573,18 @@ pub fn print_strategy(e: &StratExpr, i: &Interner) -> String {
             };
             let a = args
                 .iter()
-                .map(|e| print_strategy(e, i))
+                .map(|e| print_strategy(e, lm, i))
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("{kw}({a})")
         }
         StratExpr::Call { name, args } => {
             if args.is_empty() {
-                name.clone()
+                if rules_labelled(lm, name).is_empty() {
+                    name.clone()
+                } else {
+                    format!("{name}()")
+                }
             } else {
                 let a = args
                     .iter()
@@ -1129,7 +1144,45 @@ fn contains_xmatchrew(strategy: &StratExpr) -> bool {
 
 /// Compile kind-based call profiles and executable unconditional definitions in declaration order.
 fn compile_strategy_program(lm: &LoadedModule, i: &Interner) -> StrategyProgram {
+    compile_strategy_program_with_drops(lm, i).0
+}
+
+/// Warnings for the strategy definitions of `lm` that no strategy command executes because they are invalid:
+/// an unconditional definition whose parameter or body does not resolve, or whose name and parameter kinds
+/// match no strategy declaration. Each names the definition and the reason. Like a dropped statement's
+/// warning, it is attributed to the definition's home module and source line, so a plain importer produces
+/// its home's warning exactly. The definition itself stays in the module, and the program is still compiled
+/// for each command; this only reports what that compilation leaves out.
+///
+/// Not reported: `csd` definitions and bodies containing `xmatchrew`, which call resolution rejects as
+/// Unsupported (`TNK-STRAT-003`); a definition whose home grammar is unavailable; one whose matching profile
+/// has several origins; and diamond duplicates.
+pub fn dropped_definition_diagnostics(lm: &LoadedModule, i: &Interner) -> Vec<Diagnostic> {
+    if lm.built.strat_defs.is_empty() {
+        return Vec::new();
+    }
+    compile_strategy_program_with_drops(lm, i)
+        .1
+        .into_iter()
+        .map(|(def, reason)| {
+            Diagnostic::warning(
+                def.home.as_deref().unwrap_or(&lm.built.name),
+                def.line,
+                "strategy definition",
+                format!("dropped strategy definition `{}`: {reason}", def.name),
+            )
+        })
+        .collect()
+}
+
+/// [`compile_strategy_program`], also returning each definition it drops as invalid, with the reason (see
+/// [`dropped_definition_diagnostics`]).
+fn compile_strategy_program_with_drops<'a>(
+    lm: &'a LoadedModule,
+    i: &Interner,
+) -> (StrategyProgram, Vec<(&'a StratDef, String)>) {
     let mut program = StrategyProgram::default();
+    let mut dropped = Vec::new();
     let mut seen_declarations = HashSet::new();
     for decl in &lm.built.strat_decls {
         if let (Some(origin), Some(source_index)) = (&decl.origin, decl.source_index)
@@ -1189,37 +1242,52 @@ fn compile_strategy_program(lm: &LoadedModule, i: &Interner) -> StrategyProgram 
         let mut vars = VarIndex::new();
         let mut patterns = Vec::with_capacity(def.params.len());
         let mut arg_kinds = Vec::with_capacity(def.params.len());
-        let mut valid = true;
+        let mut invalid = None;
         for param in &def.params {
             match parse_build(param, grammar, &lm.built, i, &mut vars) {
                 Ok(pattern) => {
                     arg_kinds.push(term_kind(&pattern, lm));
                     patterns.push(pattern);
                 }
-                Err(_) => {
-                    valid = false;
+                Err(error) => {
+                    invalid = Some(error);
                     break;
                 }
             }
         }
-        if !valid {
+        if let Some(error) = invalid {
+            dropped.push((def, error));
             continue;
         }
-        let matching_profiles: Vec<ProfileKey> = program
+        let candidates: Vec<&DeclProfile> = program
             .profiles
             .iter()
-            .filter(|profile| {
-                profile.origins.len() == 1
-                    && profile.key.name == def.name
-                    && profile.key.args == arg_kinds
-            })
+            .filter(|profile| profile.key.name == def.name && profile.key.args == arg_kinds)
+            .collect();
+        if candidates.is_empty() {
+            dropped.push((
+                def,
+                "no strategy declaration matches its name and parameter kinds".to_string(),
+            ));
+            continue;
+        }
+        // A profile that declarations of several origins share applies none of their definitions.
+        let matching_profiles: Vec<ProfileKey> = candidates
+            .into_iter()
+            .filter(|profile| profile.origins.len() == 1)
             .map(|profile| profile.key.clone())
             .collect();
         if matching_profiles.is_empty() {
             continue;
         }
-        let Ok(body) = resolve_in(&def.body, lm, grammar, i, &vars) else {
-            continue;
+        let body = match resolve_in(&def.body, lm, grammar, i, &vars) {
+            Ok(body) => body,
+            Err(error) => {
+                if !contains_xmatchrew(&def.body) {
+                    dropped.push((def, error));
+                }
+                continue;
+            }
         };
         let nr_vars = vars.count();
         for key in matching_profiles {
@@ -1231,14 +1299,15 @@ fn compile_strategy_program(lm: &LoadedModule, i: &Interner) -> StrategyProgram 
             });
         }
     }
-    program
+    (program, dropped)
 }
 
+/// The kind of a strategy declaration's sort spelling, resolved as in an operator profile: a sort names its
+/// kind, and a kind spelling such as `[S]` or `[S,T]` the kind of its first component.
 fn strategy_sort_kind(lm: &LoadedModule, name: &str) -> Option<KindId> {
-    lm.built
-        .sorts
-        .get(name)
-        .map(|&sort| lm.built.engine.sorts().kind_of(sort))
+    resolve_sort(&lm.built.engine, &lm.built.sorts, name)
+        .ok()
+        .map(|sort| lm.built.engine.sorts().kind_of(sort))
 }
 
 fn term_kind(term: &Term, lm: &LoadedModule) -> KindId {
@@ -2726,6 +2795,7 @@ mod tests {
     use super::*;
     use crate::lex::tokenize;
     use crate::load::build_loaded_module;
+    use crate::surface::ast::DiagnosticSeverity;
     use crate::surface::parser::Parser;
 
     fn loaded_strategy_module(source: &str) -> (LoadedModule, Interner) {
@@ -2982,6 +3052,153 @@ mod tests {
                 .count(),
             1,
             "zero-argument declarations ignore the exact A/B subject sort within one kind"
+        );
+    }
+
+    #[test]
+    fn kind_spelled_declarations_resolve_to_their_kinds() {
+        let (loaded, interner) = loaded_strategy_module(
+            "smod STRAT-KIND-PROFILES is
+               sorts A K .
+               subsort A < K .
+               op a : -> A .
+               rl [step] : a => a .
+               strat kinded : [A] @ [A] .
+               strat multi : [A,K] @ K .
+               strat bare @ [K] .
+               sd kinded(X:[A]) := step .
+               sd multi(X:A) := step .
+               sd bare := step .
+             endsm",
+        );
+        let program = compile_strategy_program(&loaded, &interner);
+        let sorts = loaded.built.engine.sorts();
+        let kind = sorts.kind_of(loaded.built.sorts["A"]);
+        for (name, arity) in [("kinded", 1), ("multi", 1), ("bare", 0)] {
+            let profiles = program
+                .profiles
+                .iter()
+                .filter(|profile| profile.key.name == name)
+                .collect::<Vec<_>>();
+            assert_eq!(profiles.len(), 1, "`{name}` declares one profile");
+            assert_eq!(
+                profiles[0].key.args,
+                vec![kind; arity],
+                "`{name}` arguments"
+            );
+            assert_eq!(profiles[0].key.subject, kind, "`{name}` subject");
+            assert_eq!(
+                program
+                    .defs
+                    .iter()
+                    .filter(|definition| definition.key.name == name)
+                    .count(),
+                1,
+                "the definition of `{name}` is executable"
+            );
+        }
+    }
+
+    /// A zero-argument call echoes as `name()` exactly when a rule of the module is labelled `name`, whose
+    /// application the bare spelling denotes; otherwise the bare spelling is the call and is kept.
+    #[test]
+    fn zero_argument_call_echo_keeps_parentheses_beside_a_rule_label() {
+        let (loaded, interner, strategies) = loaded_module_and_strategies(
+            "smod STRAT-ZERO-ECHO is
+               sort L .
+               ops a b c : -> L .
+               rl [hop] : a => b .
+               rl [hop] : b => c .
+               strats hop solo @ L .
+               sd hop() := hop ; hop .
+               sd solo := hop .
+             endsm
+             srew a using hop .
+             srew a using hop() .
+             srew a using solo() .
+             srew a using one(hop()) ; hop() * .
+             srew a using solo ; try(solo()) .",
+        );
+        let echoes: Vec<String> = strategies
+            .iter()
+            .map(|strategy| print_strategy(strategy, &loaded, &interner))
+            .collect();
+        assert_eq!(
+            echoes,
+            [
+                "hop",
+                "hop()",
+                "solo",
+                "one(hop()) ; hop() *",
+                "solo ; try(solo)"
+            ]
+        );
+    }
+
+    /// A definition the strategy compiler drops as invalid is reported with its reason, at its `sd` line.
+    /// Unsupported forms (`csd`, a body containing `xmatchrew`) are left to call resolution, and a call of
+    /// one is a definition body that does not resolve.
+    #[test]
+    fn dropped_definitions_are_reported_with_their_reasons() {
+        let (loaded, interner) = loaded_strategy_module(
+            "smod STRAT-DROPS is
+               sorts S T .
+               ops a b : -> S .
+               op t : -> T .
+               rl [r] : a => b .
+               strats good badTerm badLabel sx sc viaX @ S .
+               strats badParam kinds : S @ S .
+               sd good := r .
+               sd badTerm := match zork .
+               sd badLabel := nolabel .
+               sd badParam(zork) := r .
+               sd kinds(t) := r .
+               sd undeclared := r .
+               sd sx := xmatchrew X:S by X:S using r .
+               csd sc := r if a = a .
+               sd viaX := sx .
+             endsm",
+        );
+        let reported: Vec<(Option<u32>, String)> =
+            dropped_definition_diagnostics(&loaded, &interner)
+                .into_iter()
+                .map(|diagnostic| {
+                    assert_eq!(diagnostic.severity, DiagnosticSeverity::Warning);
+                    assert_eq!(diagnostic.module.as_deref(), Some("STRAT-DROPS"));
+                    (diagnostic.line, diagnostic.message)
+                })
+                .collect();
+        let dropped = |line: u32, name: &str, reason: &str| {
+            (
+                Some(line),
+                format!("dropped strategy definition `{name}`: {reason}"),
+            )
+        };
+        let no_declaration = "no strategy declaration matches its name and parameter kinds";
+        assert_eq!(
+            reported,
+            [
+                dropped(9, "badTerm", "no parse at token 0 (`zork`): `zork`"),
+                dropped(
+                    10,
+                    "badLabel",
+                    "`nolabel` is neither a rule label nor a strategy of this module"
+                ),
+                dropped(11, "badParam", "no parse at token 0 (`zork`): `zork`"),
+                dropped(12, "kinds", no_declaration),
+                dropped(13, "undeclared", no_declaration),
+                dropped(16, "viaX", "xmatchrew is recognized but not implemented"),
+            ]
+        );
+        let program = compile_strategy_program(&loaded, &interner);
+        assert_eq!(
+            program
+                .defs
+                .iter()
+                .map(|definition| definition.key.name.as_str())
+                .collect::<Vec<_>>(),
+            ["good"],
+            "only the valid definition is executable"
         );
     }
 

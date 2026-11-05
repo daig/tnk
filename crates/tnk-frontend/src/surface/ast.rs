@@ -359,8 +359,10 @@ pub struct StratDecl {
 }
 
 /// A **strategy definition** `sd name(params) := body .` / `csd … := body if cond .`. The call-pattern
-/// arguments (`params`) and any condition are raw token bubbles (parsed against the module grammar at build
-/// time, like equation bubbles); the `body` strategy structure is parsed now.
+/// arguments (`params`) and any condition are raw token bubbles; the `body` strategy structure is parsed
+/// now. An unconditional definition's parameters and body term bubbles are parsed against its home grammar
+/// whenever the strategy program is compiled: for each strategy command, and once per module build to report
+/// a definition that does not resolve.
 #[derive(Debug, Clone)]
 pub struct StratDef {
     pub name: String,
@@ -373,6 +375,8 @@ pub struct StratDef {
     pub source_index: Option<usize>,
     /// Source module whose grammar owns the raw parameter/body term bubbles.
     pub home: Option<String>,
+    /// Source line of the `sd`/`csd` keyword, for diagnostics; `None` for a reflected definition.
+    pub line: Option<u32>,
 }
 
 /// A test/matchrew matching mode: `match` (top), `xmatch` (with extension), `amatch` (anywhere).

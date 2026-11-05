@@ -1198,7 +1198,7 @@ impl Session {
                 let kw = if depth_first { "dsrewrite" } else { "srewrite" };
                 let echo = command_echo(lm, &self.interner, &parsed, self.render_color)
                     .unwrap_or_else(|_| join_tokens(&term, &self.interner));
-                let strat_str = tnk_frontend::strategy::print_strategy(&strategy, &self.interner);
+                let strat_str = tnk_frontend::strategy::print_strategy(&strategy, lm, &self.interner);
                 match tnk_frontend::strategy::srewrite_command(
                     lm, &self.interner, &parsed, &strategy, depth_first,
                 ) {

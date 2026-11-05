@@ -1843,6 +1843,7 @@ impl<'a> Parser<'a> {
                     ));
                 }
                 let conditional = kw == "csd";
+                let line = self.peek().map(|token| token.line);
                 self.advance();
                 let name = self.name()?;
                 // Optional call parameters `name(p1, …)` — raw bubbles, split at top-level commas.
@@ -1868,6 +1869,7 @@ impl<'a> Parser<'a> {
                     origin: None,
                     source_index: None,
                     home: None,
+                    line,
                 });
             }
             other => return Err(format!("unsupported declaration `{other}`")),

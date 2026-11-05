@@ -283,7 +283,9 @@ pub fn build_loaded_module_homed_traced_with_host_functions<'m>(
 
 /// Typed homed configured build. Home-grammar statements and all equations are installed before
 /// configured attachments commit; identity and narrowing-trace normalization then run on the sealed
-/// signature.
+/// signature. The module's diagnostics include, after the statement diagnostics, a warning for each
+/// strategy definition that strategy commands drop as invalid
+/// ([`dropped_definition_diagnostics`](crate::strategy::dropped_definition_diagnostics)).
 ///
 /// # Errors
 ///
@@ -322,16 +324,18 @@ pub fn try_build_loaded_module_homed_traced_with_host_functions<'m>(
         .collect();
     let smt_rewrite_valid =
         built.engine.valid_for_smt_rewriting() && !has_regular_collapse_axiom(pm);
-    Ok((
-        LoadedModule {
-            built,
-            grammar,
-            diagnostics,
-            strategy_grammars,
-            smt_rewrite_valid,
-        },
-        trace_refs,
-    ))
+    let mut loaded = LoadedModule {
+        built,
+        grammar,
+        diagnostics,
+        strategy_grammars,
+        smt_rewrite_valid,
+    };
+    // Each strategy command compiles the strategy program anew; report once per build, with the statement
+    // diagnostics, the definitions that compilation drops as invalid.
+    let dropped = crate::strategy::dropped_definition_diagnostics(&loaded, interner);
+    loaded.diagnostics.extend(dropped);
+    Ok((loaded, trace_refs))
 }
 
 pub(crate) fn install_identities(

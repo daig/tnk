@@ -158,6 +158,12 @@ All notable user-visible changes are documented here. This project follows Seman
 
 - A sort renaming now renames the sorts inside kind spellings: in operator and strategy declarations (`[P]`, `[P,Q]`), in variables declared at a kind, and in on-the-fly variables such as `W:[P]` in statements. A renamed module whose source spelled a renamed sort inside a kind used to be rejected (``unknown sort `P` in kind `[P]` ``) or to drop the statements over `W:[P]` (`dropped equation: no parse`). When the old sort name still existed, for example through the implicit BOOL import beside `sort Bool to Boolean`, the kept spelling silently named that sort's kind instead, so EXT-BOOL renamed this way lost its `and-then` and `or-else` equations. A formal parameter's theory copy is such a renaming, so a parameterized module over a theory with an operator or variable at `[Elt]` is no longer rejected, and the copy keeps a theory equation over `W:[Elt]`.
 
+- A strategy declaration whose profile spells a kind (`strat st : [P] @ [P]`, `strat st2 @ [Q]`, `strat st3 : [P,Q] @ Q`) now resolves it as an operator declaration does, through the kind's first component. Such a declaration used to be skipped without a diagnostic, so its definitions never applied and every call answered `No solution.`; this also held for the renamed copies of such declarations. Because such a profile now resolves, an importer that redeclares an imported kind-spelled profile with sort names now declares that profile a second time, and, as already happens when two sort-spelled declarations name one profile, its definitions are then left out.
+
+- A strategy definition (`sd`) whose parameter or body does not resolve, or whose name and parameter kinds match no strategy declaration, is now reported when its module is built, as ``warning: module `M`, line N: dropped strategy definition `name`: REASON``, with the repetition rules of dropped-statement warnings. Such a definition used to be skipped silently each time a strategy command ran, so its calls answered `No solution.` with no diagnostic anywhere. Reported reasons include a term that does not parse, a name that is neither a rule label nor a strategy, an unbound variable, a call of a strategy that only `csd` or `xmatchrew` definitions define, and a parameter of another kind than the declaration's. The definition is still dropped on its own, so its calls still answer `No solution.`; whether it should instead make the module invalid is an open decision (TNK-DEV-009). `csd` definitions and definitions containing `xmatchrew` are not reported: call resolution still rejects them.
+
+- `srewrite` and `dsrewrite` now echo a zero-argument strategy call `name()` as `name()`, wherever it occurs in the strategy, when an executable rule of the module is labelled `name`. The echo used to print the bare `name`, which denotes that rule's application, so `srew a using go()` and `srew a using go` printed the same header with different results, and replaying the echo ran the other strategy. Without such a rule the bare spelling denotes the call, and the echo keeps it.
+
 - A parameter constant (`[pconst]`) that a view does not map now maps by identity (`X$c` to `c`), like any other unmapped source operator. The instance used to keep `X$c`, so the statements that mention it were dropped (`no parse at token … (X$c)`). A parenthesized declaration `op (c) : … [pconst]` is now the parameter constant `X$c`; its parameter copy used to be named `X$(c)`.
 
 - Passing an enclosing parameter `p` as an instantiation argument (`inc BAR{Y}` inside `BAR2{Y :: T}`) now re-qualifies the parameter constants as well as the parameter sorts (`X$c` to `p$c`). The instance's statements that mention `X$c` used to be dropped, and an identity attribute that mentions it rejected the module (`bad identity term`).
@@ -166,7 +172,7 @@ All notable user-visible changes are documented here. This project follows Seman
 
 ### Documentation
 
-- §5.2 now states that the components of a kind spelling `[A,B,...]` must be sorts of one kind, and Appendix H.4.1 records that operator and variable declarations resolve only the first component. `TNK-MOD-005` states that a sort renaming, and a formal parameter's theory copy, rewrite each component of a kind spelling.
+- §5.2 now states that the components of a kind spelling `[A,B,...]` must be sorts of one kind, and Appendix H.4.1 records that operator, variable, and strategy declarations resolve only the first component. `TNK-MOD-005` states that a sort renaming, and a formal parameter's theory copy, rewrite each component of a kind spelling.
 
 - `TNK-MOD-005` now states that an operator profile in a renaming selects one overload family (§1.2), that the profile must spell the sorts of a declared overload without kind brackets (otherwise, or when two profile maps select one family, the renaming is an error), and that a profile map takes precedence over a plain map of the same name for the family it selects. The Book's renaming section follows.
 
@@ -181,6 +187,10 @@ All notable user-visible changes are documented here. This project follows Seman
 - Recorded the current variable-left-hand-side boundary for source and reflected statements in Appendix H.4.1 and K.3 of the reference, as current behavior pending a decision rather than a static requirement.
 
 - Recorded in Appendix H.4.1 of the reference that a reflected module containing an executable statement with an unbound variable, or an equation or membership with a rewrite condition, does not down-translate.
+
+- Appendix H.4.1 records the dropped-strategy-definition warning and its state effect as the current boundary pending a decision, and two strategy seams that remain silent: a `csd` or `xmatchrew` definition beside an executable definition of the same name and arity is skipped while calls run the other definitions, and a strategy declaration naming an undeclared sort provides no call profile.
+
+- §5.2, §11, and Appendix D now admit the empty argument list of a strategy definition or call (`sd go() := …`, `go()`), which the parser already accepted, and §11 states that a bare name labelling an executable rule of the module is that rule's application, while `Name()` always calls the strategy.
 
 ## [0.1.0] - 2026-07-29
 

@@ -10973,6 +10973,7 @@ fn try_down_strat_defs(
             origin: None,
             source_index: None,
             home: None,
+            line: None,
         });
     }
     Ok(Some(result))

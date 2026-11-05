@@ -432,6 +432,84 @@ endsm
     }
 }
 
+/// A zero-argument strategy call `hop()` echoes as `hop()` when a rule of the module, local or imported, is
+/// labelled `hop`, because the bare `hop` is then that rule's application. It used to echo as the bare
+/// name, so `using hop()` and `using hop` printed the same header with different results, and replaying
+/// the echo changed the strategy. Without a rule of that name, the bare spelling is the call and is kept.
+#[test]
+fn zero_argument_call_echoes_round_trip_beside_a_rule_label() {
+    let mut r = repl();
+    let setup = r
+        .eval(
+            "smod ECHO-ZERO is\n\
+               sort L .\n\
+               ops a b c : -> L .\n\
+               op w : L -> L [ctor] .\n\
+               rl [hop] : a => b .\n\
+               rl [hop] : b => c .\n\
+               strats hop solo @ L .\n\
+               sd hop() := hop ; hop .\n\
+               sd solo := hop .\n\
+             endsm\n\
+             smod ECHO-ZERO-USE is\n\
+               protecting ECHO-ZERO .\n\
+             endsm",
+        )
+        .output;
+    assert_eq!(setup, "");
+    let cases = [
+        ("a", "hop", "hop"),
+        ("a", "hop()", "hop()"),
+        ("a", "hop() ; idle", "hop() ; idle"),
+        ("a", "one(hop()) | fail", "one(hop()) | fail"),
+        ("a", "try(hop())", "try(hop())"),
+        ("a", "top(hop())", "hop()"),
+        ("a", "hop() *", "hop() *"),
+        (
+            "w(a)",
+            "matchrew w(X:L) by X:L using hop()",
+            "matchrew w(X:L) by X:L using hop()",
+        ),
+        ("a", "solo()", "solo"),
+        ("a", "solo ; hop()", "solo ; hop()"),
+    ];
+    for module in ["ECHO-ZERO", "ECHO-ZERO-USE"] {
+        for (subject, original, expected_echo) in cases {
+            let first = r
+                .eval(&format!(
+                    "srewrite in {module} : {subject} using {original} ."
+                ))
+                .output;
+            let header = first
+                .split_once("\n\n")
+                .map_or(first.as_str(), |(header, _)| header);
+            let emitted = header.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert_eq!(
+                emitted,
+                format!("srewrite in {module} : {subject} using {expected_echo} ."),
+                "echo for `{original}`"
+            );
+            let replay = r
+                .eval(&format!(
+                    "srewrite in {module} : {subject} using {expected_echo} ."
+                ))
+                .output;
+            assert_eq!(
+                strategy_value_counts(&first),
+                strategy_value_counts(&replay),
+                "behavior changed after echo/reparse: `{original}` -> `{expected_echo}`"
+            );
+        }
+    }
+    let rule = r.eval("srewrite in ECHO-ZERO : a using hop .").output;
+    let call = r.eval("srewrite in ECHO-ZERO : a using hop() .").output;
+    assert_ne!(
+        strategy_value_counts(&rule),
+        strategy_value_counts(&call),
+        "the rule application and the call are different strategies"
+    );
+}
+
 /// Evaluate `setup`, then each command, in one REPL on a worker thread. A command that does not finish
 /// within `limit` fails the test instead of hanging the run. Returns each command's output in order.
 fn eval_commands_within(setup: &str, commands: &[&str], limit: std::time::Duration) -> Vec<String> {
@@ -2111,6 +2189,58 @@ fn sort_renaming_and_parameter_copies_follow_kind_spellings() {
             "result [N]: dbl(dbl(n))",
         ],
         "{out}"
+    );
+}
+
+/// A strategy declaration resolves a kind spelling in its profile (`[P]`, `[P,Q]`) as an operator
+/// declaration does. Such a declaration used to be skipped without a diagnostic, so its definitions never
+/// applied and every call answered `No solution.`. A sort renaming renames the kind, and the renamed
+/// declarations run too.
+#[test]
+fn kind_spelled_strategy_declarations_run_their_definitions() {
+    let out = repl()
+        .eval(
+            "smod KIND-STRAT is\n\
+               sorts P Q .\n\
+               subsort P < Q .\n\
+               ops p q : -> P .\n\
+               rl [r] : p => q .\n\
+               strat plain : P @ P .\n\
+               sd plain(X:P) := r .\n\
+               strat kinded : [P] @ [P] .\n\
+               sd kinded(X:[P]) := r .\n\
+               strat bare @ [Q] .\n\
+               sd bare := r .\n\
+               strat multi : [P,Q] @ Q .\n\
+               sd multi(X:P) := r .\n\
+             endsm\n\
+             srew p using plain(p) .\n\
+             srew p using kinded(p) .\n\
+             srew p using bare .\n\
+             srew p using multi(p) .\n\
+             smod KIND-STRAT-REN is\n\
+               inc KIND-STRAT * (sort P to PX) .\n\
+             endsm\n\
+             srew p using kinded(p) .\n\
+             srew p using bare .\n",
+        )
+        .output;
+    assert!(!out.contains("error") && !out.contains("warning"), "{out}");
+    let results: Vec<&str> = out
+        .lines()
+        .filter(|line| line.starts_with("result ") || line == &"No solution.")
+        .collect();
+    assert_eq!(
+        results,
+        [
+            "result P: q",
+            "result P: q",
+            "result P: q",
+            "result P: q",
+            "result PX: q",
+            "result PX: q",
+        ],
+        "every call applies its definition: {out}"
     );
 }
 
@@ -5752,6 +5882,120 @@ fn memo_attribute_and_controls_warn_without_changing_results() {
         );
     }
     assert_eq!(r.eval("red in MEMO-DIAMOND : f(s(z)) .").output, before);
+}
+
+/// A strategy definition whose parameter or body does not resolve, or that matches no declaration, is
+/// dropped with a warning when its module is entered, as a dropped statement is. The definition used to be
+/// skipped silently each time a strategy command compiled the module's strategies, so its calls answered
+/// `No solution.` with no diagnostic. The drop itself is unchanged: the call still answers `No solution.`,
+/// and the module's valid definitions still run. A plain importer reproduces its home's warning, which is
+/// not repeated; an instance reports its own copy. Definitions of a profile that independent modules
+/// declare, and the Unsupported forms (`csd`, `xmatchrew`), are not reported.
+#[test]
+fn invalid_strategy_definitions_are_dropped_with_a_warning() {
+    let mut r = repl();
+    let rules = "mod DROP-RULES is\n  sort S .\n  ops a b : -> S .\n  rl [r] : a => b .\nendm";
+    assert_eq!(r.eval(rules).output, "");
+    let base = r
+        .eval(
+            "smod DROP-STRAT is\n\
+               protecting DROP-RULES .\n\
+               strats good badTerm badLabel @ S .\n\
+               strat badParam : S @ S .\n\
+               sd good := r .\n\
+               sd badTerm := match zork .\n\
+               sd badLabel := nolabel .\n\
+               sd badParam(zork) := r .\n\
+             endsm",
+        )
+        .output;
+    assert_eq!(
+        base,
+        wrap::auto_wrap(
+            "warning: module `DROP-STRAT`, line 6: dropped strategy definition `badTerm`: no parse \
+             at token 0 (`zork`): `zork`\n\
+             warning: module `DROP-STRAT`, line 7: dropped strategy definition `badLabel`: \
+             `nolabel` is neither a rule label nor a strategy of this module\n\
+             warning: module `DROP-STRAT`, line 8: dropped strategy definition `badParam`: no parse \
+             at token 0 (`zork`): `zork`"
+        )
+    );
+    for (call, expected) in [
+        ("good", "result S: b"),
+        ("badTerm", "No solution."),
+        ("badLabel", "No solution."),
+        ("badParam(a)", "No solution."),
+    ] {
+        let out = r.eval(&format!("srew a using {call} .")).output;
+        assert!(out.contains(expected), "{call}: {out}");
+    }
+    // A plain importer parses the definitions in their home grammar and produces the same warnings.
+    assert_eq!(
+        r.eval("smod DROP-USE is\n  protecting DROP-STRAT .\nendsm")
+            .output,
+        ""
+    );
+    let imported = r.eval("srew in DROP-USE : a using badLabel .").output;
+    assert!(imported.contains("No solution."), "{imported}");
+
+    // An instance's copy of an invalid parameterized definition is reported for the instance.
+    assert_eq!(r.eval("fth DROP-TH is sort Elt . endfth").output, "");
+    let parameterized = r
+        .eval(
+            "smod DROP-PAR{X :: DROP-TH} is\n\
+               strat keep : X$Elt @ X$Elt .\n\
+               sd keep(Y:X$Elt) := match zork(Y:X$Elt) .\n\
+             endsm",
+        )
+        .output;
+    assert_eq!(
+        parameterized,
+        wrap::auto_wrap(
+            "warning: module `DROP-PAR`, line 3: dropped strategy definition `keep`: no parse at \
+             token 0 (`zork`): `zork ( Y:X$Elt )`"
+        )
+    );
+    assert_eq!(
+        r.eval("view DROP-V from DROP-TH to DROP-RULES is sort Elt to S . endv")
+            .output,
+        ""
+    );
+    let instance = r
+        .eval("smod DROP-INST is\n  protecting DROP-PAR{DROP-V} .\nendsm")
+        .output;
+    assert_eq!(
+        instance,
+        wrap::auto_wrap(
+            "warning: module `DROP-INST`, line 3: dropped strategy definition `keep`: no parse at \
+             token 0 (`zork`): `zork ( Y:S )`"
+        )
+    );
+
+    let quiet = r
+        .eval(
+            "smod DROP-LEFT is\n\
+               protecting DROP-RULES .\n\
+               strat both @ S .\n\
+               sd both := r .\n\
+             endsm\n\
+             smod DROP-RIGHT is\n\
+               protecting DROP-RULES .\n\
+               strat both @ S .\n\
+               sd both := idle .\n\
+             endsm\n\
+             smod DROP-BOTH is\n\
+               protecting DROP-LEFT .\n\
+               protecting DROP-RIGHT .\n\
+             endsm\n\
+             smod DROP-UNSUPPORTED is\n\
+               protecting DROP-RULES .\n\
+               strats sx sc @ S .\n\
+               sd sx := xmatchrew X:S by X:S using r .\n\
+               csd sc := r if a = a .\n\
+             endsm",
+        )
+        .output;
+    assert_eq!(quiet, "");
 }
 
 #[test]
