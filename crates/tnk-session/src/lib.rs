@@ -11,7 +11,7 @@ mod interpreter;
 mod trace;
 
 use interpreter::{InterpreterRegistry, LocalInterpreterManager};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use tnk_core::dag::DagId;
 use tnk_core::host::{HostFunctionCatalog, ReducerFault};
 use tnk_core::rewrite::{ExternalRun, RewriteStep, Rewriting};
@@ -34,7 +34,9 @@ use tnk_frontend::surface::ast::{
 };
 use tnk_frontend::surface::parser::Parser;
 use tnk_modules::db::ModuleDb;
-use tnk_modules::load::{flatten_and_build_with_host_functions, module_dep_names, view_dep_names};
+use tnk_modules::load::{
+    DepRef, flatten_and_build_with_host_functions, module_dep_refs, view_dep_refs,
+};
 use tnk_modules::meta::{MetaDescent, MetaState};
 use tnk_modules::view::{ViewDb, validate_view_with_host_functions};
 use trace::{TraceFlags, render_trace};
@@ -63,12 +65,17 @@ pub struct Session {
     views: ViewDb,
     /// Reflection search state retained across commands, including variant-unification cursors.
     meta_state: MetaState,
-    /// Direct dependencies for each module and view. Redefinition triggers rebuilding every transitive
-    /// dependent so cached flattened modules cannot retain a replaced definition.
-    deps: HashMap<String, HashSet<String>>,
+    /// Direct dependencies for each module and view, keyed by kind: a module and a view may share a name.
+    /// Redefinition triggers rebuilding every transitive dependent so cached flattened modules cannot
+    /// retain a replaced definition.
+    deps: HashMap<DepRef, HashSet<DepRef>>,
     /// The names of the built [`modules`](Self::modules), each once, in entry order (for `show modules`).
     /// A redefinition keeps its position; a module that was dropped and entered again is appended.
     order: Vec<String>,
+    /// Every module entry in sequence, never pruned: a module evicted by a failed rebuild and entered again
+    /// is listed again. A module's first entry here is its first definition, which breaks ties between
+    /// ready dependents in [`Self::dependency_order`].
+    definition_order: Vec<String>,
     /// View names in entry order (for `show views`).
     view_order: Vec<String>,
     /// Module selected for unqualified commands.
@@ -98,8 +105,10 @@ pub struct Session {
     interpreters: InterpreterRegistry,
     /// Unequal identity-collapse notices already emitted; each operator reports at most once.
     reported_identity_collapses: HashSet<(String, tnk_core::symbol::SymbolId, bool)>,
-    /// Source diagnostics already shown in this Session. Imported, renamed, instantiated, or
-    /// dependent rebuilds may rediscover the same source declaration; they must not create warning storms.
+    /// Source diagnostics already shown in this Session that the latest build of some built module (its
+    /// retained `LoadedModule::diagnostics`) still produces. Imported, renamed, instantiated, or dependent
+    /// rebuilds may rediscover the same source declaration; they must not create warning storms. Once no
+    /// built module produces a diagnostic it is forgotten, so a recurrence is reported again.
     reported_source_diagnostics: HashSet<Diagnostic>,
 }
 
@@ -229,6 +238,7 @@ impl Session {
             meta_state: MetaState::default(),
             deps: HashMap::new(),
             order: Vec::new(),
+            definition_order: Vec::new(),
             view_order: Vec::new(),
             current: None,
             render_color: false,
@@ -421,7 +431,7 @@ impl Session {
             );
         }
 
-        let dependencies = module_dep_names(&pm);
+        let dependencies = module_dep_refs(&pm);
         let imports = pm.imports.clone();
         let mut diagnostics = unsupported_memo_diagnostics(&pm, &self.interner);
 
@@ -450,6 +460,9 @@ impl Session {
                 self.reported_source_diagnostics
                     .retain(|diagnostic| diagnostic.module.as_deref() != Some(name.as_str()));
                 append_diagnostics(out, &diagnostics, &mut self.reported_source_diagnostics);
+                // The cached module keeps what its build produced: the Session's record of which shown
+                // diagnostics are still produced (see `rebuild_dependents`).
+                lm.diagnostics = diagnostics;
                 if self.verbose && !lm.built.oo_completion_diagnostics.is_empty() {
                     out.push_str(&lm.built.oo_completion_diagnostics.join("\n\n"));
                     out.push_str("\n\n");
@@ -458,15 +471,16 @@ impl Session {
                 self.last = None;
                 self.meta_state.clear();
                 self.db = candidate_db;
-                self.deps.insert(name.clone(), dependencies);
+                self.deps.insert(DepRef::Module(name.clone()), dependencies);
                 if !self.modules.contains_key(&name) {
                     self.order.push(name.clone());
+                    self.definition_order.push(name.clone());
                 }
                 self.reported_identity_collapses
                     .retain(|(module, _, _)| module != &name);
                 self.modules.insert(name.clone(), lm);
                 self.current = Some(name.clone());
-                self.rebuild_dependents(&name, out);
+                self.rebuild_dependents(&DepRef::Module(name.clone()), out);
             }
             Err(e) => {
                 out.push_str(&format!("error: module `{name}`"));
@@ -487,7 +501,8 @@ impl Session {
         let name = pm.name.clone();
         self.last = None;
         self.meta_state.clear();
-        self.deps.insert(name.clone(), module_dep_names(&pm));
+        self.deps
+            .insert(DepRef::Module(name.clone()), module_dep_refs(&pm));
         self.db.insert(pm);
         if self.verbose && !lm.built.oo_completion_diagnostics.is_empty() {
             out.push_str(&lm.built.oo_completion_diagnostics.join("\n\n"));
@@ -495,12 +510,13 @@ impl Session {
         }
         if !self.modules.contains_key(&name) {
             self.order.push(name.clone());
+            self.definition_order.push(name.clone());
         }
         self.reported_identity_collapses
             .retain(|(module, _, _)| module != &name);
         self.modules.insert(name.clone(), lm);
         self.current = Some(name.clone());
-        self.rebuild_dependents(&name, out);
+        self.rebuild_dependents(&DepRef::Module(name.clone()), out);
     }
 
     /// Validate and store a view. Success is silent; validation errors are emitted. A view can later serve
@@ -517,7 +533,8 @@ impl Session {
                 let name = v.name.clone();
                 // Record the view's direct dependencies (its from/to modules + parameter theories) and
                 // store it.
-                self.deps.insert(name.clone(), view_dep_names(&v));
+                self.deps
+                    .insert(DepRef::View(name.clone()), view_dep_refs(&v));
                 if !self.views.contains(&v.name) {
                     self.view_order.push(v.name.clone());
                 }
@@ -525,7 +542,7 @@ impl Session {
                 self.meta_state.clear(); // view semantics participate in reflected module construction
                 // A redefined view makes cached builds of modules that instantiate with it stale
                 // (`M{V}` was flattened using the replaced view), so re-flatten its transitive dependents.
-                self.rebuild_dependents(&name, out);
+                self.rebuild_dependents(&DepRef::View(name), out);
             }
             Err(e) => {
                 out.push_str(&format!("error: view `{}`", v.name));
@@ -538,28 +555,38 @@ impl Session {
     }
 
     /// Re-flatten and rebuild every currently-built module that transitively depends on `changed` (a
-    /// module or view name that was just (re)defined). Flattening reads the module database and view store
-    /// directly — never the cached [`modules`](Self::modules) map — so each dependent is rebuilt
-    /// independently (rebuild order is irrelevant) and picks up the new definition. A dependent's own
-    /// source is unchanged, so its recorded direct dependencies stay valid and need no refresh. If any
-    /// module is rebuilt, the saved rewrite/search continuation is dropped (its engine is replaced).
-    fn rebuild_dependents(&mut self, changed: &str, out: &mut String) {
-        // Reverse-reachability over the direct-dependency graph: every name that reaches `changed`.
-        let mut dependents: HashSet<String> = HashSet::new();
-        let mut frontier = vec![changed.to_string()];
+    /// module or view that was just (re)defined). Flattening reads the module database and view store
+    /// directly, but the build then reparses each imported statement and strategy definition in its home
+    /// module's grammar, taken from the cached [`modules`](Self::modules) map. Dependents are therefore
+    /// rebuilt in [`dependency_order`](Self::dependency_order): every home a dependent consults has
+    /// already been rebuilt (or evicted, if its rebuild failed), exactly as for a fresh build of the same
+    /// source. A dependent's own source is unchanged, so its recorded direct dependencies stay valid and
+    /// need no refresh. A rebuilt dependent reports the statements it drops (`TNK-STMT-001`) unless the
+    /// same diagnostic was already shown and is still produced by a built module; afterwards, shown
+    /// diagnostics that no built module produces any more are forgotten. If any module is rebuilt, the
+    /// saved rewrite/search continuation is dropped (its engine is replaced).
+    fn rebuild_dependents(&mut self, changed: &DepRef, out: &mut String) {
+        // Reverse-reachability over the direct-dependency graph: every module or view that reaches
+        // `changed`.
+        let mut dependents: HashSet<DepRef> = HashSet::new();
+        let mut frontier = vec![changed.clone()];
         while let Some(cur) = frontier.pop() {
-            for (name, ds) in &self.deps {
-                if ds.contains(&cur) && dependents.insert(name.clone()) {
-                    frontier.push(name.clone());
+            for (dependent, ds) in &self.deps {
+                if ds.contains(&cur) && dependents.insert(dependent.clone()) {
+                    frontier.push(dependent.clone());
                 }
             }
         }
+        // The caller has already (re)built `changed`; it can reach itself only through an import cycle.
+        dependents.remove(changed);
         // Rebuild only the ones that are actually built modules (views aren't built; a dependent that
-        // failed to build earlier isn't cached). The changed name itself was already (re)built by the
-        // caller, so exclude it.
+        // failed to build earlier isn't cached).
         let mut invalidated = false;
-        for name in dependents {
-            if name == changed || !self.modules.contains_key(&name) {
+        for dependent in self.dependency_order(&dependents) {
+            let DepRef::Module(name) = dependent else {
+                continue;
+            };
+            if !self.modules.contains_key(&name) {
                 continue;
             }
             let built = {
@@ -575,7 +602,12 @@ impl Session {
                 )
             };
             match built {
-                Ok(lm) => {
+                Ok(mut lm) => {
+                    // The dependent's source is unchanged, but a statement that built against the replaced
+                    // definition may no longer parse or build. It is dropped with a diagnostic, rendered
+                    // as for a direct definition; the module keeps the diagnostics its build produced.
+                    sort_diagnostics(&mut lm.diagnostics, &name);
+                    append_diagnostics(out, &lm.diagnostics, &mut self.reported_source_diagnostics);
                     self.reported_identity_collapses
                         .retain(|(module, _, _)| module != &name);
                     self.modules.insert(name, lm);
@@ -595,9 +627,87 @@ impl Session {
                 }
             }
         }
+        // A shown diagnostic stays suppressed only while the latest build of some built module still
+        // produces it. Forgetting the rest (repaired statements, evicted or replaced modules) lets a
+        // recurrence be reported again, whichever build attributed it to which module.
+        let produced: HashSet<&Diagnostic> = self
+            .modules
+            .values()
+            .flat_map(|lm| lm.diagnostics.iter())
+            .collect();
+        self.reported_source_diagnostics
+            .retain(|diagnostic| produced.contains(diagnostic));
         if invalidated {
             self.last = None;
         }
+    }
+
+    /// Order `dependents` imports-first: each one follows every member of `dependents` that it depends on
+    /// through [`deps`](Self::deps), directly or through other members such as a view argument. Among
+    /// members whose dependencies are all ordered, views come first (they are not rebuilt, but their users
+    /// wait for them), then the module whose first definition is earliest. The order is deterministic, so
+    /// rebuild diagnostics are too. An import cycle, which only a redefinition can create and which is
+    /// currently not rejected (see `TNK-MOD-007`), has no such order: its members and the dependents of
+    /// those members follow last, in the same priority order.
+    fn dependency_order(&self, dependents: &HashSet<DepRef>) -> Vec<DepRef> {
+        // Index of each first definition; `definition_order` repeats a module re-entered after eviction.
+        let mut module_rank: HashMap<&str, usize> = HashMap::new();
+        for (index, name) in self.definition_order.iter().enumerate() {
+            module_rank.entry(name.as_str()).or_insert(index);
+        }
+        let mut view_rank: HashMap<&str, usize> = HashMap::new();
+        for (index, name) in self.view_order.iter().enumerate() {
+            view_rank.entry(name.as_str()).or_insert(index);
+        }
+        // (is a module, first definition): ready views sort before ready modules.
+        let key = |node: &DepRef| {
+            let (is_module, rank) = match node {
+                DepRef::View(name) => (false, view_rank.get(name.as_str())),
+                DepRef::Module(name) => (true, module_rank.get(name.as_str())),
+            };
+            (is_module, rank.copied().unwrap_or(usize::MAX))
+        };
+        // Kahn's algorithm over the dependency graph restricted to `dependents`: the number of unordered
+        // dependencies of each member, and the users each member releases once it is ordered.
+        let mut unordered: HashMap<&DepRef, usize> = HashMap::new();
+        let mut users: HashMap<&DepRef, Vec<&DepRef>> = HashMap::new();
+        for node in dependents {
+            let mut count = 0;
+            for dependency in self.deps.get(node).into_iter().flatten() {
+                if let Some(dependency) = dependents.get(dependency) {
+                    count += 1;
+                    users.entry(dependency).or_default().push(node);
+                }
+            }
+            unordered.insert(node, count);
+        }
+        let mut ready: BTreeSet<((bool, usize), &DepRef)> = unordered
+            .iter()
+            .filter(|&(_, &count)| count == 0)
+            .map(|(&node, _)| (key(node), node))
+            .collect();
+        let mut ordered = Vec::with_capacity(dependents.len());
+        while let Some((_, node)) = ready.pop_first() {
+            ordered.push(node.clone());
+            for &user in users.get(node).into_iter().flatten() {
+                if let Some(count) = unordered.get_mut(user) {
+                    *count -= 1;
+                    if *count == 0 {
+                        ready.insert((key(user), user));
+                    }
+                }
+            }
+        }
+        if ordered.len() < dependents.len() {
+            let mut cyclic: Vec<&DepRef> = unordered
+                .iter()
+                .filter(|&(_, &count)| count > 0)
+                .map(|(&node, _)| node)
+                .collect();
+            cyclic.sort_by_key(|&node| (key(node), node));
+            ordered.extend(cyclic.into_iter().cloned());
+        }
+        ordered
     }
 
     /// Run a `reduce`/`match` command against the current module.

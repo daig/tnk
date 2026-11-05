@@ -58,64 +58,94 @@ pub struct Program {
     pub commands: Vec<(usize, Command)>,
 }
 
-/// Collect every module/view name a module expression references — the bases and arguments of imports,
-/// summations `A + B`, renamings `M * (…)`, and instantiations `M{V, …}`. This is the dependency-tracking
-/// support for redefinition invalidation: it deliberately **over-approximates** — an instantiation
-/// argument that is really an enclosing parameter is captured too (harmless: it won't match a defined
-/// name), and a view name used as an instantiation argument is captured (so redefining a view re-flattens
-/// its users). Over-approximation can only cause an extra (semantically invisible) rebuild, never a missed
-/// one.
-fn collect_expr_names(e: &ModuleExpr, out: &mut HashSet<String>) {
+/// A module or view that a definition depends on. Modules and views have separate namespaces
+/// ([`ModuleDb`] and [`ViewDb`]), so a module and a view may share a name; their dependency records must
+/// not merge.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum DepRef {
+    Module(String),
+    View(String),
+}
+
+/// Collect every module and view a module expression references. Imports, summands `A + B`, renamed
+/// modules `M * (…)`, and instantiation bases `M{…}` name modules; instantiation arguments name views (see
+/// [`collect_arg_refs`]). This is the dependency-tracking support for redefinition invalidation: it
+/// deliberately **over-approximates** — an instantiation argument that is really an enclosing parameter is
+/// captured too (a formal parameter may share its name with a defined view, so [`module_dep_refs`] removes
+/// the module's own formal parameters afterwards), and a view used as an instantiation argument is
+/// captured (so redefining a view re-flattens its users). Over-approximation can only cause an extra
+/// (semantically invisible) rebuild, never a missed one.
+fn collect_expr_refs(e: &ModuleExpr, out: &mut HashSet<DepRef>) {
     match e {
         ModuleExpr::Named(n) => {
-            out.insert(n.clone());
+            out.insert(DepRef::Module(n.clone()));
         }
         ModuleExpr::Sum(a, b) => {
-            collect_expr_names(a, out);
-            collect_expr_names(b, out);
+            collect_expr_refs(a, out);
+            collect_expr_refs(b, out);
         }
-        ModuleExpr::Rename(inner, _) => collect_expr_names(inner, out),
+        ModuleExpr::Rename(inner, _) => collect_expr_refs(inner, out),
         ModuleExpr::Instantiation(base, args) => {
-            collect_expr_names(base, out);
+            collect_expr_refs(base, out);
             for a in args {
-                collect_expr_names(a, out);
+                collect_arg_refs(a, out);
             }
         }
     }
 }
 
-/// The direct module/view dependencies of a module: every name mentioned in its imports plus its parameter
-/// theories. The module's own name and its formal-parameter names are excluded (a parameter is bound
-/// locally, not a dependency). Used to invalidate cached dependents when a module/view is redefined.
-pub fn module_dep_names(pm: &PreModule) -> HashSet<String> {
+/// Collect the views an instantiation argument references: a view, or a parameterized view together with
+/// the arguments it is instantiated with (`V{W}`). Sums and renamings are not valid arguments; they are
+/// collected as module expressions.
+fn collect_arg_refs(arg: &ModuleExpr, out: &mut HashSet<DepRef>) {
+    match arg {
+        ModuleExpr::Named(n) => {
+            out.insert(DepRef::View(n.clone()));
+        }
+        ModuleExpr::Instantiation(base, args) => {
+            collect_arg_refs(base, out);
+            for a in args {
+                collect_arg_refs(a, out);
+            }
+        }
+        ModuleExpr::Sum(..) | ModuleExpr::Rename(..) => collect_expr_refs(arg, out),
+    }
+}
+
+/// The direct dependencies of a module: its parameter theories plus every module and view its imports
+/// reference. Its formal parameters, which are bound locally where they appear as instantiation
+/// arguments, and its own name as a module are excluded; a view with the module's name is kept. Used to
+/// invalidate cached dependents when a module or view is redefined.
+pub fn module_dep_refs(pm: &PreModule) -> HashSet<DepRef> {
     let mut out = HashSet::new();
     for p in &pm.params {
-        out.insert(p.theory.clone());
+        out.insert(DepRef::Module(p.theory.clone()));
     }
     for imp in &pm.imports {
-        collect_expr_names(&imp.expr, &mut out);
+        collect_expr_refs(&imp.expr, &mut out);
     }
     for p in &pm.params {
-        out.remove(&p.name);
+        out.remove(&DepRef::View(p.name.clone()));
     }
-    out.remove(&pm.name);
+    out.remove(&DepRef::Module(pm.name.clone()));
     out
 }
 
-/// The direct module/view dependencies of a view: its `from` source theory, its `to` target module
-/// expression, and any parameter theories. Its own name and formal-parameter names are excluded. Used to
-/// invalidate cached dependents when a view is redefined.
-pub fn view_dep_names(v: &ViewDecl) -> HashSet<String> {
+/// The direct dependencies of a view: its `from` source theory, every module and view its `to` target
+/// expression references, and its parameter theories. Its formal parameters and its own name as a view
+/// are excluded; a module with the view's name, such as its target, is kept. Used to invalidate cached
+/// dependents when a module or view is redefined.
+pub fn view_dep_refs(v: &ViewDecl) -> HashSet<DepRef> {
     let mut out = HashSet::new();
     for p in &v.params {
-        out.insert(p.theory.clone());
+        out.insert(DepRef::Module(p.theory.clone()));
     }
-    collect_expr_names(&v.from, &mut out);
-    collect_expr_names(&v.to, &mut out);
+    collect_expr_refs(&v.from, &mut out);
+    collect_expr_refs(&v.to, &mut out);
     for p in &v.params {
-        out.remove(&p.name);
+        out.remove(&DepRef::View(p.name.clone()));
     }
-    out.remove(&v.name);
+    out.remove(&DepRef::View(v.name.clone()));
     out
 }
 

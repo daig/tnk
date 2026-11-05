@@ -1748,3 +1748,454 @@ fn show_modules_lists_each_built_module_once() {
     assert_eq!(listed(&mut session), "modules: SHELF LAMP READER");
     assert_eq!(session.current(), Some("READER"));
 }
+
+/// Sources for the dependent-rebuild tests below; `{BASE}` is replaced by an `ORDER-BASE` definition.
+/// `ORDER-LATE` and `ORDER-VIA` are first defined before the chain they later import, so definition order
+/// is not dependency order. `ORDER-VIA` reaches the chain only through the view `ORDER-V`.
+const ORDER_GRAPH: &str = "fth ORDER-TRIV is sort Elt . endfth
+fmod ORDER-LATE is sort Unused . endfm
+fmod ORDER-VIA is sort Unused . endfm
+{BASE}
+fmod ORDER-L1 is pr ORDER-BASE . op k1 : -> S . eq k1 = a + b * a . endfm
+fmod ORDER-L2 is pr ORDER-L1 . op k2 : -> S . eq k2 = a + b * a . endfm
+fmod ORDER-L3 is pr ORDER-L2 . op k3 : -> S . eq k3 = a + b * a . endfm
+fmod ORDER-L4 is pr ORDER-L3 . op k4 : -> S . eq k4 = a + b * a . endfm
+view ORDER-V from ORDER-TRIV to ORDER-L4 is sort Elt to S . endv
+fmod ORDER-USE{X :: ORDER-TRIV} is op id : X$Elt -> X$Elt . endfm
+fmod ORDER-LATE is pr ORDER-L4 . endfm
+fmod ORDER-VIA is pr ORDER-USE{ORDER-V} . endfm";
+
+/// `ORDER-BASE`, in which `a + b * a` groups as `a + (b * a)` when `plus > times`, else `(a + b) * a`.
+fn order_base(plus: u32, times: u32) -> String {
+    format!(
+        "fmod ORDER-BASE is sort S . ops a b : -> S .
+           op _+_ : S S -> S [prec {plus}] . op _*_ : S S -> S [prec {times}] . endfm"
+    )
+}
+
+/// `TNK-MOD-006` with `TNK-MOD-002` statement homes: a dependent rebuilt after an import changes equals
+/// a fresh build of the same sources, including the imported statements it reparses in their home
+/// modules' grammars. Every home therefore has to be rebuilt before the dependents that consult it.
+#[test]
+fn dependent_rebuilds_reparse_imports_with_rebuilt_home_grammars() {
+    let mut rebuilt = Session::new();
+    let entered = rebuilt.eval(&ORDER_GRAPH.replace("{BASE}", &order_base(33, 31)), false);
+    assert_eq!(entered.output, "");
+    let redefined = rebuilt.eval(&order_base(31, 33), false);
+    assert_eq!(redefined.output, "");
+
+    let mut fresh = Session::new();
+    let entered = fresh.eval(&ORDER_GRAPH.replace("{BASE}", &order_base(31, 33)), false);
+    assert_eq!(entered.output, "");
+
+    let modules = [
+        ("ORDER-L1", 1),
+        ("ORDER-L2", 2),
+        ("ORDER-L3", 3),
+        ("ORDER-L4", 4),
+        ("ORDER-LATE", 4),
+        ("ORDER-VIA", 4),
+    ];
+    for (module, levels) in modules {
+        for level in 1..=levels {
+            let command = format!("reduce in {module} : k{level} .");
+            let want = fresh.eval(&command, false).output;
+            assert!(want.contains("result S: a + b * a"), "{command}: {want}");
+            let got = rebuilt.eval(&command, false).output;
+            assert_eq!(got, want, "{command} differs from a fresh build");
+        }
+    }
+}
+
+/// Strategy definitions donated by a plain import are compiled with their home module's grammar too, so a
+/// rebuilt importer must see every rebuilt strategy home.
+#[test]
+fn dependent_rebuilds_recompile_imported_strategies_with_rebuilt_homes() {
+    let base = |plus: u32, times: u32| {
+        format!(
+            "mod STRAT-ORDER-BASE is\n  sort S .\n  ops a b : -> S .\n  \
+             op _plus_ : S S -> S [prec {plus}] .\n  op _times_ : S S -> S [prec {times}] .\nendm\n"
+        )
+    };
+    // STRAT-ORDER-LATE is first defined before the chain it later imports. Strategy declarations and
+    // definitions end their lines (`TNK-LEX-001`).
+    let mut source = format!("smod STRAT-ORDER-LATE is\nendsm\n{}", base(33, 31));
+    for level in 1..=4 {
+        let import = match level {
+            1 => "STRAT-ORDER-BASE".to_string(),
+            _ => format!("STRAT-ORDER-{}", level - 1),
+        };
+        source.push_str(&format!(
+            "smod STRAT-ORDER-{level} is\n  pr {import} .\n  strat go{level} : @ S .\n  \
+             sd go{level} := match a plus b times a .\nendsm\n"
+        ));
+    }
+    source.push_str("smod STRAT-ORDER-LATE is\n  pr STRAT-ORDER-4 .\nendsm\n");
+    let mut session = Session::new();
+    assert_eq!(session.eval(&source, false).output, "");
+    // `a plus b times a` now groups as `(a plus b) times a`.
+    assert_eq!(session.eval(&base(31, 33), false).output, "");
+
+    let modules = [
+        ("STRAT-ORDER-1", 1),
+        ("STRAT-ORDER-2", 2),
+        ("STRAT-ORDER-3", 3),
+        ("STRAT-ORDER-4", 4),
+        ("STRAT-ORDER-LATE", 4),
+    ];
+    for (module, levels) in modules {
+        for level in 1..=levels {
+            let command = format!("srewrite in {module} : (a plus b) times a using go{level} .");
+            let out = session.eval(&command, false).output;
+            assert!(out.contains("Solution 1"), "{command}: {out}");
+        }
+    }
+}
+
+/// Failed dependent rebuilds are reported in rebuild order. The exact order is this implementation's
+/// choice, not a Reference promise: imports first, otherwise by first definition, so the diagnostics of
+/// one redefinition are deterministic. `FAIL-LATE` was first defined before the chain it now imports.
+#[test]
+fn dependent_rebuild_failures_are_reported_in_dependency_order() {
+    let mut session = Session::new();
+    let entered = session.eval(
+        "fmod FAIL-BASE is sort S . op a : -> S . endfm
+         fmod FAIL-LATE is sort U . endfm
+         fmod FAIL-M1 is pr FAIL-BASE . op f : S -> S . endfm
+         fmod FAIL-M2 is pr FAIL-M1 . endfm
+         fmod FAIL-M3 is pr FAIL-M2 . endfm
+         fmod FAIL-N1 is pr FAIL-BASE . op n : S -> S . endfm
+         fmod FAIL-LATE is pr FAIL-M3 . endfm",
+        false,
+    );
+    assert_eq!(entered.output, "");
+    for _ in 0..2 {
+        let redefined = session.eval("fmod FAIL-BASE is sort T . endfm", false);
+        let failed: Vec<&str> = redefined
+            .output
+            .lines()
+            .filter_map(|line| line.strip_prefix("error in module `"))
+            .filter_map(|rest| rest.split('`').next())
+            .collect();
+        assert_eq!(
+            failed,
+            ["FAIL-M1", "FAIL-M2", "FAIL-M3", "FAIL-LATE", "FAIL-N1"],
+            "{}",
+            redefined.output
+        );
+        for module in failed {
+            let gone = session.eval(&format!("reduce in {module} : a ."), false);
+            assert!(gone.output.contains("does not exist"), "{}", gone.output);
+        }
+        // Restore the dependents, in their original definition order, for the second pass.
+        let restored = session.eval(
+            "fmod FAIL-BASE is sort S . op a : -> S . endfm
+             fmod FAIL-M1 is pr FAIL-BASE . op f : S -> S . endfm
+             fmod FAIL-M2 is pr FAIL-M1 . endfm
+             fmod FAIL-M3 is pr FAIL-M2 . endfm
+             fmod FAIL-N1 is pr FAIL-BASE . op n : S -> S . endfm
+             fmod FAIL-LATE is pr FAIL-M3 . endfm",
+            false,
+        );
+        assert_eq!(restored.output, "");
+    }
+}
+
+/// Modules and views have separate namespaces, so each keeps its own dependency record when they share a
+/// name (`TNK-MOD-006`). A view defined with a module's name must not stop that module from being rebuilt,
+/// nor may a module defined with a view's name stop the view's users from being rebuilt.
+#[test]
+fn module_and_view_sharing_a_name_keep_separate_dependency_records() {
+    let mut session = Session::new();
+    let entered = session.eval(
+        "fth NS-TRIV is sort Elt . endfth
+         fth NS-THV is sort Elt . op k : Elt -> Elt . endfth
+         fmod NS-BASE is sort S . ops v1 v2 : -> S . op k : -> S . eq k = v1 . endfm
+         fmod NS-OTHER is sort T . endfm
+         fmod NS-SAME is pr NS-BASE . endfm
+         view NS-SAME from NS-TRIV to NS-OTHER is sort Elt to T . endv
+         fmod NS-TA is sort D . ops c r1 r2 : -> D . op p : D -> D . eq p(c) = r1 . endfm
+         view NS-W from NS-THV to NS-TA is sort Elt to D . op k to p . endv
+         fmod NS-USE{X :: NS-THV} is
+           op probe : X$Elt -> X$Elt . var A : X$Elt . eq probe(A) = k(A) .
+         endfm
+         fmod NS-INST is pr NS-USE{NS-W} . endfm
+         fmod NS-W is sort Other . endfm",
+        false,
+    );
+    assert_eq!(entered.output, "");
+
+    let redefined = session.eval(
+        "fmod NS-BASE is sort S . ops v1 v2 : -> S . op k : -> S . eq k = v2 . endfm",
+        false,
+    );
+    assert_eq!(redefined.output, "");
+    let module = session.eval("reduce in NS-SAME : k .", false);
+    assert!(module.output.contains("result S: v2"), "{}", module.output);
+
+    let redefined = session.eval(
+        "fmod NS-TA is sort D . ops c r1 r2 : -> D . op p : D -> D . eq p(c) = r2 . endfm",
+        false,
+    );
+    assert_eq!(redefined.output, "");
+    let view_user = session.eval("reduce in NS-INST : probe(c) .", false);
+    assert!(
+        view_user.output.contains("result D: r2"),
+        "{}",
+        view_user.output
+    );
+}
+
+/// A module instantiated with a view of its own name depends on that view, and a view named like its
+/// target module depends on that module. Retargeting the view, or redefining either target, rebuilds the
+/// instantiating modules.
+#[test]
+fn same_named_view_and_target_dependencies_are_kept() {
+    let mut session = Session::new();
+    let entered = session.eval(
+        "fth SN-THV is sort Elt . op k : Elt -> Elt . endfth
+         fmod SN-TA is sort D . ops c r1 r2 r3 : -> D . op p : D -> D . eq p(c) = r1 . endfm
+         fmod SN-TB is sort D . ops c r1 r2 r3 : -> D . op p : D -> D . eq p(c) = r2 . endfm
+         fmod SN-USE{X :: SN-THV} is
+           op probe : X$Elt -> X$Elt . var A : X$Elt . eq probe(A) = k(A) .
+         endfm
+         view SN from SN-THV to SN-TA is sort Elt to D . op k to p . endv
+         fmod SN is pr SN-USE{SN} . endfm
+         fmod SN-SAME is sort D . ops c r1 r2 : -> D . op p : D -> D . eq p(c) = r1 . endfm
+         view SN-SAME from SN-THV to SN-SAME is sort Elt to D . op k to p . endv
+         fmod SN-INST is pr SN-USE{SN-SAME} . endfm",
+        false,
+    );
+    assert_eq!(entered.output, "");
+    let probe = |session: &mut Session, module: &str| {
+        session
+            .eval(&format!("reduce in {module} : probe(c) ."), false)
+            .output
+    };
+    assert!(probe(&mut session, "SN").contains("result D: r1"));
+
+    let retargeted = session.eval(
+        "view SN from SN-THV to SN-TB is sort Elt to D . op k to p . endv",
+        false,
+    );
+    assert_eq!(retargeted.output, "");
+    let out = probe(&mut session, "SN");
+    assert!(
+        out.contains("result D: r2"),
+        "after retargeting the view: {out}"
+    );
+
+    let redefined = session.eval(
+        "fmod SN-TB is sort D . ops c r1 r2 r3 : -> D . op p : D -> D . eq p(c) = r3 . endfm",
+        false,
+    );
+    assert_eq!(redefined.output, "");
+    let out = probe(&mut session, "SN");
+    assert!(
+        out.contains("result D: r3"),
+        "after redefining the target: {out}"
+    );
+
+    let redefined = session.eval(
+        "fmod SN-SAME is sort D . ops c r1 r2 : -> D . op p : D -> D . eq p(c) = r2 . endfm",
+        false,
+    );
+    assert_eq!(redefined.output, "");
+    let out = probe(&mut session, "SN-INST");
+    assert!(out.contains("result D: r2"), "{out}");
+}
+
+/// The stock prelude names identity views after their theories (`view TRIV from TRIV to TRIV`). Such a
+/// view must not replace the theory's own dependency record: redefining a module the theory imports still
+/// rebuilds the theory and the modules parameterized by it.
+#[test]
+fn identity_view_named_after_its_theory_keeps_the_theory_dependencies() {
+    let mut session = Session::new();
+    let entered = session.eval(
+        "fth ID-TRIV is sort Elt . endfth
+         fmod ID-BASE is sort S . ops v1 v2 : -> S . op k : -> S . eq k = v1 . endfm
+         fth ID-THEORY is pr ID-BASE . inc ID-TRIV . endfth
+         view ID-THEORY from ID-TRIV to ID-THEORY is endv
+         fmod ID-USE{X :: ID-THEORY} is op probe : -> S . eq probe = k . endfm",
+        false,
+    );
+    assert_eq!(entered.output, "");
+    let before = session.eval("reduce in ID-USE : probe .", false);
+    assert!(before.output.contains("result S: v1"), "{}", before.output);
+
+    let redefined = session.eval(
+        "fmod ID-BASE is sort S . ops v1 v2 : -> S . op k : -> S . eq k = v2 . endfm",
+        false,
+    );
+    assert_eq!(redefined.output, "");
+    for command in ["reduce in ID-USE : probe .", "reduce in ID-THEORY : k ."] {
+        let out = session.eval(command, false).output;
+        assert!(out.contains("result S: v2"), "{command}: {out}");
+    }
+}
+
+/// `TNK-STMT-001` applies to dependent rebuilds (`TNK-MOD-006`): a dependent rebuilt against a replaced
+/// import reports each statement it newly drops. The home module's warning is shown once even though both
+/// importers drop the statement; a drop that persists is not repeated, and one that is repaired and then
+/// recurs is reported again.
+#[test]
+fn dependent_rebuilds_report_newly_dropped_statements_once() {
+    let mut session = Session::new();
+    let base = "fmod DROP-BASE is\n  sort T .\n  ops p q : -> T .\nendfm";
+    let without_q = "fmod DROP-BASE is\n  sort T .\n  op p : -> T .\nendfm";
+    let with_r = "fmod DROP-BASE is\n  sort T .\n  ops p r : -> T .\nendfm";
+    assert_eq!(session.eval(base, false).output, "");
+    let user = "fmod DROP-USE is\n  pr DROP-BASE .\n  op h : T -> T .\n  eq h(p) = q .\nendfm";
+    assert_eq!(session.eval(user, false).output, "");
+    let top = "fmod DROP-TOP is\n  pr DROP-USE .\nendfm";
+    assert_eq!(session.eval(top, false).output, "");
+
+    let dropped =
+        "warning: module `DROP-USE`, line 4: dropped equation: no parse at token 0 (`q`): `q`";
+    assert_eq!(session.eval(without_q, false).output, dropped);
+    for module in ["DROP-USE", "DROP-TOP"] {
+        let out = session
+            .eval(&format!("reduce in {module} : h(p) ."), false)
+            .output;
+        assert!(
+            out.contains("rewrites: 0\nresult T: h(p)"),
+            "{module}: {out}"
+        );
+    }
+    assert_eq!(session.eval(with_r, false).output, "");
+
+    assert_eq!(session.eval(base, false).output, "");
+    let repaired = session.eval("reduce in DROP-TOP : h(p) .", false).output;
+    assert!(repaired.contains("rewrites: 1\nresult T: q"), "{repaired}");
+    assert_eq!(session.eval(without_q, false).output, dropped);
+
+    // A drop reported when its module was entered is not repeated when a rebuild drops it again.
+    let entry = "fmod DROP-ENTRY is\n  pr DROP-BASE .\n  op k : T -> T .\n  eq k(p) = zzz .\nendfm";
+    assert_eq!(
+        session.eval(entry, false).output,
+        "warning: module `DROP-ENTRY`, line 4: dropped equation: no parse at token 0 (`zzz`): `zzz`"
+    );
+    assert_eq!(session.eval(with_r, false).output, "");
+}
+
+/// A view redefinition rebuilds the modules instantiated with it (`TNK-MOD-006`); each statement kind
+/// that no longer builds in a rebuilt module is dropped with a diagnostic (`TNK-STMT-001`).
+#[test]
+fn view_redefinition_rebuilds_report_each_dropped_statement_kind() {
+    let mut session = Session::new();
+    let setup = session.eval(
+        "fth VDROP-PT is sort Elt . endfth
+         fmod VDROP-T1 is sort A . ops a b : -> A . endfm
+         fmod VDROP-T2 is sort A . op a : -> A . endfm
+         view VDROP-V from VDROP-PT to VDROP-T1 is sort Elt to A . endv
+         fmod VDROP-W{X :: VDROP-PT} is op w : X$Elt -> X$Elt . endfm",
+        false,
+    );
+    assert_eq!(setup.output, "");
+    let user = session.eval(
+        "mod VDROP-USE is\n  pr VDROP-W{VDROP-V} .\n  sort U .\n  subsort U < A .\n  mb b : U .\n  \
+         eq w(a) = b .\n  rl [r] : a => b .\nendm",
+        false,
+    );
+    assert_eq!(user.output, "");
+    let before = session.eval("rewrite in VDROP-USE : w(a) .", false).output;
+    assert!(before.contains("result U: b"), "{before}");
+
+    let retargeted = session.eval(
+        "view VDROP-V from VDROP-PT to VDROP-T2 is sort Elt to A . endv",
+        false,
+    );
+    assert_eq!(
+        retargeted.output,
+        "warning: module `VDROP-USE`, line 5: dropped membership: no parse at token 0 (`b`): `b`\n\
+         warning: module `VDROP-USE`, line 6: dropped equation: no parse at token 0 (`b`): `b`\n\
+         warning: module `VDROP-USE`, line 7: dropped rule: no parse at token 0 (`b`): `b`"
+    );
+    let after = session.eval("rewrite in VDROP-USE : w(a) .", false).output;
+    assert!(after.contains("rewrites: 0\nresult A: w(a)"), "{after}");
+}
+
+/// An importer's build can drop a home's statement with a message of its own (it falls back to the
+/// importer's grammar), attributed to the home. Such a warning is shown once and then stays suppressed
+/// while that build still produces it, whichever modules are rebuilt and in whichever order.
+#[test]
+fn importer_attributed_drops_are_not_repeated_by_later_rebuilds() {
+    let mut session = Session::new();
+    let with_q = "fmod STORM-BASE is sort T . ops p q : -> T . endfm";
+    let without_q = "fmod STORM-BASE is sort T . op p : -> T . endfm";
+    assert_eq!(session.eval(with_q, false).output, "");
+    let home = "fmod STORM-HOME is pr STORM-BASE . op h : T -> T . eq h(p) = q . endfm";
+    assert_eq!(session.eval(home, false).output, "");
+    let user = "fmod STORM-USE is pr STORM-HOME . sort U . op q : U -> U . endfm";
+    assert_eq!(session.eval(user, false).output, "");
+
+    // STORM-HOME no longer parses `q`; STORM-USE retries the statement in its own grammar, where `q`
+    // is unary, and reports a different message for the same home statement.
+    let broken = session.eval(without_q, false).output;
+    let lines: Vec<&str> = broken.lines().collect();
+    assert_eq!(lines.len(), 2, "{broken}");
+    assert_eq!(
+        lines[0],
+        "warning: module `STORM-HOME`, line 1: dropped equation: no parse at token 0 (`q`): `q`"
+    );
+    assert!(
+        lines[1].starts_with(
+            "warning: module `STORM-HOME`, line 1: dropped equation: no parse at token 1"
+        ),
+        "{broken}"
+    );
+    for _ in 0..3 {
+        assert_eq!(session.eval(without_q, false).output, "");
+    }
+}
+
+/// A shown drop is forgotten once no built module still produces it, so a recurrence is reported again:
+/// both when only the importer that produced it is rebuilt and when that importer is entered again.
+#[test]
+fn recurring_importer_attributed_drops_are_reported_again() {
+    let mut session = Session::new();
+    let home = session.eval(
+        "fmod RECUR-X is sort T . op p : -> T . op h : T -> T . eq h(p) = q . endfm",
+        false,
+    );
+    assert!(
+        home.output.starts_with("warning: module `RECUR-X`"),
+        "{}",
+        home.output
+    );
+    let unary_q = "fmod RECUR-B is sort U . op q : U -> U . endfm";
+    assert_eq!(session.eval(unary_q, false).output, "");
+    let user = session.eval("fmod RECUR-Y is pr RECUR-X . pr RECUR-B . endfm", false);
+    let variant = user.output;
+    assert!(
+        variant.starts_with("warning: module `RECUR-X`"),
+        "{variant}"
+    );
+
+    // Only RECUR-Y is rebuilt (RECUR-X does not import RECUR-B); now its grammar parses the equation.
+    let constant_q = "fmod RECUR-B is pr RECUR-X . op q : -> T . endfm";
+    assert_eq!(session.eval(constant_q, false).output, "");
+    let repaired = session.eval("reduce in RECUR-Y : h(p) .", false).output;
+    assert!(repaired.contains("rewrites: 1\nresult T: q"), "{repaired}");
+    assert_eq!(session.eval(unary_q, false).output, variant);
+    let broken = session.eval("reduce in RECUR-Y : h(p) .", false).output;
+    assert!(broken.contains("rewrites: 0\nresult T: h(p)"), "{broken}");
+
+    // The same recurrence through direct re-entry of an importer, with a home of its own: RECUR-Y still
+    // produces (and so still suppresses) the RECUR-X variant.
+    let second = session.eval(
+        "fmod RECUR-X2 is sort T2 . op p2 : -> T2 . op h2 : T2 -> T2 . eq h2(p2) = r . endfm",
+        false,
+    );
+    assert!(
+        second.output.starts_with("warning: module `RECUR-X2`"),
+        "{}",
+        second.output
+    );
+    let original = "fmod RECUR-Z is pr RECUR-X2 . sort V . op r : V -> V . endfm";
+    let first = session.eval(original, false).output;
+    assert!(first.starts_with("warning: module `RECUR-X2`"), "{first}");
+    let replacement = "fmod RECUR-Z is pr RECUR-X2 . op r : -> T2 . endfm";
+    assert_eq!(session.eval(replacement, false).output, "");
+    assert_eq!(session.eval(original, false).output, first);
+}
