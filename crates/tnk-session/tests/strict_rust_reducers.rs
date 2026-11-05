@@ -463,7 +463,7 @@ endfm"#,
     assert_eq!(redefined.output, "");
     let cleared = session.eval("continue .", false);
     assert!(
-        cleared.output.contains("No previous rewriting"),
+        cleared.output.contains("error: no previous rewriting"),
         "{}",
         cleared.output
     );
@@ -576,7 +576,7 @@ endfm"#,
     );
     let continuation = session.eval("continue .", false);
     assert!(
-        continuation.output.contains("No previous rewriting"),
+        continuation.output.contains("error: no previous rewriting"),
         "{}",
         continuation.output
     );
@@ -670,7 +670,7 @@ endm"#,
             !session
                 .eval("show path .", false)
                 .output
-                .contains("No previous rewriting"),
+                .contains("error: no previous rewriting"),
             "{command}: bounded rewrite did not seed a continuation"
         );
         let expected = format!("error: strict reducer `{key}` failed: deliberate fixture fault");
@@ -678,7 +678,7 @@ endm"#,
         assert_eq!(result.output, expected, "{command}");
         let continuation = session.eval("continue .", false);
         assert!(
-            continuation.output.contains("No previous rewriting"),
+            continuation.output.contains("error: no previous rewriting"),
             "{command}: {}",
             continuation.output
         );
@@ -699,7 +699,7 @@ endm"#,
         session
             .eval("continue .", false)
             .output
-            .contains("No previous rewriting")
+            .contains("error: no previous rewriting")
     );
 
     let search_seed = session.eval("search [1] in HOST-FAULT-RESUME : k0 =>+ X:Elt .", false);
@@ -717,7 +717,7 @@ endm"#,
         session
             .eval("continue .", false)
             .output
-            .contains("No previous rewriting")
+            .contains("error: no previous rewriting")
     );
 }
 
@@ -1693,7 +1693,7 @@ endm"#,
         session
             .eval("continue .", false)
             .output
-            .contains("No previous rewriting")
+            .contains("error: no previous rewriting")
     );
 
     let reflected = session.eval(
@@ -1782,7 +1782,7 @@ reduce in META-LEVEL : metaReduce(
         session
             .eval("continue .", false)
             .output
-            .contains("No previous rewriting")
+            .contains("error: no previous rewriting")
     );
 
     let child = session.eval(
@@ -1827,7 +1827,7 @@ reduce in META-LEVEL : metaReduce(
         session
             .eval("continue .", false)
             .output
-            .contains("No previous rewriting")
+            .contains("error: no previous rewriting")
     );
 }
 

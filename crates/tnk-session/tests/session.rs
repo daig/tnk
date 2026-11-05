@@ -1,4 +1,25 @@
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use tnk_session::Session;
+
+static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh, empty directory under the system temporary directory, unique to this test process.
+fn scratch_dir(label: &str) -> PathBuf {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must follow the Unix epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "tnk-session-{label}-{}-{timestamp}-{}",
+        std::process::id(),
+        NEXT_SCRATCH.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("create scratch directory");
+    dir
+}
 
 #[test]
 fn host_session_persists_modules_and_current_selection() {
@@ -176,7 +197,7 @@ fn cyclic_subsorts_are_rejected_atomically_and_session_recovers() {
 
         let shown = session.eval(&format!("show module {name} ."), false);
         assert!(
-            shown.output.contains("no such module"),
+            shown.output.starts_with("error:") && shown.output.contains("no such module"),
             "{name} was installed: {}",
             shown.output
         );
@@ -1301,4 +1322,429 @@ fn long_unrecognized_statement_is_skipped_silently() {
         "reduce in SKIP-RUN : a .\nrewrites: 1\nresult S: b"
     );
     assert_eq!(session.current(), Some("SKIP-RUN"));
+}
+
+/// Submit one rejected request and require exactly one diagnostic line carrying the Stable `error:`
+/// severity prefix (TNK-OUT-001/003) plus the given detail.
+fn assert_rejected(session: &mut Session, input: &str, detail: &str) {
+    let eval = session.eval(input, false);
+    assert!(!eval.exit, "{input}");
+    assert!(
+        eval.output.starts_with("error: ")
+            && eval.output.contains(detail)
+            && eval.output.lines().count() == 1,
+        "{input}: expected one `error:` line containing {detail:?}, got {:?}",
+        eval.output
+    );
+}
+
+#[test]
+fn rejected_session_requests_carry_the_error_prefix() {
+    let mut session = Session::new();
+    for (input, detail) in [
+        ("show module .", "no current module"),
+        ("show path 1 .", "no current module"),
+        ("show path states 1 .", "no current module"),
+        ("show search graph .", "no current module"),
+        ("show frontier states .", "no current module"),
+        ("show most general states .", "no current module"),
+        ("reduce a .", "no current module"),
+        ("continue .", "no current module"),
+        ("select .", "expected a module name"),
+        ("select NOSUCH .", "no module `NOSUCH`"),
+        ("show bogus .", "unknown form `bogus`"),
+        ("set trace .", "expected `[<option>] on|off`"),
+        ("set trace maybe .", "got `maybe`"),
+        ("set trace bogus on .", "unsupported option `bogus`"),
+    ] {
+        assert_rejected(&mut session, input, detail);
+    }
+    assert_eq!(session.current(), None);
+
+    let entered = session.eval(
+        "mod SHOW-DIAG is sort S . ops a b : -> S . rl [ab] : a => b [narrowing] . endm",
+        false,
+    );
+    assert_eq!(entered.output, "");
+    for (input, detail) in [
+        ("show all SHOW-DIAG .", "unknown form `all`;"),
+        ("show .", "expected a form"),
+        ("show module NOSUCH .", "no such module `NOSUCH`"),
+        ("show view NOSUCH .", "no such view"),
+        ("show path 1 .", "no current search"),
+        ("show path x .", "expected a state number"),
+        ("show search graph .", "no current search"),
+        ("show frontier states .", "no narrowing state graph"),
+        ("show most general states .", "no narrowing state graph"),
+        ("continue .", "no previous rewriting"),
+    ] {
+        assert_rejected(&mut session, input, detail);
+    }
+
+    // An ordinary search graph: a missing state and the narrowing-only displays are rejected.
+    let searched = session.eval("search a =>* b .", false);
+    assert!(
+        searched.output.contains("Solution 1 (state 1)"),
+        "{}",
+        searched.output
+    );
+    assert!(
+        session
+            .eval("show path 1 .", false)
+            .output
+            .contains("state 1, S: b")
+    );
+    for (input, detail) in [
+        ("show path 7 .", "no state 7"),
+        (
+            "show path states 1 .",
+            "not available for an ordinary search",
+        ),
+        ("show frontier states .", "no narrowing state graph"),
+        ("show most general states .", "no narrowing state graph"),
+    ] {
+        assert_rejected(&mut session, input, detail);
+    }
+
+    // A narrowing graph: missing states are rejected, and the search graph is no longer current.
+    let narrowed = session.eval("vu-narrow [1] a =>* b .", false);
+    assert!(
+        narrowed.output.contains("Solution 1"),
+        "{}",
+        narrowed.output
+    );
+    assert!(
+        session
+            .eval("show path 1 .", false)
+            .output
+            .contains("state 1, S: b")
+    );
+    for (input, detail) in [
+        ("show path 7 .", "no state 7"),
+        ("show path states 7 .", "no state 7"),
+        ("show search graph .", "no current search"),
+    ] {
+        assert_rejected(&mut session, input, detail);
+    }
+    assert_eq!(session.current(), Some("SHOW-DIAG"));
+}
+
+#[test]
+fn rejected_inspections_and_trace_requests_keep_session_state() {
+    let mut session = Session::new();
+    session.eval(
+        "mod KEEP-STATE is sort S . ops a b c : -> S . rl [ab] : a => b . rl [bc] : b => c . endm",
+        false,
+    );
+    let first = session.eval("search [1] a =>* X:S .", false);
+    assert!(
+        first.output.contains("Solution 1 (state 0)"),
+        "{}",
+        first.output
+    );
+    for input in [
+        "show all .",
+        "show path 99 .",
+        "show module NOSUCH .",
+        "show view NOSUCH .",
+        "show frontier states .",
+        "show most general states .",
+        "set trace bogus on .",
+        "set trace maybe .",
+    ] {
+        let rejected = session.eval(input, false);
+        assert!(
+            rejected.output.starts_with("error: "),
+            "{input}: {}",
+            rejected.output
+        );
+    }
+    assert_eq!(session.current(), Some("KEEP-STATE"));
+    let resumed = session.eval("continue 1 .", false);
+    assert!(
+        resumed.output.contains("Solution 2 (state 1)"),
+        "{}",
+        resumed.output
+    );
+
+    // A failed select leaves the current module in place (TNK-SESSION-005).
+    let rejected = session.eval("select NOSUCH .", false);
+    assert!(
+        rejected.output.starts_with("error: "),
+        "{}",
+        rejected.output
+    );
+    assert_eq!(session.current(), Some("KEEP-STATE"));
+
+    // Rejected trace requests change no flag: tracing stays off, then equation tracing stays on.
+    session.eval(
+        "fmod TRACE-STATE is sort T . ops p q : -> T . eq p = q . endfm",
+        false,
+    );
+    let rejected = session.eval("set trace eq on .", false);
+    assert!(
+        rejected.output.starts_with("error: "),
+        "{}",
+        rejected.output
+    );
+    let untraced = session.eval("reduce p .", false);
+    assert!(
+        !untraced.output.contains("***********"),
+        "{}",
+        untraced.output
+    );
+    assert_eq!(session.eval("set trace on .", false).output, "");
+    for input in ["set trace eqs maybe .", "set trace eq off ."] {
+        let rejected = session.eval(input, false);
+        assert!(
+            rejected.output.starts_with("error: "),
+            "{input}: {}",
+            rejected.output
+        );
+    }
+    let traced = session.eval("reduce p .", false);
+    assert!(
+        traced.output.contains("*********** equation"),
+        "{}",
+        traced.output
+    );
+}
+
+/// Appendix D: `load`/`sload` take the rest of the line as the path after removing one optional final
+/// command dot, which is a `.` that follows whitespace or is the whole operand. A `.` glued to the path
+/// stays part of the path.
+#[test]
+fn load_paths_drop_an_optional_final_command_dot() {
+    let dir = scratch_dir("load-dot");
+    std::fs::write(
+        dir.join("gems.maude"),
+        "fmod LOADED-GEMS is\n\
+           sort Gem .\n\
+           ops rough cut : -> Gem .\n\
+           op polish : Gem -> Gem .\n\
+           eq polish(rough) = cut .\n\
+         endfm\n\
+         reduce polish(rough) .\n",
+    )
+    .expect("write load fixture");
+    let stem = dir.join("gems");
+    let stem = stem.to_str().expect("UTF-8 scratch path");
+    let loaded = "result Gem: cut";
+
+    for form in [
+        format!("load {stem} ."),
+        format!("load {stem}\t."),
+        format!("load {stem}.maude ."),
+        format!("sload {stem} ."),
+        format!("*** gems\nload {stem} ."),
+        format!("load {stem}"),
+    ] {
+        let mut session = Session::new();
+        assert!(session.input_complete(&format!("{form}\n")), "{form:?}");
+        let out = session.eval(&form, false).output;
+        assert!(out.contains(loaded), "{form:?}: {out}");
+    }
+
+    // Dotted and undotted spellings name one file, so `sload` skips it after the first load either
+    // way, while `load` evaluates it again.
+    let mut session = Session::new();
+    let first = session.eval(&format!("sload {stem} ."), false).output;
+    assert!(first.contains(loaded), "{first}");
+    assert_eq!(session.eval(&format!("sload {stem}"), false).output, "");
+    assert_eq!(
+        session.eval(&format!("sload {stem}.maude ."), false).output,
+        ""
+    );
+    assert_eq!(session.eval(&format!("load {stem} ."), false).output, first);
+
+    // Only one final dot is removed, a glued dot is kept, and a lone dot leaves no path.
+    assert_eq!(
+        session.eval(&format!("load {stem}."), false).output,
+        format!("error: cannot open file `{stem}.`")
+    );
+    assert_eq!(
+        session.eval(&format!("load {stem} . ."), false).output,
+        format!("error: cannot open file `{stem} .`")
+    );
+    assert_eq!(
+        session.eval("load .", false).output,
+        "error: load needs a file name"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An SMT signature whose hooks are bound to fresh operator names.
+const TALLY_SMT: &str = "fmod TALLY is
+  sort Truth .
+  op tt : -> Truth [special (id-hook SMT_Symbol (true))] .
+  op ff : -> Truth [special (id-hook SMT_Symbol (false))] .
+  op _/\\_ : Truth Truth -> Truth [prec 55 special (id-hook SMT_Symbol (and))] .
+  op _=:=_ : Truth Truth -> Truth [prec 51 special (id-hook SMT_Symbol (===))] .
+  sort Num .
+  op <Nums> : -> Num [special (id-hook SMT_NumberSymbol (integers))] .
+  op _plus_ : Num Num -> Num [prec 33 special (id-hook SMT_Symbol (+))] .
+  op _below_ : Num Num -> Truth [prec 37 special (id-hook SMT_Symbol (<))] .
+  op _=:=_ : Num Num -> Truth [prec 51 special (id-hook SMT_Symbol (===))] .
+endfm";
+
+/// An `smt-search` rejected while the command is built reports one `error:` line, with no echo, and
+/// creates no search or continuation (TNK-SMT-003, Appendix K.1). Each rejection runs from a state
+/// with no prior continuation.
+#[test]
+fn rejected_smt_searches_report_an_error_and_create_no_continuation() {
+    let mut session = Session::new();
+    let entered = session.eval(
+        &format!(
+            "{TALLY_SMT}
+             mod CELLS is
+               pr TALLY .
+               sort Cell .
+               op cell : Num -> Cell .
+               op pair : Num Num -> Cell .
+               var N : Num .
+               var C : Cell .
+               crl [step] : cell(N) => cell(N plus 1) if N below 2 = tt .
+             endm"
+        ),
+        false,
+    );
+    assert_eq!(entered.output, "");
+    let no_continuation = "no previous rewriting, search, or variant enumeration";
+    let restrictions = "SMT rewriting restrictions";
+    for (input, detail) in [
+        ("smt-search cell(0) =>! C .", "=>! mode is not supported"),
+        // The goal must be linear and free of SMT operators and SMT numbers.
+        ("smt-search cell(0) =>* cell(N plus 1) .", restrictions),
+        ("smt-search cell(0) =>* pair(N, N) .", restrictions),
+        ("smt-search cell(0) =>* cell(1) .", restrictions),
+        // A `such that` condition that is not an SMT equality, or that does not parse.
+        (
+            "smt-search cell(N) =>* C such that C := cell(0) .",
+            "unsupported SMT-search condition",
+        ),
+        (
+            "smt-search cell(N) =>* C such that nosuch(N) = tt .",
+            "no parse",
+        ),
+    ] {
+        assert_rejected(&mut session, input, detail);
+        assert_rejected(&mut session, "continue .", no_continuation);
+    }
+
+    // Each module breaks one restriction on modules for rewriting modulo SMT.
+    for (name, body, search) in [
+        (
+            "EQUATION",
+            "sort Cell . ops cell twin : Num -> Cell . var N : Num .
+             eq twin(N) = cell(N) .
+             crl cell(N) => cell(N plus 1) if N below 2 = tt .",
+            "smt-search cell(0) =>* C:Cell .",
+        ),
+        (
+            "MEMBERSHIP",
+            "sorts Cell Low . subsort Low < Cell . op cell : Num -> Cell . var N : Num .
+             mb cell(0) : Low .
+             crl cell(N) => cell(N plus 1) if N below 2 = tt .",
+            "smt-search cell(0) =>* C:Cell .",
+        ),
+        (
+            "NO-RULES",
+            "sort Cell . op cell : Num -> Cell .",
+            "smt-search cell(0) =>* C:Cell .",
+        ),
+        (
+            "SMT-LHS",
+            "sort Cell . op cell : Num -> Cell . var N : Num .
+             rl cell(N plus 1) => cell(N) .",
+            "smt-search cell(0) =>* C:Cell .",
+        ),
+        (
+            "NONLINEAR-LHS",
+            "sort Cell . op pair : Num Num -> Cell . var N : Num .
+             rl pair(N, N) => pair(N, N plus 1) .",
+            "smt-search pair(0, 0) =>* C:Cell .",
+        ),
+        (
+            "COLLAPSE",
+            "sort Cell . op cell : Num -> Cell . op none : -> Cell .
+             op _&_ : Cell Cell -> Cell [assoc comm id: none] . var N : Num .
+             crl cell(N) => cell(N plus 1) if N below 2 = tt .",
+            "smt-search cell(0) =>* C:Cell .",
+        ),
+    ] {
+        let entered = session.eval(
+            &format!("mod CELLS-{name} is pr TALLY . {body} endm"),
+            false,
+        );
+        assert_eq!(entered.output, "", "{name}");
+        assert_rejected(&mut session, search, restrictions);
+        assert_rejected(&mut session, "continue .", no_continuation);
+    }
+
+    // A valid request still echoes its query and saves a continuation.
+    assert_eq!(session.eval("select CELLS .", false).output, "");
+    let found = session.eval("smt-search [1] cell(0) =>* C .", false);
+    assert!(
+        found
+            .output
+            .starts_with("smt-search [1] in CELLS : cell(0) =>* C .\n")
+            && !found.output.contains("error:"),
+        "{}",
+        found.output
+    );
+    let resumed = session.eval("continue 1 .", false);
+    assert!(!resumed.output.contains("error:"), "{}", resumed.output);
+}
+
+/// `show modules` lists each built module once, in entry order. A dependent dropped by a failed rebuild
+/// is not listed, matching `select` and `show module`, which no longer find it. Entering it again lists
+/// it once, after the modules that are still built.
+#[test]
+fn show_modules_lists_each_built_module_once() {
+    let mut session = Session::new();
+    let entered = session.eval(
+        "fmod SHELF is sort Book . op tome : -> Book . endfm
+         fmod READER is
+           including SHELF .
+           op read : Book -> Book .
+           eq read(tome) = tome .
+         endfm
+         fmod LAMP is sort Light . endfm",
+        false,
+    );
+    assert_eq!(entered.output, "");
+    let listed = |session: &mut Session| session.eval("show modules .", false).output;
+    assert_eq!(listed(&mut session), "modules: SHELF READER LAMP");
+
+    // A successful redefinition keeps the module's position.
+    session.eval("fmod LAMP is sort Light . op on : -> Light . endfm", false);
+    assert_eq!(listed(&mut session), "modules: SHELF READER LAMP");
+
+    // SHELF loses `Book`, so READER's rebuild fails and READER is dropped.
+    let redefined = session.eval("fmod SHELF is sort Scroll . endfm", false);
+    assert!(
+        redefined.output.contains("error in module `READER`"),
+        "{}",
+        redefined.output
+    );
+    assert_eq!(listed(&mut session), "modules: SHELF LAMP");
+    assert!(
+        session
+            .eval("select READER .", false)
+            .output
+            .starts_with("error: ")
+    );
+
+    // Entering READER again, and then redefining it, lists it once.
+    session.eval(
+        "fmod READER is sort Book . op tome : -> Book . endfm",
+        false,
+    );
+    assert_eq!(listed(&mut session), "modules: SHELF LAMP READER");
+    session.eval(
+        "fmod READER is sort Book . ops tome page : -> Book . endfm",
+        false,
+    );
+    assert_eq!(listed(&mut session), "modules: SHELF LAMP READER");
+    assert_eq!(session.current(), Some("READER"));
 }

@@ -137,7 +137,7 @@ Bracketed zero components are rejected for `rewrite`, `frewrite`, `erewrite`, se
 
 1. **TNK is not defined by Maude.** Similar syntax does not imply identical commands, defaults, libraries, unsupported edges, result order, or diagnostics.
 2. **There is no implicit library prelude.** `Session` and lower layers start bare. The `tnk-repl` executable merely *tries* to load `prelude.maude` unless `-no-prelude` is supplied.
-3. **Terminator rules are selective.** Declarations, statements, and most commands end in ` .`; module/view closing keywords do not. `load` and `sload` are line-terminated and take no period.
+3. **Terminator rules are selective.** Declarations, statements, and most commands end in ` .`; module/view closing keywords do not. `load` and `sload` are line-terminated; a final ` .` is optional.
 4. **Put portable top-level items on separate physical lines.** Two commands on one physical line form one invalid Session submission. A period is also allowed inside an identifier, so whitespace and line boundaries matter.
 5. **`in M :` is local to one command.** It does not select `M`. `select M .` changes the current module and always clears the saved continuation—even if `M` was already current.
 6. **A bound is a prefix, not a proof.** No reported solution before a bound says nothing about unreachability. Finite exhaustion, truncation, solver incompleteness, `Unknown`, Unsupported, and resource exhaustion are different outcomes.
@@ -429,7 +429,7 @@ load FILE
 sload FILE
 ```
 
-No period. Session loading tries the written path and then `.maude`, first from the process working directory and then each `MAUDE_LIB` directory. `sload` skips a canonical path after its first load in that Session. Nested loads are not resolved relative to the containing file.
+The period is optional: a final ` .` after whitespace is dropped, but a `.` glued to the name stays part of the path. Session loading tries the written path and then `.maude`, first from the process working directory and then each `MAUDE_LIB` directory. `sload` skips a canonical path after its first load in that Session. Nested loads are not resolved relative to the containing file.
 
 The CLI positional `FILE` is different: it is opened exactly as written, without extension completion or `MAUDE_LIB` search.
 

@@ -38,7 +38,11 @@ fn enter_module_then_reduce_across_submissions() {
 #[test]
 fn command_without_current_module() {
     let mut r = repl();
-    assert!(r.eval("red foo .").output.contains("no current module"));
+    let out = r.eval("red foo .").output;
+    assert!(
+        out.starts_with("error:") && out.contains("no current module"),
+        "{out}"
+    );
 }
 
 /// The stock REPL deliberately has no host-function catalog. A host attachment is rejected while the
@@ -2393,7 +2397,16 @@ fn select_and_show() {
         "select success is silent"
     );
     assert_eq!(r.current(), Some("A"));
-    assert!(r.eval("select NOPE .").output.contains("no module"));
+    let rejected = r.eval("select NOPE .").output;
+    assert!(
+        rejected.starts_with("error:") && rejected.contains("no module"),
+        "{rejected}"
+    );
+    assert_eq!(
+        r.current(),
+        Some("A"),
+        "a failed select keeps the current module"
+    );
 
     let mods = r.eval("show modules .").output;
     assert!(

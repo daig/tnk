@@ -66,7 +66,8 @@ pub struct Session {
     /// Direct dependencies for each module and view. Redefinition triggers rebuilding every transitive
     /// dependent so cached flattened modules cannot retain a replaced definition.
     deps: HashMap<String, HashSet<String>>,
-    /// Module names in entry order (for `show modules`).
+    /// The names of the built [`modules`](Self::modules), each once, in entry order (for `show modules`).
+    /// A redefinition keeps its position; a module that was dropped and entered again is appended.
     order: Vec<String>,
     /// View names in entry order (for `show views`).
     view_order: Vec<String>,
@@ -320,14 +321,15 @@ impl Session {
                 };
             }
             "load" | "sload" => {
-                // Load paths occupy the rest of the keyword's physical line and use no dot terminator.
-                // Search by leading keyword because comments may precede the command in this chunk.
+                // Load paths occupy the rest of the keyword's physical line; an optional final command
+                // dot is not part of the path (Appendix D). Search by leading keyword because comments
+                // may precede the command in this chunk.
                 let path = input
                     .lines()
                     .map(str::trim)
                     .find(|l| l.split_whitespace().next() == Some(first))
                     .and_then(|l| l.split_once(char::is_whitespace))
-                    .map(|(_, rest)| rest.trim())
+                    .map(|(_, rest)| load_path_operand(rest))
                     .unwrap_or("");
                 return self.meta_load(first == "sload", path);
             }
@@ -581,7 +583,9 @@ impl Session {
                 }
                 Err(e) => {
                     out.push_str(&format!("error in module `{name}`: {e}\n"));
+                    // The dropped dependent leaves `show modules` too; entering it again re-lists it.
                     self.modules.remove(&name);
+                    self.order.retain(|module| module != &name);
                     self.reported_identity_collapses
                         .retain(|(module, _, _)| module != &name);
                     if self.current.as_deref() == Some(&name) {
@@ -649,7 +653,7 @@ impl Session {
             Command::ShowNarrowing { .. } | Command::Continue { .. } => None,
         };
         let Some(cur) = m_override.or_else(|| self.current.clone()) else {
-            out.push_str("no current module — enter a module first.\n");
+            out.push_str("error: no current module — enter a module first.\n");
             return;
         };
         if !self.modules.contains_key(&cur) {
@@ -1011,9 +1015,6 @@ impl Session {
                 ..
             } => {
                 self.last = None;
-                if matches!(arrow, SearchArrow::Bang) {
-                    return;
-                }
                 let lm = self.modules.get_mut(&cur).expect("current module is built");
                 lm.built.engine.set_trace(false);
                 lm.built.engine.set_record_whole(false);
@@ -1042,7 +1043,9 @@ impl Session {
                     (Some(n), Some(m)) => format!(" [{n}, {m}]"),
                     (None, Some(m)) => format!(" [, {m}]"),
                 };
-                if let Ok(command) = smt_search_command(
+                // A request rejected during construction (`=>!`, the SMT-rewriting restrictions, or a
+                // `such that` condition) gets no echo, search, or continuation, as for `search`.
+                match smt_search_command(
                     lm,
                     &mut self.interner,
                     &subject_parsed,
@@ -1051,23 +1054,27 @@ impl Session {
                     such_that.as_deref(),
                     max_depth,
                 ) {
-                    let mut session = SmtSearchSession {
-                        search: command.search,
-                        goal_variables: command.goal_variables,
-                        target_variable_count: command.target_variable_count,
-                        shown_total: 0,
-                    };
-                    let body = render_smt_search(
-                        &mut session,
-                        lm,
-                        &self.interner,
-                        self.render_color,
-                        max_solutions,
-                    );
-                    out.push_str(&format!(
-                        "smt-search{bound_str} in {cur} : {header} .\n{body}"
-                    ));
-                    self.last = Some((cur.clone(), Continuation::SmtSearch(Box::new(session))));
+                    Ok(command) => {
+                        let mut session = SmtSearchSession {
+                            search: command.search,
+                            goal_variables: command.goal_variables,
+                            target_variable_count: command.target_variable_count,
+                            shown_total: 0,
+                        };
+                        let body = render_smt_search(
+                            &mut session,
+                            lm,
+                            &self.interner,
+                            self.render_color,
+                            max_solutions,
+                        );
+                        out.push_str(&format!(
+                            "smt-search{bound_str} in {cur} : {header} .\n{body}"
+                        ));
+                        self.last =
+                            Some((cur.clone(), Continuation::SmtSearch(Box::new(session))));
+                    }
+                    Err(e) => out.push_str(&format!("error: {e}\n")),
                 }
             }
             Command::Srewrite { depth_first, term, mut strategy, .. } => {
@@ -1595,7 +1602,8 @@ impl Session {
                     }
                 }
                 _ => out.push_str(
-                    "No previous rewriting, search, or variant enumeration to continue in this module.\n",
+                    "error: no previous rewriting, search, or variant enumeration to continue in this \
+                     module.\n",
                 ),
             },
         }
@@ -1609,7 +1617,7 @@ impl Session {
             .map(|s| s.trim_end_matches('.'))
             .unwrap_or("");
         let out = if name.is_empty() {
-            "select: expected a module name.".to_string()
+            "error: select: expected a module name.".to_string()
         } else if self.modules.contains_key(name) {
             if self.current.as_deref() != Some(name) {
                 self.meta_state.clear();
@@ -1618,7 +1626,7 @@ impl Session {
             self.last = None; // switching modules invalidates the saved rewrite continuation
             String::new()
         } else {
-            format!("select: no module `{name}` — enter it first.")
+            format!("error: select: no module `{name}` — enter it first.")
         };
         Eval {
             output: out,
@@ -1635,24 +1643,37 @@ impl Session {
             .collect();
         let out = match words.get(1).copied() {
             Some("modules") => {
-                let list = if self.order.is_empty() { "(none)".into() } else { self.order.join(" ") };
+                let list = if self.order.is_empty() {
+                    "(none)".into()
+                } else {
+                    self.order.join(" ")
+                };
                 format!("modules: {list}")
             }
             Some("module") => {
-                let name = words.get(2).map(|s| s.to_string()).or_else(|| self.current.clone());
-                match name.as_deref().and_then(|n| self.modules.get(n).map(|lm| (n, lm))) {
+                let requested = words.get(2).copied();
+                match requested
+                    .or(self.current.as_deref())
+                    .and_then(|n| self.modules.get(n).map(|lm| (n, lm)))
+                {
                     Some((n, lm)) => render_module(n, lm),
-                    None => "show module: no such module (and no current module).".into(),
+                    None => match requested {
+                        Some(n) => format!("error: show module: no such module `{n}`."),
+                        None => "error: show module: no current module.".into(),
+                    },
                 }
             }
             Some("views") => {
-                let list =
-                    if self.view_order.is_empty() { "(none)".into() } else { self.view_order.join(" ") };
+                let list = if self.view_order.is_empty() {
+                    "(none)".into()
+                } else {
+                    self.view_order.join(" ")
+                };
                 format!("views: {list}")
             }
             Some("view") => match words.get(2).and_then(|n| self.views.get(n)) {
                 Some(v) => render_view(v, &self.interner),
-                None => "show view: no such view (usage: `show view NAME .`).".into(),
+                None => "error: show view: no such view (usage: `show view NAME .`).".into(),
             },
             // `show path [states] N .` — regular-search or narrowing history.
             Some("path") => {
@@ -1680,10 +1701,17 @@ impl Session {
                                 Some(n),
                             )
                         }
-                        _ => "show path: no current search (run `search` first).".into(),
+                        // `path states` renders only narrowing histories; do not report the current
+                        // ordinary search as missing.
+                        Some((m, Continuation::Search(_))) if m == cur => {
+                            "error: show path states: not available for an ordinary search; use \
+                             `show path N .`."
+                                .into()
+                        }
+                        _ => "error: show path: no current search (run `search` first).".into(),
                     },
-                    (None, _) => "show path: expected a state number.".into(),
-                    _ => "show path: no current module.".into(),
+                    (None, _) => "error: show path: expected a state number.".into(),
+                    _ => "error: show path: no current module.".into(),
                 }
             }
             Some("frontier") if words.get(2).copied() == Some("states") => {
@@ -1700,9 +1728,10 @@ impl Session {
                                 None,
                             )
                         }
-                        _ => "Warning: no narrowing state forest.".into(),
+                        _ => "error: show frontier states: no narrowing state graph is available."
+                            .into(),
                     },
-                    None => "show frontier states: no current module.".into(),
+                    None => "error: show frontier states: no current module.".into(),
                 }
             }
             Some("most")
@@ -1722,25 +1751,39 @@ impl Session {
                                 None,
                             )
                         }
-                        _ => "Warning: no narrowing state forest.".into(),
+                        _ => "error: show most general states: no narrowing state graph is \
+                              available."
+                            .into(),
                     },
-                    None => "show most general states: no current module.".into(),
+                    None => "error: show most general states: no current module.".into(),
                 }
             }
             // `show search graph .` — the whole reachable-state graph of the last search.
-            Some("search") if words.get(3).copied() == Some("graph") || words.get(2).copied() == Some("graph") => {
+            Some("search")
+                if words.get(3).copied() == Some("graph")
+                    || words.get(2).copied() == Some("graph") =>
+            {
                 match self.current.as_deref() {
                     Some(cur) => match &self.last {
                         Some((m, Continuation::Search(session))) if m == cur => {
                             let lm = self.modules.get(cur).expect("current module is built");
                             render_graph(&session.search, lm, &self.interner, self.render_color)
                         }
-                        _ => "show search graph: no current search.".into(),
+                        _ => "error: show search graph: no current search.".into(),
                     },
-                    None => "show search graph: no current module.".into(),
+                    None => "error: show search graph: no current module.".into(),
                 }
             }
-            _ => "show: try `show module .` / `show modules .` / `show view NAME .` / `show views .` / `show path N .` / `show search graph .`".into(),
+            _ => {
+                let forms = "`show modules .`, `show module [NAME] .`, `show views .`, \
+                             `show view NAME .`, `show path [states] N .`, `show search graph .`, \
+                             `show frontier states .`, or `show most general states .`";
+                // Name only the form's first word; the dispatched chunk can hold later source text.
+                match words.get(1) {
+                    Some(form) => format!("error: show: unknown form `{form}`; try {forms}."),
+                    None => format!("error: show: expected a form; try {forms}."),
+                }
+            }
         };
         Eval {
             output: out,
@@ -1757,7 +1800,11 @@ impl Session {
             .filter(|word| !word.is_empty())
             .collect();
         let out = match words.get(1).copied() {
-            Some("trace") => self.trace.apply(&words[2..]).err().unwrap_or_default(),
+            // A rejected trace request changes no flag and reports a command diagnostic.
+            Some("trace") => match self.trace.apply(&words[2..]) {
+                Ok(()) => String::new(),
+                Err(error) => format!("error: {error}"),
+            },
             Some("memo") => unsupported_memo_control_warning().to_string(),
             Some("clear") if words.get(2).copied() == Some("memo") => {
                 unsupported_memo_control_warning().to_string()
@@ -1859,9 +1906,9 @@ impl Session {
         if matches!(trimmed, "quit" | "q" | "exit") {
             return true;
         }
-        // `load`/`sload` are line-terminated (no `.`): a submission whose first TOKEN is the
-        // keyword (leading comments stripped by the lexer) is complete at its line end — both
-        // drivers append whole lines, so the buffer already ends at one.
+        // `load`/`sload` are line-terminated (a final `.` is optional): a submission whose first
+        // TOKEN is the keyword (leading comments stripped by the lexer) is complete at its line end —
+        // both drivers append whole lines, so the buffer already ends at one.
         {
             let toks = tokenize(input, &mut self.interner);
             if let Some(t) = toks.first()
@@ -2104,6 +2151,17 @@ fn append_block(out: &mut String, block: &str) {
             out.push('\n');
         }
         out.push_str(block);
+    }
+}
+
+/// The path operand of `load`/`sload` (Appendix D): the rest of the keyword's line with surrounding
+/// whitespace trimmed and one optional final command dot removed. A final `.` is the command dot only
+/// when it is the whole operand or follows whitespace; a `.` glued to the path is part of the path.
+fn load_path_operand(rest: &str) -> &str {
+    let rest = rest.trim();
+    match rest.strip_suffix('.') {
+        Some(head) if head.is_empty() || head.ends_with(char::is_whitespace) => head.trim_end(),
+        _ => rest,
     }
 }
 
@@ -2875,7 +2933,7 @@ fn render_narrowing_display(
             let state = requested.expect("show path carries a state");
             let path = session.search.path_indices(state);
             if path.is_empty() {
-                return format!("show path: no state {state}.");
+                return format!("error: show path: no state {state}.");
             }
             let mut out = String::new();
             for (position, &index) in path.iter().enumerate() {
@@ -2946,11 +3004,11 @@ fn render_search_bindings(
 }
 
 /// Render `show path N`: the transition sequence from state 0 to state `n` — `state K, Sort: value`
-/// lines separated by `===[ rule ]===>` arcs.
+/// lines separated by `===[ rule ]===>` arcs. A state the graph lacks yields an `error:` diagnostic line.
 fn render_path(search: &Search, lm: &LoadedModule, i: &Interner, n: usize, color: bool) -> String {
     let steps = search.path(n);
     if steps.is_empty() {
-        return format!("show path: no state {n}.");
+        return format!("error: show path: no state {n}.");
     }
     let mut out = String::new();
     for (idx, step) in steps.iter().enumerate() {

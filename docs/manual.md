@@ -568,7 +568,7 @@ cont ...
 
 **TNK-CONT-001 — Continuations.** A Session owns at most one last continuation. `continue` resumes the saved rewrite, search, SMT-search, variant, variant-unifier/matcher, or narrowing object with its graph, solver, roots, counters, and numbering intact. A continuation is usable only while its originating module remains current and unchanged. `select`, including selection of the already-current name, always clears it. A successful module redefinition clears it; a successful view definition clears it only when dependent modules were rebuilt.
 
-For rewrite sessions, an omitted continuation bound runs to rule normal form; a numeric bound permits that many additional rule applications. For enumerators, a numeric bound emits at most that many additional results; an omitted bound emits until exhaustion or divergence.
+For rewrite sessions, an omitted continuation bound runs to rule normal form; a numeric bound permits that many additional rule applications. For enumerators, a numeric bound emits at most that many additional results; an omitted bound emits until exhaustion or divergence. `continue` with no current module, or without a usable continuation for the current module, emits an `error:` diagnostic and no records.
 
 Continuation invalidation on a failed replacement command is currently Experimental and command-family-dependent: some builders clear before validation while others replace only on success. Portable hosts MUST NOT attempt `continue` after any intervening execution command, successful or failed. This boundary should become a uniform typed Session transition before continuation behavior is promoted beyond the current command contract.
 
@@ -842,6 +842,8 @@ show most general states .
 
 **TNK-SESSION-005 — Selection.** Successfully entering a module makes it current. `select NAME .` changes the current module only if the named built module exists and always clears the continuation, even when `NAME` was already current. `in M :` never changes current selection. Continuation inspection requires the originating module still to be current.
 
+A `select` that names no built module, an unknown `show` form, and an inspection that cannot be displayed (no current module, or an absent module, view, search graph, narrowing graph, state, or state number) emit an `error:` diagnostic; Appendix D.1 gives the `parse error:` case for a `show` that shares a physical line with a definition. A rejected `select` leaves the current module unchanged. A rejected `show` leaves the current module, the continuation, and all settings unchanged.
+
 ### 17.2 Settings
 
 ```text
@@ -856,6 +858,8 @@ do clear memo .
 ```
 
 **TNK-SESSION-006 — Settings.** Trace is off by default. `include BOOL` is off in a bare Session; while on, a newly entered module receives an implicit `including BOOL .` if `BOOL` exists. Breakdown and verbose output are off by default. Timing measurement and memoization controls are Unsupported: enabling timing or using memo controls emits an unavailable-capability warning and has no semantic effect. Other unknown `set` controls are currently silent no-ops and are Implementation-defined recovery, not supported features.
+
+A `set trace` request outside the form above (an unknown section, a value other than `on` or `off`, or a missing or extra word) is rejected with an `error:` diagnostic and changes no trace flag.
 
 ### 17.3 Loading
 
@@ -1396,7 +1400,7 @@ TraceSection ::= "condition" | "whole" | "substitution" | "rewrite"
                | "body" | "builtin" | "eqs" | "mbs" | "rls"
 ```
 
-`load` and `sload` accept the rest of their submission line as the path after trimming whitespace and an optional final command dot. The CLI's optional positional file is a separate adapter surface. Unknown `show` commands diagnose; unknown `set` controls are currently inert and are catalogued as Unsupported in Appendix K.
+`load` and `sload` accept the rest of their submission line as the path after trimming whitespace and an optional final command dot. The command dot is a final `.` that is the whole operand or follows whitespace; a `.` glued to the path is part of the path, so `load lib .` names `lib` and `load lib.` names `lib.`. The CLI's optional positional file is a separate adapter surface. Unknown `show` commands diagnose with an `error:` line, or with a `parse error:` line when the `show` follows a module or view definition on the same physical line; unknown `set` controls are currently inert and are catalogued as Unsupported in Appendix K.
 
 ### D.2 Strategy grammar
 
@@ -1609,7 +1613,7 @@ This table is the intended ownership model. The current implementation exception
 | declaration/statement | frontend builder | invalid module definition is not installed; statement-local failures follow `TNK-STMT-001` |
 | module/view composition | module layer | attempted definition is atomic; prior definition and dependents remain |
 | strict host attachment | frontend/signature builder | invalid or missing capability rejects the attempted module atomically; a prior definition and its built dependents remain active |
-| command parse/build | frontend/Session command boundary | no semantic execution; prior continuation remains only where `TNK-SESSION-003` permits |
+| command parse/build | frontend/Session command boundary | no semantic execution; prior continuation remains only where `TNK-CONT-001` permits |
 | unsupported capability | owning feature boundary | no false success or exhaustion claim |
 | user bound | command enumerator | finite prefix; continuation retained only for resumable families |
 | solver `Unknown`/`BadDag` | SMT boundary | intended to be reported distinctly from `Sat`/`Unsat`; the current Session `BadDag` omission is in H.4 |
@@ -1779,7 +1783,7 @@ This appendix describes current product boundaries, not a development backlog. *
 | `matchrew` substrategy using a variable bound to a non-ground subterm, reachable only through a reflected strategy rewrite of a non-ground term | rejected during execution | `metaSrewrite` remains unreduced and an interpreter `srewriteTerm` request receives `interpreterError` (`Bad strategy.`); no partial result |
 | conditional narrowing rule | warning; the invalid rule statement is dropped | enclosing module and later valid statements remain installed; see H.4 |
 | non-ground unification under idempotent CUI or one-sided-identity associative theories | low-level problem is unsupported; no ordinary unifier stream | object-level Session currently emits only the command echo; no warning or no-unifier marker |
-| SMT-search `=>!` | command rejects mode | no search/continuation created |
+| SMT-search `=>!` | command rejects mode with an `error:` diagnostic and no command echo | no search/continuation created |
 | conditional constraint in reflected `metaMatch` | unsupported at reflected boundary | no unrelated dispatch |
 | `metaNarrow2` state-only dispatch | recognized but inert | term remains unreduced or explicit facade failure |
 | unknown META-LEVEL operation code | maps to inert `Unknown` | no fallback to another MetaOp |
@@ -1852,7 +1856,7 @@ The identifier is the stable reference; section numbers are navigational. The in
 | reflection | `TNK-META-001`, `TNK-META-002` | §16.2 |
 | objects/interpreters | `TNK-OO-001`, `TNK-OO-002` | §16.3 |
 | Session state | `TNK-SESSION-001`, `TNK-SESSION-002`, `TNK-SESSION-003`, `TNK-SESSION-004`, `TNK-SESSION-005`, `TNK-SESSION-006` | §17 |
-| loading | `TNK-LOAD-001`, `TNK-LOAD-002` | §17.5 |
+| loading | `TNK-LOAD-001`, `TNK-LOAD-002` | §17.3 |
 | output and diagnostics | `TNK-OUT-001`, `TNK-OUT-002`, `TNK-OUT-003` | §18 |
 | tentative invalid-input recovery | `TNK-RECOVERY-001` | Appendix H.4 |
 | accounting | `TNK-COUNT-001`, `TNK-COUNT-002` | §18.2 |

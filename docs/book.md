@@ -3414,7 +3414,7 @@ Dependent redefinition can invalidate it even if the command text would still pa
 
 ### Loading source
 
-`load FILE` and `sload FILE` are line-terminated; they do not take a trailing period.
+`load FILE` and `sload FILE` are line-terminated; a trailing period is optional. A final ` .` after whitespace is dropped from the path, while a `.` glued to the name is part of it.
 
 Resolution tries:
 

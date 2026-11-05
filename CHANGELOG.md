@@ -118,6 +118,14 @@ All notable user-visible changes are documented here. This project follows Seman
 
 - A strategy that recurses through `matchrew` by-variables or rewrite-condition substrategies no longer overflows the native stack. From about 5,000 levels such recursion aborted the process with a stack overflow (exit status `134`), and all output of the input was lost. These nested sub-searches now live in the command's task tree, and abandoning a deep failed nest, including a deep chain of named calls, is a loop rather than native recursion.
 
+- Rejected Session requests now start with the Stable `error:` severity prefix (`TNK-OUT-001`). This covers unknown `show` forms; `show` inspections with no current module or an absent module, view, search graph, narrowing graph, or state; failed `select`; malformed `set trace` requests; `continue` without a usable continuation; and commands entered with no current module. The two narrowing displays no longer print a capitalized `Warning:`, and `show module NAME .` for a missing module no longer claims that no module is current. Clients that detect diagnostics by prefix now see these rejections. Their state effects are unchanged.
+
+- `load FILE .` and `sload FILE .` now remove the optional final command dot from the path, as Appendix D specifies. They previously searched for a file named `FILE .` and failed with `cannot open file`. A `.` glued to the name (`load FILE.`) is still part of the path, and `load .` now reports that a file name is missing.
+
+- An `smt-search` request rejected while the command is built now reports an `error:` diagnostic instead of printing nothing. This covers the unsupported `=>!` mode, a module or goal outside the restrictions for rewriting modulo SMT, and a `such that` condition that does not parse or is not supported. As before, the rejected request prints no command echo and creates no search or continuation.
+
+- `show modules .` now lists each built module once, in entry order. A dependent dropped because its rebuild failed after a redefinition is no longer listed, matching `select` and `show module`, which already reported it missing. Entering it again lists it once, at the end, instead of twice.
+
 ### Documentation
 
 - Documented the public reducer API, source attachment grammar, purity/trust boundary, fault policy, supported typed adapters, feature status, and end-to-end configured Session workflow.
