@@ -1517,6 +1517,212 @@ fn match_command_through_repl() {
     );
 }
 
+/// An identity-collapse rewrite under a non-commutative `[id: e]` operator keeps the rewritten
+/// argument in place. With `eq t(A) # e = k(A)` (or `e # t(A)`), `b # t(a)` reduces to `b # k(a)`;
+/// moving the rhs to the front would give the different term `k(a) # b`.
+#[test]
+fn cui_identity_rewrite_keeps_argument_order_through_repl() {
+    let out = repl()
+        .eval(concat!(
+            "fmod CUI-ORDER-RIGHT is\n",
+            "  sort S . ops a b e : -> S . ops k t : S -> S .\n",
+            "  op _#_ : S S -> S [id: e] .\n",
+            "  var A : S .\n",
+            "  eq t(A) # e = k(A) .\n",
+            "endfm\n",
+            "red b # t(a) .\n",
+            "red t(a) # b .\n",
+            "fmod CUI-ORDER-LEFT is\n",
+            "  sort S . ops a b e : -> S . ops k t : S -> S .\n",
+            "  op _#_ : S S -> S [id: e] .\n",
+            "  var A : S .\n",
+            "  eq e # t(A) = k(A) .\n",
+            "endfm\n",
+            "red b # t(a) .\n",
+        ))
+        .output;
+    assert!(!out.contains("error"), "{out}");
+    assert!(
+        out.contains("reduce in CUI-ORDER-RIGHT : b # t(a) .\nrewrites: 1\nresult S: b # k(a)"),
+        "second argument rewritten in place:\n{out}"
+    );
+    assert!(
+        out.contains("reduce in CUI-ORDER-RIGHT : t(a) # b .\nrewrites: 1\nresult S: k(a) # b"),
+        "first argument rewritten in place:\n{out}"
+    );
+    assert!(
+        out.contains("reduce in CUI-ORDER-LEFT : b # t(a) .\nrewrites: 1\nresult S: b # k(a)"),
+        "identity on the pattern's left operand:\n{out}"
+    );
+}
+
+/// A rule step below an `iter` node keeps the node's count in every rule driver. `s_^3(a)` denotes
+/// `s(s(s(a)))`, so with `rl a => b` the step gives `s_^3(b)`, not the single application `s b`. The
+/// same holds under a free, AC, or distinct iter parent, for a rewrite condition and a search goal
+/// that need the tower, and for strategy rule application and `amatchrew`. A rewritten argument
+/// that is itself a successor folds into the count, and a frozen argument is not rewritten.
+#[test]
+fn rule_steps_below_iter_keep_the_count_through_repl() {
+    let out = repl()
+        .eval(concat!(
+            "mod ITER-RULE is\n",
+            "  sorts S Set Flag . subsort S < Set .\n",
+            "  ops a b c : -> S . op tt : -> Flag .\n",
+            "  ops s_ p_ : S -> S [iter] .\n",
+            "  op h : S S -> S . op g : S -> S [frozen] . op k : S -> S . op ok : S -> Flag .\n",
+            "  op __ : Set Set -> Set [assoc comm] .\n",
+            "  rl [r] : a => b .\n",
+            "  crl [c] : ok(X:S) => tt if X:S => s_^3(b) .\n",
+            "endm\n",
+            "rew s_^3(a) .\n",
+            "frew s_^3(a) .\n",
+            "erew s_^3(a) .\n",
+            "rew h(s_^3(a), a) .\n",
+            "rew p_^2(s_^3(a)) .\n",
+            "frew p_^2(s_^3(a)) .\n",
+            "rew c s_^3(a) .\n",
+            "rew g(s_^3(a)) .\n",
+            "rew ok(s_^3(a)) .\n",
+            "search s_^3(a) =>1 X:S .\n",
+            "search s_^3(a) =>* s_^3(b) .\n",
+            "srew s_^3(a) using r .\n",
+            "srew s_^3(a) using all .\n",
+            "srew s_^3(k(a)) using amatchrew k(X:S) by X:S using r .\n",
+            "mod ITER-GROW is\n",
+            "  sort S . op a : -> S . op s_ : S -> S [iter] .\n",
+            "  rl [grow] : a => s a .\n",
+            "endm\n",
+            "rew [1] s_^3(a) .\n",
+            "rew [2] s_^3(a) .\n",
+            "frew [1] s_^3(a) .\n",
+        ))
+        .output;
+    assert!(!out.contains("error"), "{out}");
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|line| {
+            line.starts_with("result ") || line.starts_with("Solution ") || line.contains(" --> ")
+        })
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "result S: s_^3(b)", // rew
+            "result S: s_^3(b)", // frew
+            "result S: s_^3(b)", // erew (not a configuration: position-fair fallback)
+            "result S: h(s_^3(b), b)",
+            "result S: p_^2(s_^3(b))", // rew below two distinct iter operators
+            "result S: p_^2(s_^3(b))", // frew
+            "result Set: c s_^3(b)",   // AC parent
+            "result S: g(s_^3(a))",    // frozen argument
+            "result Flag: tt",         // the condition `X => s_^3(b)` holds
+            "Solution 1 (state 1)",    // search =>1
+            "X:S --> s_^3(b)",
+            "Solution 1 (state 1)", // search =>* s_^3(b)
+            "Solution 1",           // srew using r
+            "result S: s_^3(b)",
+            "Solution 1", // srew using all
+            "result S: s_^3(b)",
+            "Solution 1", // amatchrew below the tower
+            "result S: s_^3(k(b))",
+            "result S: s_^4(a)",                     // rew [1] with a => s a
+            "result S: s_^5(a)",                     // rew [2]
+            "result (sort not calculated): s_^4(a)", // frew [1]
+        ],
+        "{out}"
+    );
+}
+
+/// At a subject rooted at a CUI operator, one pattern operand may take the whole subject while the
+/// other takes the identity (or, under `idem`, the subject again). These matchers follow the ordinary
+/// pairings, so `match`, `reduce`, and `search` all see them.
+#[test]
+fn cui_rooted_subject_collapse_through_repl() {
+    let out = repl()
+        .eval(concat!(
+            "fmod ROOT-ID is\n",
+            "  sort S . ops a b e : -> S .\n",
+            "  op f : S S -> S [id: e] .\n",
+            "  vars X Y : S .\n",
+            "endfm\n",
+            "match f(X, Y) <=? f(a, b) .\n",
+            "fmod ROOT-COMM-ID is\n",
+            "  sort S . ops a b e : -> S .\n",
+            "  op f : S S -> S [comm id: e] .\n",
+            "  vars X Y : S .\n",
+            "endfm\n",
+            "match f(X, Y) <=? f(a, b) .\n",
+            "fmod ROOT-IDEM is\n",
+            "  sort S . ops a b : -> S .\n",
+            "  op f : S S -> S [comm idem] .\n",
+            "  vars X Y : S .\n",
+            "endfm\n",
+            "match f(X, Y) <=? f(a, b) .\n",
+            "fmod ROOT-RED is\n",
+            "  sorts T S . subsort T < S .\n",
+            "  ops a b c : -> T . op e : -> S . op h : S S -> S .\n",
+            "  op f : S S -> S [id: e] .\n",
+            "  vars A B : T .\n",
+            "  eq f(f(A, B), e) = h(A, B) .\n",
+            "endfm\n",
+            "red f(a, b) .\n",
+            "red f(f(a, b), c) .\n",
+            "mod ROOT-SEARCH is\n",
+            "  sort S . ops a b e : -> S . op g : S S -> S .\n",
+            "  op f : S S -> S [id: e] .\n",
+            "  vars X Y : S .\n",
+            "  rl f(X, Y) => g(X, Y) .\n",
+            "endm\n",
+            "search f(a, b) =>1 Z:S .\n",
+        ))
+        .output;
+    assert!(!out.contains("error"), "{out}");
+    assert!(
+        out.contains(concat!(
+            "match in ROOT-ID : f(X, Y) <=? f(a, b) .\n\n",
+            "Matcher 1\nX --> a\nY --> b\n\n",
+            "Matcher 2\nX --> f(a, b)\nY --> e\n\n",
+            "Matcher 3\nX --> e\nY --> f(a, b)\n",
+        )),
+        "identity collapse after the ordinary pairing:\n{out}"
+    );
+    assert!(
+        out.contains(concat!(
+            "match in ROOT-COMM-ID : f(X, Y) <=? f(a, b) .\n\n",
+            "Matcher 1\nX --> a\nY --> b\n\n",
+            "Matcher 2\nX --> b\nY --> a\n\n",
+            "Matcher 3\nX --> f(a, b)\nY --> e\n\n",
+            "Matcher 4\nX --> e\nY --> f(a, b)\n",
+        )),
+        "commutative identity collapse:\n{out}"
+    );
+    assert!(
+        out.contains(concat!(
+            "match in ROOT-IDEM : f(X, Y) <=? f(a, b) .\n\n",
+            "Matcher 1\nX --> a\nY --> b\n\n",
+            "Matcher 2\nX --> b\nY --> a\n\n",
+            "Matcher 3\nX --> f(a, b)\nY --> f(a, b)\n",
+        )),
+        "idempotent collapse:\n{out}"
+    );
+    assert!(
+        out.contains("reduce in ROOT-RED : f(a, b) .\nrewrites: 1\nresult S: h(a, b)"),
+        "f(f(A, B), e) applies at a top-level f(a, b):\n{out}"
+    );
+    assert!(
+        out.contains("reduce in ROOT-RED : f(f(a, b), c) .\nrewrites: 1\nresult S: f(h(a, b), c)"),
+        "and at an argument:\n{out}"
+    );
+    assert!(
+        out.contains(concat!(
+            "Solution 2 (state 2)\nstates: 3  rewrites: 2\nZ:S --> g(f(a, b), e)\n\n",
+            "Solution 3 (state 3)\nstates: 4  rewrites: 3\nZ:S --> g(e, f(a, b))\n\n",
+            "No more solutions.",
+        )),
+        "the collapse matchers are one-step successors:\n{out}"
+    );
+}
+
 /// `select` switches the current module; success is silent, an unknown module is reported.
 #[test]
 fn select_and_show() {

@@ -112,8 +112,16 @@ impl SmtSearch {
         if !self.tested_initial {
             self.tested_initial = true;
             if self.arrow == Arrow::Star {
-                self.prepare_solver(engine, 0);
-                self.queue_goal_matches(engine, 0);
+                // Like every other retained match, an initial-state goal match needs the backend's
+                // `Sat` for the initial `such that` constraint, so an unverified (`Unsat`, `Unknown`,
+                // or `BadDag`) initial constraint yields no match. Exempting the literal `true`
+                // constraint, which the null backend answers `Unknown`, is provisional pending the
+                // trivial-constraint decision recorded in TNK-DEV-012. Prepare the solver first in
+                // every case: goal match constraints are checked against the initial constraint.
+                let feasible = self.prepare_solver(engine, 0);
+                if feasible || engine.is_smt_true(self.states[0].constraint) {
+                    self.queue_goal_matches(engine, 0);
+                }
             }
         }
         loop {

@@ -8,6 +8,10 @@
 
 TNK implements the reflected operations listed in the Reference and deliberately leaves unsupported or unresolved operations inert or represented by the loaded facade's failure value. Release cleanup removed a probe that covered several supported and unsupported boundary cases; retained tests do not represent every case.
 
+`metaXmatch` and `metaXapply` count the copies of a repeated associative-commutative element as one position (Reference §16.2). `meta_xapply_and_xmatch_visit_a_repeated_ac_element_once` in `crates/tnk-session/tests/session.rs` covers this for a repeated constant, a repeated non-constant element, the index-until-failure counting idiom, and a commutative control.
+
+A rule step below an `iter` node keeps the node's count in `metaRewrite`, `metaFrewrite`, `metaSearch`, and `metaXapply` results, and the `metaXapply`, `metaXmatch`, and `metaNarrowingApply` contexts head an `iter` ancestor with its count (`'s_^3[[]]`). `rule_steps_below_iter_keep_the_count_through_meta_and_nat` in `crates/tnk-session/tests/session.rs` covers this for a hole directly below the tower and for a tower below a free parent. It does not cover a proper `iter` extension match, which the proper-residue item below includes.
+
 ## Work
 
 Add permanent behavior-level coverage for:

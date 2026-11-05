@@ -567,16 +567,25 @@ fn collect_variable_keys(e: &Engine, root: DagId, keys: &mut Vec<(u32, crate::so
     }
 }
 
+/// The non-frozen positions of `root`, breadth-first, as child-index paths with their subterms.
+///
+/// The copies of a repeated element of an associative-commutative node are one position. Equal
+/// arguments of a free, associative, or non-commutative identity/idempotent operator are distinct
+/// positions, even when they are one shared node (for example an instantiated `f(Y, Y)` or a ground
+/// `f(g(a), g(a))`). When the two arguments of a commutative operator are one shared node, only the
+/// first is narrowed: the second yields the same unifiers, and states equal to the first's modulo
+/// commutativity. Separately built equal arguments of a commutative operator are both narrowed.
 fn narrowing_positions(e: &Engine, root: DagId) -> Vec<(Vec<usize>, DagId)> {
     let mut result = Vec::new();
     let mut queue = VecDeque::from([(Vec::new(), root)]);
     while let Some((path, dag)) = queue.pop_front() {
         result.push((path.clone(), dag));
         let symbol = e.node(dag).symbol();
-        let children: Vec<_> = e.node(dag).children().collect();
+        let commutative_pair =
+            matches!(e.node(dag).term, NodeTerm::Cui { .. }) && e.symbol(symbol).is_commutative();
         let mut previous = None;
-        for (index, child) in children.into_iter().enumerate() {
-            if previous == Some(child) || e.is_frozen_arg(symbol, index) {
+        for (index, child) in e.redex_arguments(dag, |index| e.is_frozen_arg(symbol, index)) {
+            if commutative_pair && previous == Some(child) {
                 continue;
             }
             previous = Some(child);

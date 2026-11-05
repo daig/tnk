@@ -10347,7 +10347,19 @@ fn up_context_impl(
         return ctx.app(hooks.ops["holeSymbol"], vec![]);
     };
     let sym = source.engine.node(node).symbol();
-    let name = source.engine.symbol(sym).name().to_string();
+    // An iter ancestor `f^n(...)` is headed `'f^n`, as `up_term` renders the node itself; the bare name
+    // would denote a single application of `f`.
+    let name = match source.engine.node(node).repr() {
+        NodeRepr::Iter { count, .. } => {
+            let base = meta_symbol_name(source, sym);
+            if count == "1" {
+                base
+            } else {
+                format!("{base}^{count}")
+            }
+        }
+        _ => source.engine.symbol(sym).name().to_string(),
+    };
     let children: Vec<DagId> = source.engine.node(node).children().collect();
     let matched_whole_child =
         matched.is_none_or(|portion| source.engine.deep_equal(children[head], portion));
@@ -10620,7 +10632,9 @@ fn up_rule(
 }
 
 /// Collect the subterm positions of `node` whose depth is in `[min_d, max_d]`, as child-index paths in
-/// outermost-first (pre-order) order — `metaXapply`'s application-position enumeration.
+/// outermost-first (pre-order) order — the `metaXmatch`/`metaXapply` position enumeration. The copies of
+/// a repeated element of an associative-commutative subterm are one position, addressed through the
+/// first copy, so they do not report one solution per copy.
 fn collect_positions(
     engine: &Engine,
     node: DagId,
@@ -10636,8 +10650,7 @@ fn collect_positions(
     if depth >= min_d {
         out.push(path.clone());
     }
-    let children: Vec<DagId> = engine.node(node).children().collect();
-    for (i, &c) in children.iter().enumerate() {
+    for (i, c) in engine.redex_arguments(node, |_| false) {
         path.push(i);
         collect_positions(engine, c, depth + 1, path, min_d, max_d, out);
         path.pop();
@@ -10658,6 +10671,7 @@ fn subterm_at(engine: &Engine, root: DagId, path: &[usize]) -> DagId {
 }
 
 /// `root` with the subterm at child-index `path` replaced by `new` (rebuilding the spine, theory-aware).
+/// An `iter` ancestor `f^n(...)` keeps its count `n`; `make_node` would build a single application of `f`.
 fn replace_at(engine: &mut Engine, root: DagId, path: &[usize], new: DagId) -> DagId {
     let Some((&head, rest)) = path.split_first() else {
         return new;
@@ -10665,7 +10679,16 @@ fn replace_at(engine: &mut Engine, root: DagId, path: &[usize], new: DagId) -> D
     let sym = engine.node(root).symbol();
     let mut children: Vec<DagId> = engine.node(root).children().collect();
     children[head] = replace_at(engine, children[head], rest, new);
-    engine.make_node(sym, children)
+    let iter_count = match engine.node(root).repr() {
+        NodeRepr::Iter { count, .. } => Some(count),
+        _ => None,
+    };
+    match iter_count {
+        Some(count) => engine
+            .make_iter_decimal(sym, &count, children[0])
+            .expect("an iteration count is a decimal numeral"),
+        None => engine.make_node(sym, children),
+    }
 }
 
 /// Remove one associative matched portion from `whole`, preserving every unmatched argument.

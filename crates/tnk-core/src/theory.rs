@@ -12,7 +12,7 @@
 
 use crate::acu::{AcuLhs, AcuSubproblem};
 use crate::au::{AuLhs, AuSubproblem};
-use crate::cui::{CuiLhs, CuiSubproblem};
+use crate::cui::{CuiLhs, CuiResidue, CuiSubproblem};
 use crate::dag::{DagId, NodeTerm};
 use crate::engine::{Runtime, Signature};
 use crate::num::Nat;
@@ -42,7 +42,7 @@ enum RewriteMatchContextKind {
     },
     Cui {
         symbol: SymbolId,
-        residue: DagId,
+        residue: CuiResidue,
     },
     S {
         symbol: SymbolId,
@@ -73,7 +73,7 @@ impl RewriteMatchContext {
         }
     }
 
-    pub(crate) fn cui(symbol: SymbolId, residue: DagId) -> Self {
+    pub(crate) fn cui(symbol: SymbolId, residue: CuiResidue) -> Self {
         Self {
             kind: RewriteMatchContextKind::Cui { symbol, residue },
         }
@@ -111,7 +111,7 @@ impl RewriteMatchContext {
                 runtime.make_au(signature, *symbol, sequence)
             }
             RewriteMatchContextKind::Cui { symbol, residue } => {
-                runtime.make_cui(signature, *symbol, rhs, *residue)
+                residue.rebuild(runtime, signature, *symbol, rhs)
             }
             RewriteMatchContextKind::S { symbol, residue } => {
                 runtime.make_s(signature, *symbol, residue.clone(), rhs)
@@ -265,7 +265,7 @@ pub(crate) enum Subproblem {
     Acu(AcuSubproblem),
     /// AU theory: a resumable ordered-sequence enumerator (see [`AuSubproblem`]).
     Au(AuSubproblem),
-    /// CUI theory: the (at most two) commutative pairings (see [`CuiSubproblem`]).
+    /// CUI theory: the commutative, collapse, and collapse-extension pairings (see [`CuiSubproblem`]).
     Cui(CuiSubproblem),
     /// S theory: the (lazy) successor-extension solutions (see [`SSubproblem`]).
     S(SSubproblem),

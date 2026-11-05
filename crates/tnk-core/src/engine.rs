@@ -3766,14 +3766,34 @@ impl Runtime {
                 debug_assert_eq!(children.len(), 2, "a CUI node is binary");
                 self.make_cui(sig, symbol, children[0], children[1])
             }
-            // An iter `Op` layer (from `instantiate`) is one successor; `make_s` flattening folds nested
-            // layers into a single `s^k`. `reduce` re-seats existing S nodes with their preserved count
-            // directly (not through here), so this `s^1` semantics is only ever what `instantiate` wants.
+            // A fresh iter application (an `Op` layer from `instantiate`, or a builder's application) is
+            // one successor; `make_s` flattening folds nested layers into a single `s^k`. Rebuilding an
+            // existing S node must keep its count instead: `reduce` re-seats it directly, and splicers
+            // that put a rewritten child back into its parent use [`rebuild_like`](Self::rebuild_like).
             Theory::S => {
                 debug_assert_eq!(children.len(), 1, "an S successor is unary");
                 self.make_s(sig, symbol, Nat::one(), children[0])
             }
         }
+    }
+
+    /// Rebuild the existing node `original` over replacement `children`. Unlike [`rebuild`](Self::rebuild),
+    /// which builds a fresh application, this keeps the node's non-child state: an S node `s^n(t)` keeps
+    /// its count `n` and becomes `s^n(t')` (a same-symbol S child folds in). Every other node is rebuilt
+    /// by `rebuild`. Rule-position splicers use this to rebuild the ancestors of a rewritten position.
+    pub(crate) fn rebuild_like(
+        &mut self,
+        sig: &Signature,
+        original: DagId,
+        children: Vec<DagId>,
+    ) -> DagId {
+        let symbol = self.node(original).symbol();
+        if let NodeTerm::S { count, .. } = &self.node(original).term {
+            debug_assert_eq!(children.len(), 1, "an S node has one child");
+            let count = count.clone();
+            return self.make_s(sig, symbol, count, children[0]);
+        }
+        self.rebuild(sig, symbol, children)
     }
 
     /// Whether `arg` is the constant `id_sym()` (an arity-0 free node). Used to recognise identity
@@ -5193,8 +5213,53 @@ impl Runtime {
         }
     }
 
+    /// The argument positions below `node` that a rule-position enumerator visits, as
+    /// `(physical child index, child)` pairs in [`children`](DagNode::children) order. Physical
+    /// indices for which `frozen` holds are omitted.
+    ///
+    /// Below an ACU node, the copies of a repeated element are one position: rewriting any copy yields
+    /// the same multiset. Each entry is therefore addressed once, through its first non-frozen copy.
+    /// An entry structurally equal to the previously yielded one is skipped as well; this covers equal
+    /// elements that construction has not merged yet. Equal entries are normally adjacent in the
+    /// canonical order. If an equal entry is not adjacent, it stays a redundant position, which can
+    /// repeat a result but never loses one. The arguments of every other theory are separate
+    /// positions, even when they are equal or one shared node. Callers splice a result back through
+    /// the physical index.
+    pub(crate) fn redex_arguments(
+        &self,
+        node: DagId,
+        frozen: impl Fn(usize) -> bool,
+    ) -> Vec<(usize, DagId)> {
+        match &self.node(node).term {
+            NodeTerm::Acu { args, .. } => {
+                let mut arguments: Vec<(usize, DagId)> = Vec::with_capacity(args.len());
+                let mut offset = 0usize;
+                for &(element, multiplicity) in args {
+                    let copies = offset..offset + multiplicity as usize;
+                    offset = copies.end;
+                    let Some(index) = copies.into_iter().find(|&index| !frozen(index)) else {
+                        continue; // every copy is frozen
+                    };
+                    let repeated = arguments.last().is_some_and(|&(_, previous)| {
+                        previous == element || self.deep_equal(previous, element)
+                    });
+                    if !repeated {
+                        arguments.push((index, element));
+                    }
+                }
+                arguments
+            }
+            _ => self
+                .node(node)
+                .children()
+                .enumerate()
+                .filter(|&(index, _)| !frozen(index))
+                .collect(),
+        }
+    }
+
     /// Rebuild from a rewritten position to the root, replacing the path argument at each ancestor
-    /// while preserving all other children by sharing.
+    /// while preserving all other children by sharing. An iter ancestor keeps its count.
     fn rebuild_path(
         &mut self,
         sig: &Signature,
@@ -5208,10 +5273,9 @@ impl Runtime {
             let parent_idx = stack[idx].parent;
             let arg_index = stack[idx].arg_index;
             let parent_node = stack[parent_idx].node;
-            let symbol = self.node(parent_node).symbol();
             let mut args: Vec<DagId> = self.node(parent_node).children().collect();
             args[arg_index] = node;
-            node = self.rebuild(sig, symbol, args);
+            node = self.rebuild_like(sig, parent_node, args);
             idx = parent_idx;
         }
         node
@@ -7388,12 +7452,6 @@ impl Engine {
             .is_some_and(|rs| rs.iter().any(|r| r.oo == OoRuleKind::LeftOver))
     }
 
-    /// Reconstruct a node of `symbol` from `children` (the theory-aware constructor — Free/ACU/AU/CUI/S).
-    /// Used by the `frewrite` traversal to rebuild a parent after rewriting a child.
-    pub(crate) fn rebuild_node(&mut self, symbol: SymbolId, children: Vec<DagId>) -> DagId {
-        self.rt.rebuild(&self.sig, symbol, children)
-    }
-
     /// Begin a search from `initial`, panicking if equational normalization invokes a failing reducer.
     /// Use [`try_search`](Self::try_search) to preserve reducer failures.
     pub fn search(
@@ -7569,6 +7627,15 @@ impl Engine {
             .smt_goal_matches(&self.sig, goal, nr_vars, smt_variables, state)
     }
 
+    /// Whether `constraint` is the signature's literal SMT `true` constant, the accumulated constraint
+    /// of a state that no non-trivial `such that` formula or rule condition has constrained.
+    pub(crate) fn is_smt_true(&self, constraint: DagId) -> bool {
+        self.sig
+            .smt_info
+            .true_symbol()
+            .is_some_and(|true_symbol| self.rt.node(constraint).symbol() == true_symbol)
+    }
+
     pub(crate) fn smt_conjoin_constraints(
         &mut self,
         accumulated: DagId,
@@ -7577,12 +7644,7 @@ impl Engine {
         let Some(local) = local else {
             return accumulated;
         };
-        if self
-            .sig
-            .smt_info
-            .true_symbol()
-            .is_some_and(|true_symbol| self.rt.node(accumulated).symbol() == true_symbol)
-        {
+        if self.is_smt_true(accumulated) {
             return local;
         }
         self.rt
@@ -7686,7 +7748,7 @@ impl Engine {
             }
         }
         let mut node = if changed {
-            self.rebuild_node(symbol, new_children)
+            self.rt.rebuild_like(&self.sig, node, new_children)
         } else {
             node
         };
@@ -8374,6 +8436,20 @@ impl Engine {
         self.rt.deep_equal(a, b)
     }
 
+    /// The argument positions below `node` that a rule-position enumerator visits, as
+    /// `(physical child index, child)` pairs in [`DagNode::children`] order, omitting physical indices
+    /// for which `frozen` holds. The copies of a repeated element of an associative-commutative node
+    /// are one position, addressed through the first non-frozen copy. The arguments of every other
+    /// theory are separate positions, even when they are equal.
+    #[must_use]
+    pub fn redex_arguments(
+        &self,
+        node: DagId,
+        frozen: impl Fn(usize) -> bool,
+    ) -> Vec<(usize, DagId)> {
+        self.rt.redex_arguments(node, frozen)
+    }
+
     /// Build a DAG instance of `term` under `subst` (the rhs of a matched equation).
     pub fn instantiate(&mut self, term: &Term, subst: &Subst) -> DagId {
         self.rt.instantiate(&self.sig, term, subst)
@@ -8637,6 +8713,68 @@ mod tests {
         assert!(!e.set_frozen(configured, &[1, 3]));
         assert!(!e.is_frozen_arg(configured, 0));
         assert!(e.is_frozen_arg(configured, 1));
+    }
+
+    /// Rule-position enumeration addresses a repeated ACU element once, through its first non-frozen
+    /// physical copy, including equal entries that construction has not merged. Equal arguments of
+    /// every other theory stay separate positions, even when they are one shared node.
+    #[test]
+    fn redex_arguments_address_each_acu_element_once() {
+        let mut e = Engine::new();
+        let s = e.add_sort("S");
+        e.close_sorts();
+        let d = e.add_op("d", vec![], s);
+        let x = e.add_op("x", vec![], s);
+        let k = e.add_op("k", vec![s], s);
+        let pair = e.add_op("pair", vec![s, s], s);
+        let soup = e.add_op_ac("soup", vec![s, s], s, None);
+        let seq = e.add_op_au("seq", vec![s, s], s, None);
+        let swap = e.add_op_cui("swap", vec![s, s], s, true, false, None);
+
+        // A merged multiset: the three copies of `d` are physical children 0..3 and `x` is child 3.
+        let dd = e.make_const(d);
+        let xx = e.make_const(x);
+        let merged = e.make_acu(soup, vec![(dd, 3), (xx, 1)]);
+        assert_eq!(
+            e.node(merged).children().collect::<Vec<_>>(),
+            vec![dd, dd, dd, xx]
+        );
+        assert_eq!(e.redex_arguments(merged, |_| false), vec![(0, dd), (3, xx)]);
+        // A frozen copy defers the element to its next copy; with every index frozen nothing remains.
+        assert_eq!(
+            e.redex_arguments(merged, |index| index == 0),
+            vec![(1, dd), (3, xx)]
+        );
+        assert_eq!(e.redex_arguments(merged, |_| true), vec![]);
+
+        // Separately built equal elements are distinct unreduced entries, but still one position.
+        let copies: Vec<DagId> = (0..3)
+            .map(|_| {
+                let inner = e.make_const(d);
+                e.make_free(k, vec![inner])
+            })
+            .collect();
+        let unmerged = e.make_ac(soup, copies.clone());
+        let entries: Vec<DagId> = e.node(unmerged).children().collect();
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|entry| copies.contains(entry)));
+        assert_ne!(entries[0], entries[1]);
+        assert_eq!(
+            e.redex_arguments(unmerged, |_| false),
+            vec![(0, entries[0])]
+        );
+
+        // One shared node under a free, associative, or commutative operator is two positions.
+        let shared = e.make_free(k, vec![dd]);
+        let free = e.make_free(pair, vec![shared, shared]);
+        let assoc = e.make_au(seq, vec![shared, shared]);
+        let comm = e.make_cui(swap, shared, shared);
+        for node in [free, assoc, comm] {
+            assert_eq!(
+                e.redex_arguments(node, |_| false),
+                vec![(0, shared), (1, shared)]
+            );
+        }
     }
 
     /// Genuine variable leaves (`make_var` / `variable_symbol`): per-sort symbol caching in demand
@@ -10834,6 +10972,59 @@ mod tests {
         assert_eq!(e.rewrites(), 1, "s^3 -> s 0");
         let s1b = iter_num(&mut e, z, s, 1);
         assert!(e.deep_equal(r2, s1b));
+    }
+
+    /// A rule step below an iter node keeps the node's count. With `rl a => 0`, `s^3(a)` denotes
+    /// `s(s(s(a)))`, so rule-fair rewriting, position-fair rewriting, and the one-step successor that
+    /// search explores all give `s^3(0)`, not `s 0`. A rewritten argument that is itself a successor
+    /// folds in: with `rl b => s b`, one step takes `s^3(b)` to `s^4(b)`.
+    #[test]
+    fn rule_steps_below_an_iter_node_keep_its_count() {
+        let (mut e, _zero, _nznat, nat, z, s) = iter_ctx();
+        let a = e.add_op("a", vec![], nat);
+        let b = e.add_op("b", vec![], nat);
+        e.add_rule(Term::constant(a), Term::constant(z), 0);
+        e.add_rule(Term::constant(b), Term::op(s, vec![Term::constant(b)]), 0);
+        let s3_a = |e: &mut Engine| {
+            let a0 = e.make_const(a);
+            e.make_iter(s, 3, a0)
+        };
+        let expected = iter_num(&mut e, z, s, 3);
+
+        let subject = s3_a(&mut e);
+        let step = e.rewrite(subject).run(&mut e, None);
+        assert!(step.done, "rewrite reaches a normal form");
+        assert!(
+            e.deep_equal(step.term, expected),
+            "rewrite: s^3(a) => s^3(0)"
+        );
+
+        let subject = s3_a(&mut e);
+        let step = e.frewrite(subject, 1).run(&mut e, None);
+        assert!(step.done, "frewrite reaches a normal form");
+        assert!(
+            e.deep_equal(step.term, expected),
+            "frewrite: s^3(a) => s^3(0)"
+        );
+
+        let subject = s3_a(&mut e);
+        let mut search = e.search(subject, Term::var(0, nat), 1, Vec::new(), Arrow::One, None);
+        let solution = search.next_solution(&mut e).expect("one successor");
+        assert!(
+            e.deep_equal(solution.bindings[0], expected),
+            "search =>1: the successor of s^3(a) is s^3(0)"
+        );
+        assert!(search.next_solution(&mut e).is_none(), "only one successor");
+
+        let b0 = e.make_const(b);
+        let subject = e.make_iter(s, 3, b0);
+        let step = e.rewrite(subject).run(&mut e, Some(1));
+        let b1 = e.make_const(b);
+        let grown = e.make_iter(s, 4, b1);
+        assert!(
+            e.deep_equal(step.term, grown),
+            "rewrite [1]: s^3(b) => s^4(b)"
+        );
     }
 
     /// Built-in equality returns `tt` or `ff` from structural equality in one rewrite. A decided

@@ -685,7 +685,7 @@ fvu-narrow ...
 
 `fvu-narrow` implies fold mode. Prefix options select state folding and retained path data; the post-command option block selects unifier filtering and delayed filtering.
 
-**TNK-NARROW-001 — Narrowing graph.** Narrowing uses rules marked `[narrowing]`, including such rules marked `[nonexec]`. Conditional narrowing rules are Unsupported. In the current loader, such a rule is diagnosed and dropped as one invalid statement while the enclosing module and later valid statements are retained; Appendix H.4 records the exact recovery boundary. Narrowing explores non-variable, non-frozen positions and composes rule unifiers with each state's accumulated substitution.
+**TNK-NARROW-001 — Narrowing graph.** Narrowing uses rules marked `[narrowing]`, including such rules marked `[nonexec]`. Conditional narrowing rules are Unsupported. In the current loader, such a rule is diagnosed and dropped as one invalid statement while the enclosing module and later valid statements are retained; Appendix H.4 records the exact recovery boundary. Narrowing explores non-variable, non-frozen positions and composes rule unifiers with each state's accumulated substitution. Below an associative-commutative operator, the copies of a repeated element are one position; equal arguments of other operators are separate positions. When the two arguments of a commutative operator are equal, both choices give the same states modulo commutativity, and narrowing may explore only one of them.
 
 **TNK-NARROW-002 — Search options.** `fold` removes states matched by retained states. `vfold` uses variant subsumption. `filter` retains most-general unifiers; `delay` defers that filtering as defined by the search. `path` retains step substitutions and rule/position records for `show path`. `=>1`, `=>+`, `=>*`, and `=>!` have the same depth qualification as ordinary search; the second bound is narrowing depth.
 
@@ -776,6 +776,8 @@ The key is a dotted lowercase identifier matching `^[a-z](?:[a-z0-9-]*[a-z0-9])?
 ### 16.2 Reflection
 
 The reflection layer supports native descent for reduction/normalization, rewrite/frewrite/apply/xapply, match/xmatch, search/path, SMT check/search, sort queries, parsing/printing, well-formedness, up/down term and module/view components, unification, variants, variant matching, narrowing, strategy rewrite, and LEXICAL tokenize/printTokens when their hook signatures resolve.
+
+`metaXmatch` and `metaXapply` number their solutions across the positions of the reduced subject. Below an associative-commutative operator, the copies of a repeated element are one position, so a match or rewrite inside a repeated element is reported once, not once per copy. Equal arguments of any other operator are separate positions.
 
 **TNK-META-001 — Owned boundary.** Reflected module/term values are translated at the module/session boundary. Engine-local IDs never cross a child-interpreter or external-manager boundary. A metalevel operation whose `MetaOp` is `Unknown`, whose reflected value is malformed, or whose required hook cannot resolve remains inert or returns the loaded facade's explicit failure value; it MUST NOT dispatch to an unrelated operation.
 

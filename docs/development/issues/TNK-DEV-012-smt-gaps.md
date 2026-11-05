@@ -7,6 +7,7 @@
 ## Current behavior
 
 - `smt-search =>!` is unsupported and rejected without creating a search or continuation.
+- An `=>*` search reports its initial state only when the backend returns `Sat` for the initial (`such that`) constraint, except that the literal SMT `true` constraint is exempt. The exemption is provisional. The null backend answers `Unknown` for `true` as well, so it still reports the initial state of an unconstrained search whose goal has no SMT-sorted variable, yet prunes every successor, including those whose constraint is still `true`. `TNK-SMT-003` as written prunes every `Unknown`; whether a trivial constraint needs a backend `Sat` is undecided.
 - A configured backend `BadDag` result currently produces the command echo without a distinct backend-answer line.
 - `Unknown`, `BadDag`, explicit bounds, finite no-solution, and incompleteness are semantically distinct even when `Eval` cannot represent every distinction structurally.
 

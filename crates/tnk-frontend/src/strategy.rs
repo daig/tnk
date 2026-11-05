@@ -28,7 +28,7 @@ use crate::load::{
 use crate::surface::ast::{StratExpr, StratSugar, TestKind};
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::rc::Rc;
-use tnk_core::dag::DagId;
+use tnk_core::dag::{DagId, NodeRepr};
 use tnk_core::engine::Engine;
 use tnk_core::host::ReducerFault;
 use tnk_core::sort::KindId;
@@ -2199,7 +2199,8 @@ fn subterm_at(eng: &Engine, root: DagId, path: &[usize]) -> DagId {
     node
 }
 
-/// `root` with the subterm at `path` replaced by `new` (rebuilding the spine, theory-aware).
+/// `root` with the subterm at `path` replaced by `new` (rebuilding the spine, theory-aware). An `iter`
+/// ancestor `f^n(...)` keeps its count `n`; `make_node` would build a single application of `f`.
 fn replace_at(eng: &mut Engine, root: DagId, path: &[usize], new: DagId) -> DagId {
     let Some((&head, rest)) = path.split_first() else {
         return new;
@@ -2207,7 +2208,16 @@ fn replace_at(eng: &mut Engine, root: DagId, path: &[usize], new: DagId) -> DagI
     let sym = eng.node(root).symbol();
     let mut kids: Vec<DagId> = eng.node(root).children().collect();
     kids[head] = replace_at(eng, kids[head], rest, new);
-    eng.make_node(sym, kids)
+    let iter_count = match eng.node(root).repr() {
+        NodeRepr::Iter { count, .. } => Some(count),
+        _ => None,
+    };
+    match iter_count {
+        Some(count) => eng
+            .make_iter_decimal(sym, &count, kids[0])
+            .expect("an iteration count is a decimal numeral"),
+        None => eng.make_node(sym, kids),
+    }
 }
 
 /// Deduplicate solutions by `deep_equal`, keeping the first occurrence + its count.
