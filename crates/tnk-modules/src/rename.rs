@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use tnk_frontend::lex::{Frag, Interner, Sym, Token, split_mixfix, tokenize};
 use tnk_frontend::load::{ConditionPiece, condition_pieces};
 use tnk_frontend::rename_terms::{
-    OpRenamer, ReconTarget, ViewOpMap, ViewOpSubst, rewrite_op_hook_signature_by,
+    OpRenamer, ProfileSorts, ReconTarget, ViewOpMap, ViewOpSubst, rewrite_op_hook_signature_by,
 };
 use tnk_frontend::surface::ast::{Attrs, ModuleKind, PreModule, RenameItem, Statement, StratExpr};
 
@@ -79,7 +79,14 @@ pub fn apply_renaming(
             target: ReconTarget::Op(s.to.clone()),
         })
         .collect();
-    let structural = ViewOpSubst::new(&premodule_of(&d), &structural_maps, interner)?;
+    // The declaration loop below matches a profile by its spelling, so a profile resolves sort names only:
+    // a resolved kind spelling could rename statement occurrences without the declaration.
+    let structural = ViewOpSubst::new(
+        &premodule_of(&d),
+        &structural_maps,
+        ProfileSorts::SortsOnly,
+        interner,
+    )?;
     let grammar_renames: Vec<(String, Option<usize>, String)> = op_renames
         .iter()
         .filter(|s| s.dom_range.is_some())

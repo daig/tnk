@@ -362,6 +362,8 @@ In `ops` and `msgs`, each top-level parenthesized group is one OpName, and its p
 
 A user sort identifier cannot contain `.`. Bracketed sort names denote kinds; structured sorts and parameter sorts such as `List{Nat}` and `X$Elt` are semantic names, not punctuation-free aliases.
 
+In a `var`/`vars` name list, in a module or a view, a `,` token separates names and is never itself declared: `vars W, X : S .` declares exactly `W` and `X`, like `vars W X : S .`. A `,` in a term is therefore never a declared variable.
+
 ### 5.3 Operator attributes
 
 | Attribute | TNK behavior |
@@ -1335,7 +1337,7 @@ Rename       ::= "sort" SortName "to" SortName
                | "msg" OpName "to" OpName
 ```
 
-The matching close keyword is required. Module-kind gates are normative in `TNK-MOD-001`. `op` and `msg` take one OpName. In `ops` and `msgs`, the `OpName+` list holds one OpName per top-level parenthesized group and one per remaining token (§5.2). `class`/`classes` use the parser's class-list surface; `msg`/`msgs` reuse operator declaration syntax but are object-only. `csd` is accepted but its conditional execution is Unsupported.
+The matching close keyword is required. Module-kind gates are normative in `TNK-MOD-001`. `op` and `msg` take one OpName. In `ops` and `msgs`, the `OpName+` list holds one OpName per top-level parenthesized group and one per remaining token (§5.2). In `VarDecl`, a `,` separates names and is not a declared `Name` (§5.2). `class`/`classes` use the parser's class-list surface; `msg`/`msgs` reuse operator declaration syntax but are object-only. `csd` is accepted but its conditional execution is Unsupported.
 
 ### D.1 Command grammar
 

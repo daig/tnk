@@ -1231,4 +1231,61 @@ mod tests {
             "S"
         );
     }
+
+    /// `vars W, X : S .` declares only `W` and `X` (§5.2). A declared `,` was inlined as a variable into
+    /// every argument separator of composed statements: the instantiated membership and conditional
+    /// equation (`PM{VN}`) and the importer equation whose `,` collided with an imported one at another
+    /// sort (`UPPER` over `LOWER`) were dropped.
+    #[test]
+    fn comma_separated_var_list_keeps_composed_statements() {
+        assert_program_results(
+            "fth TRIV2 is sort Item . endfth\n\
+             fmod PM{P :: TRIV2} is\n\
+               sorts Same{P} Pair{P} . subsort Same{P} < Pair{P} .\n\
+               op pair : P$Item P$Item -> Pair{P} .\n\
+               op pick : P$Item P$Item -> P$Item .\n\
+               vars W, X : P$Item .\n\
+               mb pair(W, W) : Same{P} .\n\
+               ceq pick(W, X) = X if pair(W, X) : Same{P} .\n\
+             endfm\n\
+             fmod NUMS is sort Num . ops n1 n2 : -> Num . endfm\n\
+             view VN from TRIV2 to NUMS is sort Item to Num . endv\n\
+             fmod USE is inc PM{VN} . endfm\n\
+             red pair(n1, n1) .\n\
+             red pick(n2, n2) .\n\
+             fmod LOWER is sort S . ops s1 s2 : -> S . op f : S S -> S . vars A, B : S .\n\
+               eq f(A, B) = A .\n\
+             endfm\n\
+             fmod UPPER is inc LOWER . sort T . ops t1 t2 : -> T . op g : T T -> T . vars C, D : T .\n\
+               eq g(C, D) = D .\n\
+             endfm\n\
+             red g(t1, t2) .\n",
+            &[
+                e("Same{VN}", "pair(n1, n1)", 1),
+                e("Num", "n2", 2),
+                e("T", "t2", 1),
+            ],
+        );
+    }
+
+    /// A view with a comma-separated `vars` list reads the mixfix source `{ L , R }` as the theory
+    /// operator `{_,_}` applied to `L` and `R`. A declared `,` made it the undefined source `{___}`.
+    #[test]
+    fn view_comma_var_list_maps_mixfix_comma_source() {
+        assert_program_results(
+            "fth CPL is sort E . op {_,_} : E E -> E . endfth\n\
+             fmod TGT is sort D . ops d1 d2 : -> D . op tw : D D -> D . endfm\n\
+             view VW from CPL to TGT is\n\
+               sort E to D .\n\
+               vars L, R : E .\n\
+               op { L , R } to term tw(R, L) .\n\
+             endv\n\
+             fmod BOTH{P :: CPL} is op both : P$E P$E -> P$E . vars M N : P$E .\n\
+               eq both(M, N) = {M, N} .\n\
+             endfm\n\
+             fmod USE is inc BOTH{VW} . endfm\n\
+             red both(d1, d2) .\n",
+            &[e("D", "tw(d2, d1)", 1)],
+        );
+    }
 }

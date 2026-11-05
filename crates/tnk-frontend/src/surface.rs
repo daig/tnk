@@ -4,3 +4,4 @@
 
 pub mod ast;
 pub mod parser;
+pub mod sort_spelling;

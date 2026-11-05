@@ -8,11 +8,14 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use tnk_frontend::lex::{Interner, Token, tokenize};
-use tnk_frontend::rename_terms::{ReconTarget, ViewOpMap, ViewOpSubst, rewrite_op_hook_signature};
+use tnk_frontend::rename_terms::{
+    ProfileSorts, ReconTarget, ViewOpMap, ViewOpSubst, rewrite_op_hook_signature,
+};
 use tnk_frontend::surface::ast::{
     Attrs, ModuleExpr, ModuleKind, OpDecl, OpMap, PreModule, RenameItem, Statement, StratExpr,
     VarDecl, ViewDecl,
 };
+use tnk_frontend::surface::sort_spelling::{kind_components, map_sort_spelling};
 
 use crate::db::ModuleDb;
 use crate::rename::apply_renaming;
@@ -1224,8 +1227,9 @@ fn unchain(expr: &ModuleExpr) -> Option<(&str, Vec<&[ModuleExpr]>)> {
 /// Substitute an instantiation's parameter names into a renaming's structured sort names,
 /// positionally (`Array{X,Y}` over `ARRAY{X :: TRIV, Y :: TRIV}` instantiated `{Nat, Int0}` →
 /// `Array{Nat,Int0}`; the `to` side likewise, `Vector{Y}` → `Vector{Int0}`), so the rename items
-/// match the instance's sort spellings. Non-structured names and op items pass through (an op
-/// rename's from/to get the same brace-argument treatment).
+/// match the instance's sort spellings. A kind spelling in a sort position substitutes each component
+/// (`[List{X}]` → `[List{Nat}]`). Non-structured names and op items pass through (an op rename's
+/// from/to get the same brace-argument treatment).
 fn subst_rename_item_params(
     inner: &ModuleExpr,
     args: &[ModuleExpr],
@@ -1245,12 +1249,19 @@ fn subst_rename_item_params(
         .map(|(p, a)| (p.name.as_str(), canonical_key(a)))
         .collect();
     let subst = |name: &str| subst_brace_args(name, &map);
+    let subst_sort = |name: &str| match kind_components(name) {
+        Some(components) => {
+            let substituted: Vec<String> = components.iter().map(|c| subst(c)).collect();
+            format!("[{}]", substituted.join(","))
+        }
+        None => subst(name),
+    };
     items
         .iter()
         .map(|it| match it {
             RenameItem::Sort { from, to } => RenameItem::Sort {
-                from: subst(from),
-                to: subst(to),
+                from: subst_sort(from),
+                to: subst_sort(to),
             },
             RenameItem::Op {
                 from,
@@ -1264,7 +1275,7 @@ fn subst_rename_item_params(
                 attrs: attrs.clone(),
                 dom_range: dom_range
                     .as_ref()
-                    .map(|(d, r)| (d.iter().map(|s| subst(s)).collect(), subst(r))),
+                    .map(|(d, r)| (d.iter().map(|s| subst_sort(s)).collect(), subst_sort(r))),
             },
             other => other.clone(),
         })
@@ -1372,14 +1383,21 @@ fn instantiate(
                     map.source = format!("{}${}", param.name, map.source);
                 }
                 if let Some((domain, range)) = &mut map.dom_range {
-                    for sort in domain {
-                        if theory_sorts.contains(sort) {
-                            *sort = format!("{}${sort}", param.name);
+                    // A selector sort may be a kind spelling (`op f : [Elt] -> [Elt] to g`), whose
+                    // theory-owned components are qualified one by one.
+                    let qualify = |sort: &mut String| {
+                        if let Some(qualified) = map_sort_spelling(sort, |component| {
+                            theory_sorts
+                                .contains(component)
+                                .then(|| format!("{}${component}", param.name))
+                        }) {
+                            *sort = qualified;
                         }
+                    };
+                    for sort in domain {
+                        qualify(sort);
                     }
-                    if theory_sorts.contains(range) {
-                        *range = format!("{}${range}", param.name);
-                    }
+                    qualify(range);
                 }
                 map
             }));
@@ -1559,7 +1577,8 @@ fn apply_view_op_recon(
     }
     src.vars.retain(|vd| !vd.names.is_empty());
     src.vars.extend(d.vars.iter().cloned());
-    let Some(mapper) = ViewOpSubst::new(&src, op_recon, interner)? else {
+    let Some(mapper) = ViewOpSubst::new(&src, op_recon, ProfileSorts::SortsAndKinds, interner)?
+    else {
         return Ok(());
     };
     // Identities and host term hooks are ground term bubbles. Op hooks carry declaration signatures:
@@ -2338,9 +2357,14 @@ fn subst_bubble(
 /// by-parameter binding); a structured sort `Base{a, …}` has each argument instantiated (a bare parameter
 /// name `X` becomes its view/argument name, the instance-naming rule); anything else is unchanged.
 fn inst_sort(name: &str, bindings: &HashMap<String, ParamBinding>) -> String {
-    // A kind sort `[S]` instantiates its inner sort (`[Y$Elt] ↦ [Nat]`, MAP's `op undefined : -> [Y$Elt]`).
-    if let Some(inner) = name.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-        return format!("[{}]", inst_sort(inner, bindings));
+    // A kind spelling instantiates each of its component sorts (`[Y$Elt] ↦ [Nat]`, MAP's
+    // `op undefined : -> [Y$Elt]`; `[S{X},T{X}] ↦ [S{V},T{V}]`). Its bracket text is not one sort name.
+    if let Some(components) = kind_components(name) {
+        let instantiated: Vec<String> = components
+            .iter()
+            .map(|component| inst_sort(component, bindings))
+            .collect();
+        return format!("[{}]", instantiated.join(","));
     }
     if let Some((base, groups)) = split_structured(name) {
         let mut instantiated = base.to_string();
@@ -2664,6 +2688,89 @@ fmod TOP is protecting L . protecting R . endfm
             .expect("cons");
         assert_eq!(cons.domain, ["X$Elt", "List{X}"]);
         assert_eq!(cons.range, "List{X}");
+    }
+
+    /// Instantiation rewrites every component of a multi-sort kind spelling (TNK-MOD-004): the bracket
+    /// text is not one sort name. Structured components, parameter sorts, and either order instantiate.
+    #[test]
+    fn instantiation_substitutes_every_kind_component() {
+        let (db, views, mut i) = db_of(
+            "fth TRIV is sort Elt . endfth\n\
+             fmod COLOR is sort Hue . op red : -> Hue [ctor] . endfm\n\
+             view V from TRIV to COLOR is sort Elt to Hue . endv\n\
+             fmod K{X :: TRIV} is\n\
+               sorts S{X} T{X} L{X} .\n\
+               subsort X$Elt < S{X} T{X} L{X} .\n\
+               op fa : [S{X},T{X}] -> [S{X},T{X}] .\n\
+               op fb : [X$Elt,S{X}] -> [X$Elt] .\n\
+               op fc : [L{X},X$Elt] -> [L{X}] .\n\
+               var W : [S{X},T{X}] .\n\
+             endfm\n\
+             fmod USE is protecting K{V} . endfm\n",
+        );
+        let flat = flatten("USE", &db, &views, &mut i).expect("flatten");
+        let profile = |name: &str| {
+            let op = flat
+                .ops
+                .iter()
+                .find(|o| i.resolve(o.name[0].sym) == name)
+                .unwrap_or_else(|| panic!("op {name}"));
+            (op.domain.clone(), op.range.clone())
+        };
+        assert_eq!(
+            profile("fa"),
+            (vec!["[S{V},T{V}]".to_string()], "[S{V},T{V}]".to_string())
+        );
+        assert_eq!(
+            profile("fb"),
+            (vec!["[Hue,S{V}]".to_string()], "[Hue]".to_string())
+        );
+        assert_eq!(
+            profile("fc"),
+            (vec!["[L{V},Hue]".to_string()], "[L{V}]".to_string())
+        );
+        let w = flat
+            .vars
+            .iter()
+            .find(|v| v.names.iter().any(|n| n == "W"))
+            .expect("var W");
+        assert_eq!(w.sort, "[S{V},T{V}]");
+    }
+
+    /// The rename items of an instantiated renamed module `(M * R){V}` take the instance's parameter
+    /// names inside kind-spelled profile sorts as well as in structured sort names.
+    #[test]
+    fn renamed_instance_substitutes_kind_profile_parameters() {
+        let (db, _, mut i) = db_of(
+            "fth TRIV is sort Elt . endfth\n\
+             fmod L{X :: TRIV} is sort List{X} . op f : [List{X}] -> [List{X}] . endfm\n",
+        );
+        let toks = tokenize(
+            "fmod U is inc (L * (sort List{X} to Seq{X}, \
+             op f : [List{X}] X$Elt -> [List{X},X$Elt] to g)){V} . endfm",
+            &mut i,
+        );
+        let source = Parser::new(&toks, &i).parse_source().expect("parse");
+        let ModuleExpr::Instantiation(base, args) = &source.modules[0].imports[0].expr else {
+            panic!("instantiated import");
+        };
+        let ModuleExpr::Rename(inner, items) = &**base else {
+            panic!("renamed base");
+        };
+        let items = subst_rename_item_params(inner, args, &db, items);
+        assert!(
+            matches!(&items[0], RenameItem::Sort { from, to } if from == "List{V}" && to == "Seq{V}"),
+            "structured sort item"
+        );
+        let RenameItem::Op {
+            dom_range: Some((domain, range)),
+            ..
+        } = &items[1]
+        else {
+            panic!("profiled op item");
+        };
+        assert_eq!(domain, &["[List{V}]", "X$Elt"]);
+        assert_eq!(range, "[List{V},X$Elt]");
     }
 
     /// An undefined imported module is a loud error.

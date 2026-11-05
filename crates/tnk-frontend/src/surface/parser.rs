@@ -322,6 +322,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The names of a module or view `var`/`vars` declaration, up to its `:`. A `,` token separates
+    /// names and is never itself declared (§5.2): `vars W, X : S .` declares exactly `W` and `X`. A
+    /// declared `,` would otherwise be a variable alias that every name-matching pass over statement and
+    /// view-mapping tokens (instantiation inlining, view source patterns, reflected views) mistakes for
+    /// a variable occurrence.
+    fn var_names(&mut self) -> PResult<Vec<String>> {
+        let mut names = Vec::new();
+        while !self.at(":") {
+            if self.at(",") {
+                self.advance();
+            } else {
+                names.push(self.name()?);
+            }
+        }
+        Ok(names)
+    }
+
     /// Synthetic tokens for the class-attribute suffix `` `:_ ``.
     fn attribute_suffix(&self, line: u32) -> [Token; 2] {
         let fragment = |text| Token {
@@ -1254,10 +1271,7 @@ impl<'a> Parser<'a> {
                 }
                 "var" | "vars" => {
                     self.advance();
-                    let mut names = Vec::new();
-                    while !self.at(":") {
-                        names.push(self.name()?);
-                    }
+                    let names = self.var_names()?;
                     self.eat(":")?;
                     let sort = self.sort_name()?;
                     self.eat_dot()?;
@@ -1510,10 +1524,7 @@ impl<'a> Parser<'a> {
             }
             "var" | "vars" => {
                 self.advance();
-                let mut names = Vec::new();
-                while !self.at(":") {
-                    names.push(self.name()?);
-                }
+                let names = self.var_names()?;
                 self.eat(":")?;
                 let sort = self.sort_name()?;
                 self.eat_dot()?;
@@ -3528,6 +3539,24 @@ endv
             matches!(&v.op_maps[1], OpMap::Term { .. }),
             "op 0 to term zero"
         );
+    }
+
+    /// A `,` in a module or view `var`/`vars` name list separates names and is never itself declared
+    /// (§5.2), whether spaced or glued to the names.
+    #[test]
+    fn var_name_lists_treat_commas_as_separators() {
+        let s = parse(
+            "fmod M is sort S .\n\
+               vars W, X : S .\n\
+               vars Y,Z : S .\n\
+             endfm\n\
+             view V from T to M is\n\
+               vars L, R : E .\n\
+             endv\n",
+        );
+        let names = |vars: &[VarDecl]| vars.iter().map(|d| d.names.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&s.modules[0].vars), [vec!["W", "X"], vec!["Y", "Z"]]);
+        assert_eq!(names(&s.views[0].vars), [vec!["L", "R"]]);
     }
 
     #[test]

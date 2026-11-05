@@ -19,6 +19,7 @@ use crate::load::{ConditionPiece, condition_pieces};
 use crate::sig::build_sig::{build_module, canonical_name, resolve_sort};
 use crate::sig::syntax::BuiltModule;
 use crate::surface::ast::PreModule;
+use crate::surface::sort_spelling::{kind_components, kind_representative};
 use std::collections::{HashMap, HashSet};
 
 type RenameTarget = (Option<usize>, Vec<String>);
@@ -213,6 +214,18 @@ pub struct ViewOpMap {
     pub target: ReconTarget,
 }
 
+/// The sort spellings a signature-qualified [`ViewOpMap`] profile may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProfileSorts {
+    /// Declared sort names only; a kind spelling is an unknown source sort. Operator renamings use this:
+    /// their declaration-side selection compares spelled profiles, so a kind profile resolved here could
+    /// rename statement occurrences without the declaration they belong to.
+    SortsOnly,
+    /// Sort names and kind spellings (`[Elt]`, `[A,B]`); a kind spelling denotes the error sort of the
+    /// kind of its first component. View operator maps use this.
+    SortsAndKinds,
+}
+
 /// Rewrite the referenced operator at the head of an `op-hook` signature. Signature-qualified maps
 /// compare complete structured sort/kind names; both source arrows accepted by the surface syntax are
 /// recognized. Operator-to-term maps cannot name an operator hook and are deliberately left unchanged
@@ -357,10 +370,12 @@ pub struct ViewOpSubst {
 impl ViewOpSubst {
     /// Build over `pm` (the source parameterized module, flattened with its parameter copies so the theory
     /// operators and its variables are in scope). `Ok(None)` if `maps` is empty; an exact source profile is
-    /// resolved to the same symbol identity carried by the source grammar.
+    /// resolved to the same symbol identity carried by the source grammar. `profile_sorts` says whether a
+    /// profile may spell a sort as a kind.
     pub fn new(
         pm: &PreModule,
         maps: &[ViewOpMap],
+        profile_sorts: ProfileSorts,
         interner: &mut Interner,
     ) -> Result<Option<Self>, String> {
         if maps.is_empty() {
@@ -368,6 +383,19 @@ impl ViewOpSubst {
         }
         let built = build_syntax_module(pm, interner)?;
         let grammar = CompiledGrammar::compile(&build_grammar(&built, interner));
+        let resolve = |sort: &String| {
+            let resolved = match profile_sorts {
+                ProfileSorts::SortsAndKinds if kind_components(sort).is_some() => {
+                    let sorts = built.engine.sorts();
+                    built
+                        .sorts
+                        .get(kind_representative(sort))
+                        .map(|&member| sorts.error_sort(sorts.kind_of(member)))
+                }
+                _ => built.sorts.get(sort).copied(),
+            };
+            resolved.ok_or_else(|| format!("unknown source sort `{sort}` in view operator map"))
+        };
         let mut symbol_targets = HashMap::new();
         let mut name_targets = HashMap::new();
         for map in maps {
@@ -375,20 +403,8 @@ impl ViewOpSubst {
                 name_targets.insert(map.source.clone(), map.target.clone());
                 continue;
             };
-            let domain_ids: Vec<_> =
-                domain
-                    .iter()
-                    .map(|sort| {
-                        built.sorts.get(sort).copied().ok_or_else(|| {
-                            format!("unknown source sort `{sort}` in view operator map")
-                        })
-                    })
-                    .collect::<Result<_, _>>()?;
-            let range_id = built
-                .sorts
-                .get(range)
-                .copied()
-                .ok_or_else(|| format!("unknown source sort `{range}` in view operator map"))?;
+            let domain_ids: Vec<_> = domain.iter().map(resolve).collect::<Result<_, _>>()?;
+            let range_id = resolve(range)?;
             let symbols: HashSet<_> = built
                 .op_profiles
                 .iter()
@@ -840,6 +856,7 @@ mod tests {
                 dom_range: None,
                 target: ReconTarget::Op("h".into()),
             }],
+            ProfileSorts::SortsAndKinds,
             &mut i,
         )
         .expect("build")
@@ -890,9 +907,14 @@ mod tests {
              var X : E . var Y : S . endfm",
             &mut i,
         );
-        let mapper = ViewOpSubst::new(&pm, &[op_map("_,_", "_;_")], &mut i)
-            .expect("build")
-            .expect("mapper");
+        let mapper = ViewOpSubst::new(
+            &pm,
+            &[op_map("_,_", "_;_")],
+            ProfileSorts::SortsAndKinds,
+            &mut i,
+        )
+        .expect("build")
+        .expect("mapper");
         assert_eq!(
             substituted(&mapper, "ins(X, Y)", &mut i),
             ("ins ( X , Y )".into(), true)
@@ -920,9 +942,14 @@ mod tests {
              vars X Y : B . endfm",
             &mut i,
         );
-        let mapper = ViewOpSubst::new(&pm, &[op_map("_+_", "_*_"), op_map("_,_", "_;_")], &mut i)
-            .expect("build")
-            .expect("mapper");
+        let mapper = ViewOpSubst::new(
+            &pm,
+            &[op_map("_+_", "_*_"), op_map("_,_", "_;_")],
+            ProfileSorts::SortsOnly,
+            &mut i,
+        )
+        .expect("build")
+        .expect("mapper");
         assert_eq!(
             substituted(&mapper, "p(X, Y)", &mut i),
             ("p ( X , Y )".into(), true)
@@ -939,6 +966,7 @@ mod tests {
                 dom_range: Some((vec!["B".into()], "A".into())),
                 target: ReconTarget::Op("g".into()),
             }],
+            ProfileSorts::SortsOnly,
             &mut i,
         )
         .expect("build")
@@ -961,9 +989,14 @@ mod tests {
              op lt : S S -> B . op _+_ : S S -> S . var X : S . endm",
             &mut i,
         );
-        let mapper = ViewOpSubst::new(&pm, &[op_map("lt", "_<<_"), op_map("_+_", "plus")], &mut i)
-            .expect("build")
-            .expect("mapper");
+        let mapper = ViewOpSubst::new(
+            &pm,
+            &[op_map("lt", "_<<_"), op_map("_+_", "plus")],
+            ProfileSorts::SortsAndKinds,
+            &mut i,
+        )
+        .expect("build")
+        .expect("mapper");
         let bubble = tokenize(
             "lt(X, a) = tt /\\ X := a + b /\\ a + X : S /\\ lt(a, b) /\\ X + a => b",
             &mut i,
@@ -1001,9 +1034,10 @@ mod tests {
              op __ : S S -> S [ctor assoc] . op _+_ : S S -> S . op g : S S -> S . endfm",
             &mut i,
         );
-        let juxtaposition = ViewOpSubst::new(&pm, &[op_map("__", "_;_")], &mut i)
-            .expect("build")
-            .expect("mapper");
+        let juxtaposition =
+            ViewOpSubst::new(&pm, &[op_map("__", "_;_")], ProfileSorts::SortsOnly, &mut i)
+                .expect("build")
+                .expect("mapper");
         assert_eq!(
             substituted(&juxtaposition, "a b", &mut i),
             ("( ( a ) ; ( b ) )".into(), true)
@@ -1013,12 +1047,51 @@ mod tests {
             ("g ( a , b ) = c".into(), false)
         );
 
-        let plus = ViewOpSubst::new(&pm, &[op_map("_+_", "_*_")], &mut i)
-            .expect("build")
-            .expect("mapper");
+        let plus = ViewOpSubst::new(
+            &pm,
+            &[op_map("_+_", "_*_")],
+            ProfileSorts::SortsOnly,
+            &mut i,
+        )
+        .expect("build")
+        .expect("mapper");
         assert_eq!(
             substituted(&plus, "a + b = c", &mut i),
             ("( ( a ) * ( b ) ) = c".into(), false)
         );
+    }
+
+    /// A view map's kind-spelled profile selects the overload declared at that kind (through any of its
+    /// sorts); operator renamings keep resolving profile sorts by sort name only.
+    #[test]
+    fn kind_profiles_resolve_for_view_maps_only() {
+        let mut i = Interner::new();
+        let source = tokenize(
+            "fmod KIND-MAP is sorts A B . subsort A < B . op a : -> A . \
+             op f : [A] -> [A] . op f : B B -> B . endfm",
+            &mut i,
+        );
+        let pm = Parser::new(&source, &i)
+            .parse_source()
+            .expect("parse source")
+            .modules
+            .remove(0);
+        let maps = [ViewOpMap {
+            source: "f".into(),
+            dom_range: Some((vec!["[B,A]".into()], "[A]".into())),
+            target: ReconTarget::Op("g".into()),
+        }];
+        let mapper = ViewOpSubst::new(&pm, &maps, ProfileSorts::SortsAndKinds, &mut i)
+            .expect("build")
+            .expect("mapper");
+        let bubble = tokenize("f(f(a, a))", &mut i);
+        let rewritten = mapper.rewrite(&bubble, &mut i);
+        let text: String = rewritten.iter().map(|t| i.resolve(t.sym)).collect();
+        assert_eq!(text, "g(f(a,a))");
+
+        let err = ViewOpSubst::new(&pm, &maps, ProfileSorts::SortsOnly, &mut i)
+            .err()
+            .expect("kind profile rejected");
+        assert!(err.contains("unknown source sort `[B,A]`"), "got: {err}");
     }
 }

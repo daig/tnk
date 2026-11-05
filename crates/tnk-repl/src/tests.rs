@@ -6286,3 +6286,182 @@ fn narrowing_rules_with_unlexed_variable_names_load_and_narrow() {
         "{narrowed}"
     );
 }
+
+/// `vars U, V : P$Item .` declares only `U` and `V` (§5.2). A declared `,` was inlined as a variable into
+/// the argument separators of the instantiated rule `back`, which was dropped, and of the instantiated
+/// match pattern of `go`, which silently found no solution although its `swap` rule was intact.
+#[test]
+fn comma_var_list_instantiated_rule_and_strategy_through_repl() {
+    let out = repl()
+        .eval(concat!(
+            "fth TRIV2 is sort Item . endfth\n",
+            "mod RPAIR{P :: TRIV2} is\n",
+            "  sort Pair{P} .\n",
+            "  op <_;_> : P$Item P$Item -> Pair{P} .\n",
+            "  ops sw bk : P$Item P$Item -> Pair{P} .\n",
+            "  vars U V : P$Item .\n",
+            "  rl [swap] : sw(U, V) => < V ; U > .\n",
+            "endm\n",
+            "smod SPAIR{P :: TRIV2} is\n",
+            "  pr RPAIR{P} .\n",
+            "  vars U, V : P$Item .\n",
+            "  rl [back] : bk(U, V) => sw(V, U) .\n",
+            "  strat go @ Pair{P} .\n",
+            "  sd go := match sw(U, V) ; swap .\n",
+            "endsm\n",
+            "fmod NUMS is sort Num . ops n1 n2 : -> Num . endfm\n",
+            "view VN from TRIV2 to NUMS is sort Item to Num . endv\n",
+            "smod USE is\n",
+            "  pr SPAIR{VN} .\n",
+            "endsm\n",
+            "rew bk(n1, n2) .\n",
+            "srew sw(n1, n2) using go .\n",
+        ))
+        .output;
+    assert!(!out.contains("dropped"), "{out}");
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(
+        results,
+        [
+            "result Pair{VN}: < n1 ; n2 >",
+            "result Pair{VN}: < n2 ; n1 >"
+        ],
+        "rule and strategy results: {out}"
+    );
+    assert!(out.contains("Solution 1"), "{out}");
+}
+
+/// `upView` reifies the operator-to-term maps of views with a comma-separated `vars` list. A declared
+/// `,` was qualified like a view variable, so the reflected terms of the installed prefix-source view `VP`
+/// did not parse and `upView('VP)` stayed unreduced; the mixfix-source view `VM` was not even installed.
+#[test]
+fn up_view_with_comma_var_list_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude"));
+    let out = r
+        .eval(concat!(
+            "fth CPLP is sort E . op mk : E E -> E . endfth\n",
+            "fth CPLM is sort E . op {_,_} : E E -> E . endfth\n",
+            "fmod TGT is sort D . op tw : D D -> D . endfm\n",
+            "view VP from CPLP to TGT is\n",
+            "  sort E to D .\n",
+            "  vars L, R : E .\n",
+            "  op mk(L, R) to term tw(R, L) .\n",
+            "endv\n",
+            "view VM from CPLM to TGT is\n",
+            "  sort E to D .\n",
+            "  vars L, R : E .\n",
+            "  op { L , R } to term tw(L, R) .\n",
+            "endv\n",
+            "red in META-LEVEL : upView('VP) .\n",
+            "red in META-LEVEL : upView('VM) .\n",
+        ))
+        .output;
+    assert!(
+        out.contains("op 'mk['L:E, 'R:E] to term 'tw['R:D, 'L:D] ."),
+        "prefix source map: {out}"
+    );
+    assert!(
+        out.contains("op '`{_`,_`}['L:E, 'R:E] to term 'tw['L:D, 'R:D] ."),
+        "mixfix source map: {out}"
+    );
+}
+
+/// Instantiation rewrites every component of a multi-sort kind spelling. `[S{X},T{X}]` used to stay
+/// uninstantiated and `[X$Elt,S{X}]` became `[X$Elt,S{VH}]`, so both instances were rejected with
+/// `unknown sort … in kind …`.
+#[test]
+fn multi_sort_kind_instantiation_through_repl() {
+    let out = repl()
+        .eval(concat!(
+            "fth THUE is sort Elt . endfth\n",
+            "fmod KPAIR{X :: THUE} is\n",
+            "  sorts S{X} T{X} .\n",
+            "  subsort X$Elt < S{X} T{X} .\n",
+            "  op both : [S{X},T{X}] -> [S{X},T{X}] .\n",
+            "  op mixed : [X$Elt,S{X}] -> [X$Elt] .\n",
+            "endfm\n",
+            "fmod HUES is sort Hue . op teal : -> Hue . endfm\n",
+            "view VH from THUE to HUES is sort Elt to Hue . endv\n",
+            "fmod USE-KPAIR is inc KPAIR{VH} . endfm\n",
+            "red both(teal) .\n",
+            "red mixed(teal) .\n",
+        ))
+        .output;
+    assert!(!out.contains("error"), "{out}");
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(
+        results,
+        [
+            "result [S{VH},T{VH}]: both(teal)",
+            "result [S{VH},T{VH}]: mixed(teal)"
+        ],
+        "{out}"
+    );
+}
+
+/// View operator-map selectors may spell their sorts as kinds (Appendix D `OpSelector`). Such views
+/// used to be rejected (`source operator … is not defined`); now they install, and an instantiation
+/// applies the map: the selector's theory components are parameter-qualified (`[Elt]` to `[X$Elt]`)
+/// and the kind resolves to the overload declared at it.
+#[test]
+fn kind_spelled_view_selectors_through_repl() {
+    let out = repl()
+        .eval(concat!(
+            "fmod ZBASE is sort Z . endfm\n",
+            "fth TZ is pr ZBASE . sort Elt . subsort Elt < Z . op f : [Z] -> [Z] . endfth\n",
+            "fth TS is sort Elt . op k : Elt -> Elt . endfth\n",
+            "fmod PZ{X :: TZ} is\n",
+            "  op h : X$Elt -> [Z] .\n",
+            "  var Y : X$Elt .\n",
+            "  eq h(Y) = f(Y) .\n",
+            "endfm\n",
+            "fmod MZ is\n",
+            "  pr ZBASE .\n",
+            "  sort N . subsort N < Z .\n",
+            "  op n : -> N .\n",
+            "  op g : [Z] -> [Z] .\n",
+            "  op k2 : N -> N .\n",
+            "endfm\n",
+            "view VZ from TZ to MZ is sort Elt to N . op f : [Elt] -> [Elt] to g . endv\n",
+            "view VZ2 from TZ to MZ is sort Elt to N . op f : [Z,Elt] -> [Elt] to g . endv\n",
+            "view VS from TS to MZ is sort Elt to N . op k : [Elt] -> [Elt] to k2 . endv\n",
+            "show views .\n",
+            "fmod UZ is inc PZ{VZ} . endfm\n",
+            "red h(n) .\n",
+            "fmod UZ2 is inc PZ{VZ2} . endfm\n",
+            "red h(n) .\n",
+        ))
+        .output;
+    assert!(!out.contains("error"), "{out}");
+    assert!(out.contains("views: VZ VZ2 VS"), "{out}");
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(results, ["result [Z]: g(n)", "result [Z]: g(n)"], "{out}");
+}
+
+/// A view variable declared at a kind (`var W : [Elt]`) used to be rejected (`variable sort `[Elt]` is
+/// not a source theory sort`); it now takes the kind of its sort image in the target.
+#[test]
+fn kind_sorted_view_variable_through_repl() {
+    let out = repl()
+        .eval(concat!(
+            "fth TW is sort Elt . op f : Elt -> Elt . endfth\n",
+            "fmod PW{X :: TW} is\n",
+            "  op h : X$Elt -> X$Elt .\n",
+            "  var Y : X$Elt .\n",
+            "  eq h(Y) = f(Y) .\n",
+            "endfm\n",
+            "fmod MW is sort N . op n : -> N . op g : [N] -> N . endfm\n",
+            "view VW from TW to MW is\n",
+            "  sort Elt to N .\n",
+            "  var W : [Elt] .\n",
+            "  op f(W) to term g(W) .\n",
+            "endv\n",
+            "fmod UW is inc PW{VW} . endfm\n",
+            "red h(n) .\n",
+        ))
+        .output;
+    assert!(!out.contains("error"), "{out}");
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(results, ["result N: g(n)"], "{out}");
+}

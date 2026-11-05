@@ -10,6 +10,7 @@ use tnk_frontend::lex::{Interner, Token};
 use tnk_frontend::load::{build_loaded_module_with_host_functions, build_logic_command_parses};
 use tnk_frontend::sig::syntax::{BuiltModule, OpProfile};
 use tnk_frontend::surface::ast::{ModuleExpr, OpMap, VarDecl, ViewDecl};
+use tnk_frontend::surface::sort_spelling::{kind_components, kind_representative};
 
 use crate::db::ModuleDb;
 use crate::flatten::flatten;
@@ -104,13 +105,7 @@ fn map_source_name(
 /// Whether a colon suffix denotes a source sort or kind. A colon inside an operator token is not enough
 /// to make that token a variable (`marker:tag` may be a declared constant).
 fn source_type_name(source: &BuiltModule, name: &str) -> bool {
-    if source.sorts.contains_key(name) {
-        return true;
-    }
-    name.strip_prefix('[')
-        .and_then(|name| name.strip_suffix(']'))
-        .and_then(|kind| kind.split(',').next())
-        .is_some_and(|maximal| source.sorts.contains_key(maximal.trim()))
+    selector_sort(source, name).is_some()
 }
 
 fn op_map_specs(v: &ViewDecl, interner: &Interner, source: &BuiltModule) -> Vec<OpMapSpec> {
@@ -150,14 +145,21 @@ fn selector_matches(
             .iter()
             .zip(&profile.domain)
             .all(|(name, &resolved)| {
-                source.sorts.get(name).is_some_and(|&declared| {
+                selector_sort(source, name).is_some_and(|declared| {
                     source.engine.sorts().kind_of(declared)
                         == source.engine.sorts().kind_of(resolved)
                 })
             })
-        && source.sorts.get(&selector.1).is_some_and(|&range| {
+        && selector_sort(source, &selector.1).is_some_and(|range| {
             source.engine.sorts().kind_of(range) == source.engine.sorts().kind_of(profile.range)
         })
+}
+
+/// The source sort through which a written sort spelling names its kind: the sort itself, or the first
+/// component of a kind spelling (`op f : [Elt] -> [Elt] to g`), the component through which declarations
+/// resolve a kind.
+fn selector_sort(source: &BuiltModule, name: &str) -> Option<SortId> {
+    source.sorts.get(kind_representative(name)).copied()
 }
 
 fn mapped_sort(
@@ -344,7 +346,16 @@ pub fn validate_view_with_host_functions(
         term_pm.statements.clear();
         term_pm.strat_defs.clear();
         for variable in &v.vars {
-            let target_sort = sort_image.get(&variable.sort).ok_or_else(|| {
+            // A kind-sorted view variable (`var Z : [Elt]`) takes the kind of its components' images.
+            let target_sort = match kind_components(&variable.sort) {
+                None => sort_image.get(&variable.sort).cloned(),
+                Some(components) => components
+                    .iter()
+                    .map(|component| sort_image.get(*component).cloned())
+                    .collect::<Option<Vec<_>>>()
+                    .map(|images| format!("[{}]", images.join(","))),
+            }
+            .ok_or_else(|| {
                 format!(
                     "view `{}`: variable sort `{}` is not a source theory sort",
                     v.name, variable.sort
@@ -352,7 +363,7 @@ pub fn validate_view_with_host_functions(
             })?;
             term_pm.vars.push(VarDecl {
                 names: variable.names.clone(),
-                sort: target_sort.clone(),
+                sort: target_sort,
             });
         }
         Some(build_loaded_module_with_host_functions(
@@ -565,5 +576,51 @@ mod tests {
         );
         let err = validate_view(&views[0], &db, &ViewDb::new(), &mut i).unwrap_err();
         assert!(err.contains("does not have a sort below S"), "got: {err}");
+    }
+
+    /// An operator-map selector may spell its sorts as kinds (Appendix D `OpSelector`), over a source
+    /// operator declared at the kind or at a sort of it. A kind of no source sort still selects nothing.
+    #[test]
+    fn kind_spelled_selector_validates() {
+        let (db, views, mut i) = setup(
+            "fth T is sort E . op f : [E] -> [E] . op k : E E -> E . endfth\n\
+             fmod M is sort S . op g : [S] -> [S] . op k2 : S S -> S . endfm\n\
+             view V from T to M is\n\
+               sort E to S .\n\
+               op f : [E] -> [E] to g .\n\
+               op k : [E] E -> [E] to k2 .\n\
+             endv\n\
+             view Bad from T to M is sort E to S . op f : [Nope] -> [E] to g . endv\n",
+        );
+        assert_eq!(
+            validate_view(&views[0], &db, &ViewDb::new(), &mut i),
+            Ok(())
+        );
+        let err = validate_view(&views[1], &db, &ViewDb::new(), &mut i).unwrap_err();
+        assert!(
+            err.contains("source operator `f` is not defined"),
+            "got: {err}"
+        );
+    }
+
+    /// A view variable declared at a kind takes the kind of its sort image in the target, so an
+    /// operator-to-term map can use it where the target operator expects that kind.
+    #[test]
+    fn kind_sorted_view_variable_validates() {
+        let (db, views, mut i) = setup(
+            "fth T is sort E . op f : E -> E . endfth\n\
+             fmod M is sort S . op g : [S] -> S . endfm\n\
+             view V from T to M is sort E to S . var Z : [E] . op f(Z) to term g(Z) . endv\n\
+             view Bad from T to M is sort E to S . var Z : [Nope] . op f(Z) to term g(Z) . endv\n",
+        );
+        assert_eq!(
+            validate_view(&views[0], &db, &ViewDb::new(), &mut i),
+            Ok(())
+        );
+        let err = validate_view(&views[1], &db, &ViewDb::new(), &mut i).unwrap_err();
+        assert!(
+            err.contains("variable sort `[Nope]` is not a source theory sort"),
+            "got: {err}"
+        );
     }
 }
