@@ -751,6 +751,19 @@ fn apply_attr_override(attrs: &mut Attrs, ovr: &Attrs) {
     }
 }
 
+/// Rename one token bubble the way [`apply_renaming`] renames a copied statement's text: sort names
+/// (bare, dotted qualifiers, and colon-variable sorts) through `sort_map`, then single-token operator names
+/// through `op_map`. Instantiation uses it to give a view image the names of a parameter copy.
+pub(crate) fn rename_bubble_tokens(
+    bubble: &mut Vec<Token>,
+    sort_map: &HashMap<String, String>,
+    op_map: &HashMap<String, String>,
+    interner: &mut Interner,
+) {
+    subst_sort_tokens(bubble, sort_map, interner);
+    subst_tokens(bubble, op_map, interner);
+}
+
 /// Replace each string in `xs` that is a key of `map` with its mapped value.
 fn rename_each(xs: &mut [String], map: &HashMap<String, String>) {
     for x in xs {

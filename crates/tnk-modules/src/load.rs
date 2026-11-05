@@ -901,6 +901,25 @@ mod tests {
         );
     }
 
+    /// A theory-view chain ending in an **enclosing parameter**, `WALK{Retype}{P}` inside
+    /// `PATH{P :: DST}`: the view's images take the names of `P`'s copy of `DST`. The sort image
+    /// `Item ↦ Node` becomes `P$Node` while the module-donated `Weight` stays shared, and `DST`'s
+    /// parameter constants named by a plain, profile-qualified, constant-to-term, or template map become
+    /// `P$c`. In `TRIPLE{Recode}{C}` the identity-mapped constants follow `CODES`: `K$top ↦ C$top`,
+    /// `K$low ↦ low`, and the plain `mid ↦ C$mid`.
+    #[test]
+    fn theory_view_chain_to_enclosing_parameter_renames_images() {
+        assert_program_results(
+            module_fixture!("instantiation-theory-view-param.maude"),
+            &[
+                e("P$Node", "link(P$root, P$root)", 3),
+                e("Weight", "heavy", 3),
+                e("C$Code", "low", 1),
+                e("C$Code", "C$mid", 1),
+            ],
+        );
+    }
+
     /// Bracketed comments `***( … )` / `---( … )` — balanced parens across newlines, with a backquoted paren
     /// not counting and code-looking text inside ignored — plus inline ones and plain line comments with a
     /// stray `(`. The module ignores every comment form and reduces normally.

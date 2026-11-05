@@ -1,0 +1,93 @@
+*** A chain `M{View}{P}` whose last level is an enclosing parameter `P`: the theory view retypes the
+*** parameter and `P` keeps it, so every image of the view takes the names of `P`'s copy of the view's
+*** target theory. Its own sorts and parameter constants are qualified (`P$Node`, `P$root`), a sort
+*** donated to it by an ordinary module stays shared (`Weight`), and an operator the view leaves unmapped
+*** maps by identity (`top`, `low`, `mid`).
+
+fmod WEIGHT is
+  sort Weight .
+  ops light heavy : -> Weight [ctor] .
+endfm
+
+fth SRC is
+  sorts Item Mass .
+  op origin : -> Item [pconst] .
+  op rim : -> Item [pconst] .
+  op seed : -> Item .
+  op step : Item -> Item .
+  op mass : Item -> Mass .
+endfth
+
+fth DST is
+  protecting WEIGHT .
+  sort Node .
+  op root : -> Node [pconst] .
+  op leaf : -> Node [pconst] .
+  op edge : -> Node [pconst] .
+  op next : Node -> Node .
+  op link : Node Node -> Node .
+  op weigh : Node -> Weight .
+endfth
+
+*** Each operator image names a parameter constant of DST: a plain map, a profile-qualified map, a
+*** constant-to-term map, and a term template.
+view Retype from SRC to DST is
+  sort Item to Node .
+  sort Mass to Weight .
+  op origin to root .
+  op rim : -> Item to edge .
+  op seed to term leaf .
+  var I : Item .
+  op step(I) to term link(root, next(I)) .
+  op mass to weigh .
+endv
+
+fmod WALK{X :: SRC} is
+  op walk : X$Item -> X$Item .
+  op heft : X$Item -> X$Mass .
+  var I : X$Item .
+  eq walk(X$origin) = step(seed) .
+  eq walk(X$rim) = X$origin .
+  eq heft(I) = mass(step(I)) .
+endfm
+
+fmod PATH{P :: DST} is
+  including WALK{Retype}{P} .
+  eq next(P$leaf) = P$root .
+  eq weigh(link(P$root, P$root)) = heavy .
+endfm
+
+red in PATH : walk(walk(P$edge)) .
+red in PATH : heft(P$leaf) .
+
+*** Identity maps between theories that disagree on which constants are parameter constants.
+fth KEYS is
+  sort Key .
+  op top : -> Key [pconst] .
+  op low : -> Key [pconst] .
+  op mid : -> Key .
+endfth
+
+fth CODES is
+  sort Code .
+  op top : -> Code [pconst] .
+  op low : -> Code .
+  op mid : -> Code [pconst] .
+endfth
+
+view Recode from KEYS to CODES is
+  sort Key to Code .
+endv
+
+fmod TRIPLE{K :: KEYS} is
+  op pick : K$Key -> K$Key .
+  eq pick(K$top) = K$low .
+  eq pick(K$low) = mid .
+endfm
+
+fmod PICK{C :: CODES} is
+  including TRIPLE{Recode}{C} .
+endfm
+
+red in PICK : pick(C$top) .
+red in PICK : pick(low) .

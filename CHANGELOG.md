@@ -146,6 +146,8 @@ All notable user-visible changes are documented here. This project follows Seman
 
 - A view variable may be declared at a kind (`var Z : [Elt]`) for an operator-to-term map; it takes the kind of its sort image in the target. It used to be rejected (`variable sort [Elt] is not a source theory sort`).
 
+- A chained instantiation `M{V}{Y}` that passes an enclosing parameter `Y` straight after a theory view `V`, inside `fmod M2{Y :: T2}` with `V` from `T` to `T2`, now names the view's images as in `Y`'s parameter copy of `T2`. Mapped and identity-mapped sorts become `Y$s` (sorts that `T2` imports from ordinary modules stay shared), and `T2`'s parameter constants become `Y$c` in plain, profile-qualified, identity, and operator-to-term maps. Previously the instance named such a sort `Y$Foo` after the source sort (an `unknown sort` error, so the module was not installed) unless the view mapped it to a same-named sort declared by `T2` itself, and it did not rename parameter constants into `Y`'s copy, so statements using them were dropped. A longer chain ending in `Y` gets the same names only when no view after its first maps operators; otherwise it keeps the previous behavior, because the views' operator maps are merged rather than composed.
+
 ### Documentation
 
 - `TNK-MOD-005` now states that an operator profile in a renaming selects one overload family (§1.2), that the profile must spell the sorts of a declared overload without kind brackets (otherwise, or when two profile maps select one family, the renaming is an error), and that a profile map takes precedence over a plain map of the same name for the family it selects. The Book's renaming section follows.

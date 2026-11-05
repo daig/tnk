@@ -18,7 +18,7 @@ use tnk_frontend::surface::ast::{
 use tnk_frontend::surface::sort_spelling::{kind_components, map_sort_spelling};
 
 use crate::db::ModuleDb;
-use crate::rename::apply_renaming;
+use crate::rename::{apply_renaming, rename_bubble_tokens};
 use crate::view::ViewDb;
 
 /// The renamable declaration bundle of a (sub-)module expression — everything a renaming `* (…)` rewrites.
@@ -1003,6 +1003,25 @@ fn theory_pconst_ops(
         .collect())
 }
 
+/// The canonical names of every operator in a theory's flattened signature, spelled as
+/// [`theory_pconst_ops`] spells them.
+fn theory_op_names(
+    theory: &str,
+    db: &ModuleDb,
+    views: &ViewDb,
+    interner: &mut Interner,
+) -> Result<HashSet<String>, String> {
+    let mut tmp = Acc::default();
+    let mut tmp_visited = HashSet::new();
+    collect_named(theory, db, views, &mut tmp, &mut tmp_visited, interner)?;
+    Ok(tmp
+        .into_decls()
+        .ops
+        .iter()
+        .map(|op| op.name.iter().map(|t| interner.resolve(t.sym)).collect())
+        .collect())
+}
+
 fn collect_expression_sorts(
     expr: &ModuleExpr,
     db: &ModuleDb,
@@ -1317,9 +1336,12 @@ fn subst_brace_args(name: &str, map: &HashMap<&str, String>) -> String {
 /// target and binds the parameter to its sort image, a by-parameter argument (kind 2) prefix-renames
 /// `X$s ↦ p$s`, and a theory-view (kind 1) leaves the parameter free for the next level to bind — so a
 /// chain `BOX{ToT2}{C2}` composes the theory-view `ToT2` with the module-view `C2` into one binding
-/// (`X$Elt ↦ Hue`, `Box{X} ↦ Box{ToT2}{C2}`). `mname`'s imports are re-instantiated with the bound
-/// parameters substituted in, and its own declarations merged under the binding (with variables inlined as
-/// colon variables at their instantiated sorts).
+/// (`X$Elt ↦ Hue`, `Box{X} ↦ Box{ToT2}{C2}`). A chain ending in an enclosing parameter, `BOX{ToT2}{p}`,
+/// keeps the retyped parameter under `p`, so `ToT2`'s sort and operator images take the names of `p`'s
+/// copy of `T2` ([`ParamCopyNames`]); the levels' operator maps are merged, not composed, so a longer
+/// chain gets those names only while no view after its first maps operators. `mname`'s imports are
+/// re-instantiated with the bound parameters substituted in, and its own declarations merged under the
+/// binding (with variables inlined as colon variables at their instantiated sorts).
 #[allow(clippy::too_many_arguments)]
 fn instantiate(
     mname: &str,
@@ -1370,15 +1392,22 @@ fn instantiate(
         // sorts retain their names.
         let theory_sorts = theory_param_sorts(&param.theory, db, views, interner)?;
         let pconst_ops = theory_pconst_ops(&param.theory, db, views, interner)?;
+        // A chain ending in an enclosing parameter `p` (`M{TV}{p}`) keeps the parameter under `p`'s copy of
+        // the theory view's target, so the view's images take that copy's names.
+        let copy = ParamCopyNames::of_chain(&resolutions, db, views, interner)?;
         for r in &resolutions {
             for (k, val) in &r.op_subst {
+                let val = match &copy {
+                    Some(copy) => copy.rename_tokens(val, &[], interner),
+                    None => val.clone(),
+                };
                 if pconst_ops.contains(k) {
-                    op_subst.insert(format!("{}${}", param.name, k), val.clone());
+                    op_subst.insert(format!("{}${}", param.name, k), val);
                 } else {
-                    op_subst.insert(k.clone(), val.clone());
+                    op_subst.insert(k.clone(), val);
                 }
             }
-            op_recon.extend(r.op_recon.iter().cloned().map(|mut map| {
+            for mut map in r.op_recon.iter().cloned() {
                 if pconst_ops.contains(&map.source) {
                     map.source = format!("{}${}", param.name, map.source);
                 }
@@ -1399,8 +1428,34 @@ fn instantiate(
                     }
                     qualify(range);
                 }
-                map
-            }));
+                if let Some(copy) = &copy {
+                    copy.rename_target(&mut map.target, interner);
+                }
+                op_recon.push(map);
+            }
+        }
+        // An operator the chain's views leave unmapped maps by identity into the view's target theory. Under
+        // the copy it still needs a substitution when exactly one side is a parameter constant: the body's
+        // `X$c` becomes `p$c` or the plain `c`, and a plain `c` becomes `p$c`.
+        if let Some(copy) = &copy {
+            for name in theory_op_names(&param.theory, db, views, interner)? {
+                let mapped = resolutions.iter().any(|r| {
+                    r.op_subst.contains_key(&name) || r.op_recon.iter().any(|m| m.source == name)
+                });
+                if mapped || name.contains('_') || tokenize(&name, interner).len() != 1 {
+                    continue;
+                }
+                let key = if pconst_ops.contains(&name) {
+                    format!("{}${name}", param.name)
+                } else {
+                    name.clone()
+                };
+                let image = copy.op_name(&name);
+                if image != key {
+                    let image = tokenize(&image, interner);
+                    op_subst.insert(key, image);
+                }
+            }
         }
         // Compose the sort image: each source sort threaded through every level's map in order.
         let mut sort_image: HashMap<String, String> = HashMap::new();
@@ -1430,6 +1485,7 @@ fn instantiate(
                 final_name: last.binding.view_name.clone(),
                 sort_image,
                 by_param: last.binding.by_param,
+                final_param_sorts: copy.map(|copy| copy.sorts.into_keys().collect()),
                 theory_sorts: Some(theory_sorts),
             },
         );
@@ -1647,6 +1703,12 @@ struct ParamBinding {
     final_name: String,
     sort_image: HashMap<String, String>,
     by_param: bool,
+    /// For a by-parameter binding reached through a theory view (`M{ToT2}{p}`, [`ParamCopyNames`]): the
+    /// sorts that `p`'s copy of the view's target theory owns. [`inst_sort`] threads `X$s` through
+    /// `sort_image` and qualifies the image as `p$image` only when it is one of these sorts; any other
+    /// image (a sort donated to that theory by an ordinary module) stays shared. `None` keeps the plain
+    /// rename `X$s ↦ p$s`.
+    final_param_sorts: Option<HashSet<String>>,
     /// The parameter theory's own sorts — the sorts `s` for which `X$s` is a *genuine* parameter sort
     /// (theory-declared, excluding module-origin sorts, exactly what [`add_parameter_copy`] renames).
     /// Gates the `X$s` substitution in [`inst_sort`]: a "fake" parameter sort `X$Foo` (`Foo` not a theory
@@ -1654,6 +1716,113 @@ struct ParamBinding {
     /// `None` disables the gate for nested-view bindings because their view-map target sorts cannot be
     /// fake parameter sorts.
     theory_sorts: Option<HashSet<String>>,
+}
+
+/// The names of an enclosing parameter's copy of a theory, for a chain `M{TV}{p}` whose last level passes
+/// the enclosing parameter `p` straight after the theory view `TV`. `TV`'s images are written in its target
+/// theory `T`; `p`'s copy of `T` ([`add_parameter_copy`]) names `T`'s own sorts `p$s` and its parameter
+/// constants `p$c`, while sorts donated by ordinary modules and the other operators keep their names. The
+/// instance therefore gives every image of `TV` those names. A longer chain gets them only while no view
+/// after its first maps operators ([`ParamCopyNames::of_chain`]).
+struct ParamCopyNames {
+    /// `s ↦ p$s` for each genuine sort of `T` ([`theory_param_sorts`]).
+    sorts: HashMap<String, String>,
+    /// `c ↦ p$c` for each parameter constant of `T` ([`theory_pconst_ops`]).
+    pconsts: HashMap<String, String>,
+}
+
+impl ParamCopyNames {
+    /// The copy names for one parameter's resolved chain, if it ends in a by-parameter level directly
+    /// after a theory view whose target is a named theory, and no level after the first maps operators.
+    /// Otherwise `None`: a single level keeps its own names, and a chain ending in a view names the
+    /// grounding target. [`instantiate`] merges the levels' operator maps rather than composing them, and
+    /// the merge is the chain's operator image only while every map comes from the first view. That
+    /// view's sources are operators of the parameter's theory: view checking rejects any source outside
+    /// the view's source theory, though the instantiation does not check that this theory is the
+    /// parameter's. A later view that maps no operators keeps each operator's name; a sort written inside
+    /// an image is still not threaded through its sort map. A later view's sources are written in an
+    /// intermediate theory, so they can name an operator that the parameter's theory lacks and capture a
+    /// token of `M`'s body with that spelling. A chain such as `M{TV1}{TV2}{p}` where `TV2` maps operators
+    /// therefore keeps its unrenamed merge: the copy's names would turn the merge's wrong images into
+    /// installable statements.
+    fn of_chain(
+        resolutions: &[ArgResolution],
+        db: &ModuleDb,
+        views: &ViewDb,
+        interner: &mut Interner,
+    ) -> Result<Option<Self>, String> {
+        let [.., before, last] = resolutions else {
+            return Ok(None);
+        };
+        if resolutions[1..]
+            .iter()
+            .any(|r| !r.op_subst.is_empty() || !r.op_recon.is_empty())
+        {
+            return Ok(None);
+        }
+        let Some(ModuleExpr::Named(theory)) = &before.target else {
+            return Ok(None);
+        };
+        if !last.binding.by_param || !db.get(theory).is_some_and(|m| m.is_theory) {
+            return Ok(None);
+        }
+        let param = &last.binding.final_name;
+        let qualify = |names: HashSet<String>| -> HashMap<String, String> {
+            names
+                .into_iter()
+                .map(|name| {
+                    let qualified = format!("{param}${name}");
+                    (name, qualified)
+                })
+                .collect()
+        };
+        Ok(Some(Self {
+            sorts: qualify(theory_param_sorts(theory, db, views, interner)?),
+            pconsts: qualify(theory_pconst_ops(theory, db, views, interner)?),
+        }))
+    }
+
+    /// The copy's name for an operator of `T`: `p$c` for a parameter constant, otherwise unchanged.
+    fn op_name(&self, name: &str) -> String {
+        self.pconsts
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    /// An image's tokens under the copy's names. `formals` are an op→term template's argument variables,
+    /// which are placeholders and keep their spelling.
+    fn rename_tokens(
+        &self,
+        tokens: &[Token],
+        formals: &[String],
+        interner: &mut Interner,
+    ) -> Vec<Token> {
+        let unshadowed = |map: &HashMap<String, String>| -> HashMap<String, String> {
+            map.iter()
+                .filter(|(name, _)| !formals.contains(name))
+                .map(|(name, qualified)| (name.clone(), qualified.clone()))
+                .collect()
+        };
+        let mut out = tokens.to_vec();
+        rename_bubble_tokens(
+            &mut out,
+            &unshadowed(&self.sorts),
+            &unshadowed(&self.pconsts),
+            interner,
+        );
+        out
+    }
+
+    /// A reconstruction map's target under the copy's names.
+    fn rename_target(&self, target: &mut ReconTarget, interner: &mut Interner) {
+        match target {
+            ReconTarget::Op(name) => *name = self.op_name(name),
+            ReconTarget::Term { formals, template } => {
+                *template = self.rename_tokens(template, formals, interner);
+            }
+        }
+    }
 }
 
 /// One instantiation argument resolved to its parameter binding plus the module expression to import for
@@ -1693,6 +1862,7 @@ fn resolve_arg(
                 final_name: p.clone(),
                 sort_image: HashMap::new(),
                 by_param: true,
+                final_param_sorts: None,
                 theory_sorts: None,
             },
             target: None,
@@ -1717,6 +1887,7 @@ fn resolve_arg(
                     final_name: view_name.clone(),
                     sort_image: v.sort_maps.iter().cloned().collect(),
                     by_param: false,
+                    final_param_sorts: None,
                     theory_sorts: None,
                 },
                 target: Some(v.to.clone()),
@@ -1765,6 +1936,7 @@ fn resolve_arg(
                     final_name: canonical_key(arg),
                     sort_image,
                     by_param: false,
+                    final_param_sorts: None,
                     theory_sorts: None,
                 },
                 target: Some(target),
@@ -2393,10 +2565,21 @@ fn inst_sort(name: &str, bindings: &HashMap<String, ParamBinding>) -> String {
             return name.to_string();
         }
         // By-parameter: prefix-rename `X$s ↦ p$s` (the parameter survives) — using the *final* level only,
-        // so a chain `LIST{ORD}{X}` gives `X$Elt`, not the malformed chain `ORD}{X$Elt`. View: the view's
-        // sort image.
+        // so a chain `LIST{ORD}{X}` gives `X$Elt`, not the malformed chain `ORD}{X$Elt`. Through a theory
+        // view (`M{ToT2}{p}`) the sort first takes the view's image, which `p` owns only if it is a sort of
+        // `p`'s copy of the view's target. View: the view's sort image.
         return if b.by_param {
-            format!("{}${s}", b.final_name)
+            match &b.final_param_sorts {
+                Some(owned) => {
+                    let image = b.sort_image.get(s).map_or(s, String::as_str);
+                    if owned.contains(image) {
+                        format!("{}${image}", b.final_name)
+                    } else {
+                        image.to_string()
+                    }
+                }
+                None => format!("{}${s}", b.final_name),
+            }
         } else {
             b.sort_image
                 .get(s)
@@ -2771,6 +2954,119 @@ fmod TOP is protecting L . protecting R . endfm
         };
         assert_eq!(domain, &["[List{V}]", "X$Elt"]);
         assert_eq!(range, "[List{V},X$Elt]");
+    }
+
+    /// A theory-view chain ending in the enclosing parameter, `WALK{Retype}{P}` inside `PATH{P :: DST}`,
+    /// names the instance after `P`'s copy of `DST`: the sort image `Item ↦ Node` is `P$Node`, the image
+    /// `Mass ↦ Weight` (a sort `DST` imports from a module) stays shared, and `DST`'s parameter constant
+    /// `root` in the operator images is `P$root`.
+    #[test]
+    fn by_parameter_chain_names_theory_view_images_after_the_copy() {
+        let (db, views, mut i) = db_of(
+            "fmod WEIGHT is sort Weight . endfm\n\
+             fth SRC is sorts Item Mass . op origin : -> Item [pconst] . op mass : Item -> Mass . endfth\n\
+             fth DST is protecting WEIGHT . sort Node . op root : -> Node [pconst] .\n\
+               op weigh : Node -> Weight . endfth\n\
+             view Retype from SRC to DST is sort Item to Node . sort Mass to Weight .\n\
+               op origin to root . op mass to weigh . endv\n\
+             fmod WALK{X :: SRC} is op heft : X$Item -> X$Mass . eq heft(X$origin) = mass(X$origin) . endfm\n\
+             fmod PATH{P :: DST} is including WALK{Retype}{P} . endfm\n",
+        );
+        let flat = flatten("PATH", &db, &views, &mut i).expect("flatten");
+        let mut sorts = flat.sorts.clone();
+        sorts.sort();
+        assert_eq!(sorts, ["P$Node", "Weight"], "instance sorts");
+        let heft = flat
+            .ops
+            .iter()
+            .find(|o| i.resolve(o.name[0].sym) == "heft")
+            .expect("heft");
+        assert_eq!(heft.domain, ["P$Node"]);
+        assert_eq!(heft.range, "Weight");
+        let text =
+            |bubble: &[Token]| -> String { bubble.iter().map(|t| i.resolve(t.sym)).collect() };
+        let equations: Vec<(String, String)> = flat
+            .statements
+            .iter()
+            .filter_map(|st| match st {
+                Statement::Eq { lhs, rhs, .. } => Some((text(lhs), text(rhs))),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            equations,
+            [("heft(P$root)".to_string(), "weigh(P$root)".to_string())]
+        );
+    }
+
+    /// A chain whose two views both map operators, `HOP{Leave}{Swap}{Y}`: `Leave` sends `home` to `away`
+    /// and `Swap` sends `away` back to `home`, so the composed image of `X$home` is `Y$home`. The levels'
+    /// maps are merged rather than composed, and the merge (`home ↦ away`, `away ↦ home`) must not take
+    /// `Y`'s copy names, which would install the wrong equation `hop(Y$away) = Y$away`.
+    #[test]
+    fn by_parameter_chain_through_two_op_mapping_views_gives_no_wrong_equation() {
+        let (db, views, mut i) = db_of(
+            "fth PLAIN is sort Spot . op home : -> Spot [pconst] . endfth\n\
+             fth PAIR is sort Spot . ops home away : -> Spot [pconst] . endfth\n\
+             view Leave from PLAIN to PAIR is op home to away . endv\n\
+             view Swap from PAIR to PAIR is op away to home . op home to away . endv\n\
+             fmod HOP{X :: PLAIN} is op hop : X$Spot -> X$Spot . eq hop(X$home) = X$home . endfm\n\
+             fmod TRIP{Y :: PAIR} is including HOP{Leave}{Swap}{Y} . endfm\n",
+        );
+        let flat = flatten("TRIP", &db, &views, &mut i).expect("flatten");
+        let text =
+            |bubble: &[Token]| -> String { bubble.iter().map(|t| i.resolve(t.sym)).collect() };
+        let equations: Vec<(String, String)> = flat
+            .statements
+            .iter()
+            .filter_map(|st| match st {
+                Statement::Eq { lhs, rhs, .. } => Some((text(lhs), text(rhs))),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            equations.iter().all(|(lhs, _)| lhs != "hop(Y$away)"),
+            "wrong equation from the merged maps: {equations:?}"
+        );
+    }
+
+    /// A chain whose only operator-mapping view is the later one, `KEEP{Widen}{Fill}{Y}`. `Fill`'s source
+    /// `spare` is a constant of the intermediate theory `WIDE` that `BASIC` lacks, so no operator of
+    /// `KEEP`'s parameter reaches it, and `KEEP`'s own `spare` keeps its name: the correct equation is
+    /// `keep(spare) = Y$seed`. The merged maps send every `spare` token to `slot`, and that merge must not
+    /// take `Y`'s copy names, which would install the wrong equation `keep(Y$slot) = Y$seed`. `FillAt` is
+    /// the same map written with a profile, so it takes the reconstruction path.
+    #[test]
+    fn by_parameter_chain_with_a_later_op_mapping_view_gives_no_wrong_equation() {
+        let (db, views, mut i) = db_of(
+            "fth BASIC is sort Item . op seed : -> Item [pconst] . endfth\n\
+             fth WIDE is sort Item . ops seed spare : -> Item [pconst] . endfth\n\
+             fth FINAL is sort Item . ops seed slot : -> Item [pconst] . endfth\n\
+             view Widen from BASIC to WIDE is sort Item to Item . endv\n\
+             view Fill from WIDE to FINAL is op spare to slot . endv\n\
+             view FillAt from WIDE to FINAL is op spare : -> Item to slot . endv\n\
+             fmod KEEP{X :: BASIC} is op spare : -> X$Item . op keep : X$Item -> X$Item .\n\
+               eq keep(spare) = X$seed . endfm\n\
+             fmod USE{Y :: FINAL} is including KEEP{Widen}{Fill}{Y} . endfm\n\
+             fmod USEAT{Y :: FINAL} is including KEEP{Widen}{FillAt}{Y} . endfm\n",
+        );
+        for module in ["USE", "USEAT"] {
+            let flat = flatten(module, &db, &views, &mut i).expect("flatten");
+            let text =
+                |bubble: &[Token]| -> String { bubble.iter().map(|t| i.resolve(t.sym)).collect() };
+            let equations: Vec<(String, String)> = flat
+                .statements
+                .iter()
+                .filter_map(|st| match st {
+                    Statement::Eq { lhs, rhs, .. } => Some((text(lhs), text(rhs))),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                equations.iter().all(|(lhs, _)| lhs != "keep(Y$slot)"),
+                "{module}: own operator captured by the later view's map: {equations:?}"
+            );
+        }
     }
 
     /// An undefined imported module is a loud error.
