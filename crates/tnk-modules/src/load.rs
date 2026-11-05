@@ -677,6 +677,51 @@ mod tests {
         );
     }
 
+    /// An imported statement is built in its home grammar first. When that build ends in a statement
+    /// boundary rejection (bare-variable lhs, unbound rhs variable), the verdict is final: a retry in the
+    /// importer's flattened grammar would read the importer's constant `X` into the home variable `X` and
+    /// silently install `eq X = c`, `mb X : T`, and `eq f(a) = X` on that constant.
+    #[test]
+    fn imported_statement_rejections_ignore_importer_shadowing() {
+        let src = "fmod SHADOW-HOME is\n\
+                     sorts S T .\n\
+                     subsort T < S .\n\
+                     ops a c : -> S .\n\
+                     op f : S -> S .\n\
+                     var X : S .\n\
+                     eq X = c .\n\
+                     mb X : T .\n\
+                     eq f(a) = X .\n\
+                   endfm\n\
+                   fmod SHADOW-USE is\n\
+                     protecting SHADOW-HOME .\n\
+                     op X : -> S .\n\
+                   endfm\n\
+                   red X .\n\
+                   red f(a) .\n";
+        assert_program_results(src, &[e("S", "X", 0), e("S", "f(a)", 0)]);
+
+        let program = load_program(src).expect("load shadowing importer");
+        let home = &program.modules[program.module_index["SHADOW-HOME"]];
+        let importer = &program.modules[program.module_index["SHADOW-USE"]];
+        let messages: Vec<_> = home
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                "dropped equation: equation left-hand side is a variable",
+                "dropped membership: membership left-hand side is a variable",
+                "dropped equation: unbound variable in equation right-hand side or condition",
+            ]
+        );
+        // The importer repeats the home verdicts verbatim, so a Session reports each statement once.
+        assert_eq!(importer.diagnostics, home.diagnostics);
+        assert!(importer.built.eq_traces.is_empty() && importer.built.mb_traces.is_empty());
+    }
+
     /// A view sort map targeting a nonexistent sort fails to load with a precise source/target diagnostic.
     #[test]
     fn bad_view_rejected_by_load() {

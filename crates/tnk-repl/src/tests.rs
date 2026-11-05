@@ -4046,6 +4046,86 @@ fn statement_and_module_failures_are_actionable_and_recoverable() {
     );
 }
 
+/// An executable equation whose left-hand side is a bare variable is outside the current statement
+/// boundary. It is dropped with one warning, like the membership and rule cases, wherever it comes
+/// from: the module itself, a theory, a plain importer (no repeated warning), or an instance whose view
+/// maps `h(Z)` to `Z`. The Session keeps running instead of panicking.
+#[test]
+fn bare_variable_equation_lhs_is_dropped_and_session_recovers() {
+    let mut r = repl();
+    let dropped = |line| {
+        format!(
+            "warning: module `BARE-LHS`, line {line}: dropped equation: equation left-hand side is a \
+             variable"
+        )
+    };
+    assert_eq!(
+        r.eval(
+            "fmod BARE-LHS is\n\
+               sort S .\n\
+               ops a b c : -> S [ctor] .\n\
+               op f : S -> S .\n\
+               var X : S .\n\
+               eq X = c .\n\
+               ceq X:S = c if X:S = a .\n\
+               eq X = b [owise] .\n\
+               eq f(a) = b .\n\
+             endfm",
+        )
+        .output,
+        wrap::auto_wrap(&[dropped(6), dropped(7), dropped(8)].join("\n"))
+    );
+    let reduced = r.eval("red in BARE-LHS : f(a) .").output;
+    assert!(reduced.contains("rewrites: 1\nresult S: b"), "{reduced}");
+    assert!(
+        r.eval("red in BARE-LHS : c .")
+            .output
+            .contains("rewrites: 0\nresult S: c")
+    );
+
+    // A plain importer reuses the home verdict, so the Session does not repeat the warning.
+    assert!(
+        r.eval("fmod BARE-LHS-USE is protecting BARE-LHS . op g : S -> S . eq g(b) = a . endfm")
+            .output
+            .is_empty()
+    );
+    let imported = r.eval("red in BARE-LHS-USE : g(f(a)) .").output;
+    assert!(imported.contains("rewrites: 2\nresult S: a"), "{imported}");
+
+    assert_eq!(
+        r.eval("fth BARE-LHS-TH is\n  sort T .\n  op t : -> T .\n  eq Y:T = t .\nendfth")
+            .output,
+        wrap::auto_wrap(
+            "warning: module `BARE-LHS-TH`, line 4: dropped equation: equation left-hand side is a \
+             variable"
+        )
+    );
+
+    // A valid projection view turns the instance equation `eq h(X) = d` into `eq X = d`.
+    let instance = r
+        .eval(
+            "fth BARE-PROJ is sort S . op d : -> S . op h : S -> S . endfth\n\
+             fmod BARE-PROJ-USE{P :: BARE-PROJ} is eq h(X:P$S) = d . endfm\n\
+             fmod BARE-PROJ-TARGET is sort R . op w : -> R . endfm\n\
+             view BARE-PROJ-VIEW from BARE-PROJ to BARE-PROJ-TARGET is\n\
+               sort S to R . op d to w . var Z : S . op h(Z) to term Z .\n\
+             endv\n\
+             fmod BARE-PROJ-INST is including BARE-PROJ-USE{BARE-PROJ-VIEW} . endfm\n\
+             red in BARE-PROJ-INST : w .",
+        )
+        .output;
+    assert_eq!(
+        instance
+            .replace("\n    ", " ")
+            .matches("dropped equation: equation left-hand side is a variable")
+            .count(),
+        1,
+        "{instance}"
+    );
+    assert!(instance.contains("rewrites: 0\nresult R: w"), "{instance}");
+    assert!(!instance.contains("error"), "{instance}");
+}
+
 #[test]
 fn meta_boundaries_distinguish_supported_and_inert_operations() {
     let mut r = repl();
@@ -4092,4 +4172,353 @@ red in META-LEVEL : metaParseStrategy(['NAT], none, 'top '`( 'all '`)) ."#,
     );
     assert!(!output.contains("dropped rule"), "{output}");
     assert!(!output.contains("error:"), "{output}");
+}
+
+/// Reflected statements follow the source boundary for bare-variable left-hand sides. Descent has no
+/// warning channel, so an executable bare-variable equation, membership, or rule makes the reflected
+/// module invalid, like a statement naming an undeclared operator: descent stays inert, `wellFormed` is
+/// false, and a child interpreter rejects the module. `[nonexec]` and `[narrowing]` forms still descend.
+#[test]
+fn reflected_bare_variable_statements_make_descent_inert() {
+    let mut r = repl();
+    let prelude = r.eval(conformance_file!("prelude-meta.maude")).output;
+    assert!(
+        !prelude.contains("error: module") && !prelude.contains("parse error:"),
+        "META prelude build:\n{prelude}"
+    );
+    // Each inert result below prints the reduced module constant, which also shows its equation loaded.
+    r.eval(
+        r#"mod META-BARE is
+  including META-LEVEL .
+  ops eqm mbm rlm okm : -> Module .
+  eq eqm = (fmod 'BARE-EQ is nil sorts 'S . none
+              op 'c : nil -> 'S [none] . op 'd : nil -> 'S [none] .
+              none
+              eq 'X:S = 'd.S [none] .
+            endfm) .
+  eq mbm = (fmod 'BARE-MB is nil sorts 'S ; 'T . subsort 'T < 'S .
+              op 'c : nil -> 'S [none] .
+              mb 'X:S : 'T [none] .
+              none
+            endfm) .
+  eq rlm = (mod 'BARE-RL is nil sorts 'S . none
+              op 'c : nil -> 'S [none] . op 'd : nil -> 'S [none] .
+              none none
+              rl 'X:S => 'd.S [none] .
+            endm) .
+  eq okm = (mod 'BARE-OK is nil sorts 'S ; 'T . subsort 'T < 'S .
+              op 'c : nil -> 'S [none] . op 'd : nil -> 'S [none] .
+              mb 'X:S : 'T [nonexec] .
+              eq 'X:S = 'c.S [nonexec] . eq 'c.S = 'd.S [none] .
+              rl 'X:S => 'c.S [nonexec] . rl 'Y:S => 'd.S [narrowing] .
+            endm) .
+endm"#,
+    );
+
+    for (command, inert) in [
+        (
+            "metaReduce(eqm, 'c.S)",
+            "result [ResultPair?]: metaReduce(fmod 'BARE-EQ is",
+        ),
+        (
+            "metaReduce(mbm, 'c.S)",
+            "result [ResultPair?]: metaReduce(fmod 'BARE-MB is",
+        ),
+        (
+            "metaRewrite(rlm, 'c.S, 1)",
+            "result [ResultPair?]: metaRewrite(mod 'BARE-RL is",
+        ),
+    ] {
+        let output = r.eval(&format!("red in META-BARE : {command} .")).output;
+        assert!(output.contains(inert), "{command} stays inert:\n{output}");
+    }
+    for module in ["eqm", "mbm", "rlm"] {
+        let output = r
+            .eval(&format!("red in META-BARE : wellFormed({module}) ."))
+            .output;
+        assert!(output.contains("result Bool: false"), "{module}:\n{output}");
+    }
+    let exempt = r.eval("red in META-BARE : metaReduce(okm, 'c.S) .").output;
+    assert!(exempt.contains("result ResultPair: {'d.S, 'S}"), "{exempt}");
+    assert!(
+        r.eval("red in META-BARE : wellFormed(okm) .")
+            .output
+            .contains("result Bool: true")
+    );
+
+    let stock = r.eval(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../share/maude-gpl/metaInterpreter.maude"
+        ))
+        .expect("read bundled metaInterpreter.maude"),
+    );
+    assert!(
+        !stock.exit && !stock.output.contains("error in module"),
+        "stock meta-interpreter loads: {}",
+        stock.output
+    );
+    let child = r
+        .eval(
+            r#"mod META-BARE-CHILD is
+  protecting META-BARE .
+  protecting META-INTERPRETER .
+  op me : -> Oid .
+  op User : -> Cid .
+  op got:_ : Msg -> Attribute .
+  vars X Y Z : Oid .
+  var AS : AttributeSet .
+  var Q : String .
+  rl < X : User | AS > createdInterpreter(X, Y, Z) =>
+     < X : User | AS > insertModule(Z, X, eqm) .
+  rl < X : User | AS > insertedModule(X, Y) => < X : User | AS, got: insertedModule(X, Y) > .
+  rl < X : User | AS > interpreterError(X, Y, Q) =>
+     < X : User | AS, got: interpreterError(X, Y, Q) > .
+endm
+erewrite in META-BARE-CHILD : <> < me : User | none >
+  createInterpreter(interpreterManager, me, none) ."#,
+        )
+        .output;
+    assert!(
+        child.contains("got: interpreterError(") && child.contains("\"Bad module.\""),
+        "child rejects the reflected module:\n{child}"
+    );
+    assert!(!child.contains("insertedModule(me"), "{child}");
+}
+
+/// Reflected statements also follow the source loader's other statement checks (`TNK-COND-002`). An
+/// executable statement with a right-side or condition variable that neither its left side nor an
+/// earlier fragment binds, or an equation or membership with a rewrite (`=>`) condition, makes the
+/// reflected module invalid, as a bare-variable left-hand side does. Descent stays inert and
+/// `wellFormed` is false, instead of panicking when the statement is installed or applied. As at the
+/// source level, an executable `[narrowing]` rule is not exempt, while `[nonexec]` statements and
+/// fragments that bind fresh variables still descend.
+#[test]
+fn reflected_unbound_variable_and_rewrite_condition_statements_make_descent_inert() {
+    let mut r = repl();
+    let prelude = r.eval(conformance_file!("prelude-meta.maude")).output;
+    assert!(
+        !prelude.contains("error: module") && !prelude.contains("parse error:"),
+        "META prelude build:\n{prelude}"
+    );
+    r.eval(
+        r#"mod META-UNBOUND is
+  including META-LEVEL .
+  ops ueq uceq umb rweq rwmb url ucrl unarrow okm : -> Module .
+  eq ueq = (fmod 'U-EQ is nil sorts 'S . none
+              op 'c : nil -> 'S [none] .
+              none
+              eq 'c.S = 'Y:S [none] .
+            endfm) .
+  eq uceq = (fmod 'U-CEQ is nil sorts 'S . none
+              op 'c : nil -> 'S [none] . op 'f : 'S -> 'S [none] .
+              none
+              ceq 'f['X:S] = 'X:S if 'Y:S = 'X:S [none] .
+            endfm) .
+  eq umb = (fmod 'U-MB is nil sorts 'S ; 'T . subsort 'T < 'S .
+              op 'c : nil -> 'S [none] .
+              cmb 'c.S : 'T if 'W:S = 'c.S [none] .
+              none
+            endfm) .
+  eq rweq = (mod 'RW-EQ is nil sorts 'S . none
+              op 'c : nil -> 'S [none] . op 'd : nil -> 'S [none] .
+              none
+              ceq 'c.S = 'd.S if 'c.S => 'd.S [none] .
+              rl 'c.S => 'd.S [none] .
+            endm) .
+  eq rwmb = (mod 'RW-MB is nil sorts 'S ; 'T . subsort 'T < 'S .
+              op 'c : nil -> 'S [none] . op 'd : nil -> 'S [none] .
+              cmb 'c.S : 'T if 'c.S => 'd.S [none] .
+              none
+              rl 'c.S => 'd.S [none] .
+            endm) .
+  eq url = (mod 'U-RL is nil sorts 'S . none
+              op 'c : nil -> 'S [none] .
+              none none
+              rl 'c.S => 'Y:S [none] .
+            endm) .
+  eq ucrl = (mod 'U-CRL is nil sorts 'S . none
+              op 'c : nil -> 'S [none] . op 'd : nil -> 'S [none] .
+              none none
+              crl 'c.S => 'd.S if 'Y:S = 'c.S [none] .
+            endm) .
+  eq unarrow = (mod 'U-NARROW is nil sorts 'S . none
+              op 'c : nil -> 'S [ctor] . op 'f : 'S -> 'S [ctor] . op 'g : 'S 'S -> 'S [ctor] .
+              none none
+              rl 'f['X:S] => 'g['X:S, 'Y:S] [narrowing] .
+            endm) .
+  eq okm = (mod 'U-OK is nil sorts 'S . none
+              op 'c : nil -> 'S [ctor] . op 'd : nil -> 'S [ctor] .
+              op 'f : 'S -> 'S [none] . op 'g : 'S 'S -> 'S [ctor] . op 'h : 'S -> 'S [ctor] .
+              none
+              eq 'c.S = 'Y:S [nonexec] .
+              ceq 'f['X:S] = 'Y:S if 'Y:S := 'X:S [none] .
+              rl 'd.S => 'Y:S [nonexec] .
+              rl 'h['X:S] => 'g['X:S, 'Y:S] [nonexec narrowing] .
+              crl 'g['X:S, 'X:S] => 'Y:S if 'X:S => 'Y:S [none] .
+            endm) .
+endm"#,
+    );
+
+    for (command, inert) in [
+        (
+            "metaReduce(ueq, 'c.S)",
+            "result [ResultPair?]: metaReduce(fmod 'U-EQ is",
+        ),
+        (
+            "metaReduce(uceq, 'f['c.S])",
+            "result [ResultPair?]: metaReduce(fmod 'U-CEQ is",
+        ),
+        (
+            "metaReduce(umb, 'c.S)",
+            "result [ResultPair?]: metaReduce(fmod 'U-MB is",
+        ),
+        (
+            "metaReduce(rweq, 'c.S)",
+            "result [ResultPair?]: metaReduce(mod 'RW-EQ is",
+        ),
+        (
+            "metaReduce(rwmb, 'c.S)",
+            "result [ResultPair?]: metaReduce(mod 'RW-MB is",
+        ),
+        (
+            "metaRewrite(url, 'c.S, 1)",
+            "result [ResultPair?]: metaRewrite(mod 'U-RL is",
+        ),
+        (
+            "metaRewrite(ucrl, 'c.S, 1)",
+            "result [ResultPair?]: metaRewrite(mod 'U-CRL is",
+        ),
+        (
+            "metaRewrite(unarrow, 'f['c.S], 1)",
+            "result [ResultPair?]: metaRewrite(mod 'U-NARROW is",
+        ),
+        (
+            "metaNarrowingApply(unarrow, 'f['c.S], empty, '#, 0)",
+            "result NarrowingApplyResult?: metaNarrowingApply(mod 'U-NARROW is",
+        ),
+    ] {
+        let output = r.eval(&format!("red in META-UNBOUND : {command} .")).output;
+        assert!(output.contains(inert), "{command} stays inert:\n{output}");
+    }
+    for module in [
+        "ueq", "uceq", "umb", "rweq", "rwmb", "url", "ucrl", "unarrow",
+    ] {
+        let output = r
+            .eval(&format!("red in META-UNBOUND : wellFormed({module}) ."))
+            .output;
+        assert!(output.contains("result Bool: false"), "{module}:\n{output}");
+    }
+
+    for (command, result) in [
+        ("metaReduce(okm, 'f['c.S])", "result ResultPair: {'c.S, 'S}"),
+        ("wellFormed(okm)", "result Bool: true"),
+        (
+            "metaNarrowingApply(okm, 'h['c.S], empty, '#, 0)",
+            "result NarrowingApplyResult: {\n  'g['c.S, '@1:S], 'S,",
+        ),
+        (
+            "metaRewrite(okm, 'g['c.S, 'c.S], 1)",
+            "result ResultPair: {'c.S, 'S}",
+        ),
+    ] {
+        let output = r.eval(&format!("red in META-UNBOUND : {command} .")).output;
+        assert!(output.contains(result), "{command}:\n{output}");
+    }
+
+    // A child interpreter rejects the module instead of inserting it.
+    let stock = r.eval(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../share/maude-gpl/metaInterpreter.maude"
+        ))
+        .expect("read bundled metaInterpreter.maude"),
+    );
+    assert!(
+        !stock.exit && !stock.output.contains("error in module"),
+        "stock meta-interpreter loads: {}",
+        stock.output
+    );
+    let child = r
+        .eval(
+            r#"mod META-UNBOUND-CHILD is
+  protecting META-UNBOUND .
+  protecting META-INTERPRETER .
+  op me : -> Oid .
+  op User : -> Cid .
+  op got:_ : Msg -> Attribute .
+  vars X Y Z : Oid .
+  var AS : AttributeSet .
+  var Q : String .
+  rl < X : User | AS > createdInterpreter(X, Y, Z) =>
+     < X : User | AS > insertModule(Z, X, ueq) .
+  rl < X : User | AS > insertedModule(X, Y) => < X : User | AS, got: insertedModule(X, Y) > .
+  rl < X : User | AS > interpreterError(X, Y, Q) =>
+     < X : User | AS, got: interpreterError(X, Y, Q) > .
+endm
+erewrite in META-UNBOUND-CHILD : <> < me : User | none >
+  createInterpreter(interpreterManager, me, none) ."#,
+        )
+        .output;
+    assert!(
+        child.contains("got: interpreterError(") && child.contains("\"Bad module.\""),
+        "child rejects the reflected module:\n{child}"
+    );
+    assert!(!child.contains("insertedModule(me"), "{child}");
+}
+
+/// Entering a module normalizes each executable `[narrowing]` rule's display trace by variable name. A
+/// base name never lexed on its own, such as on-the-fly `Zqx:S` or the `Atts` that object completion
+/// invents, is interned on demand instead of panicking. Narrowing then uses the rule, in the module and
+/// in an importer alike.
+#[test]
+fn narrowing_rules_with_unlexed_variable_names_load_and_narrow() {
+    let mut r = repl();
+    let loaded = r.eval(
+        "mod NARROW-OTF is\n\
+           sort S .\n\
+           ops a b : -> S [ctor] .\n\
+           op f : S -> S [ctor] .\n\
+           rl [n1] : f(Zqx:S) => Zqx:S [narrowing] .\n\
+         endm\n\
+         mod NARROW-OTF-USE is protecting NARROW-OTF . endm",
+    );
+    assert!(
+        !loaded.exit && loaded.output.is_empty(),
+        "{}",
+        loaded.output
+    );
+    let solutions = "\n\nSolution 1\nrewrites: 0\nstate: f(f(#1:S))\naccumulated substitution:\n\
+                     Y:S --> #1:S\nvariant unifier:\nZ:S --> f(f(@1:S))\n#1:S --> @1:S\n\n\
+                     Solution 2\nrewrites: 1\nstate: f(@1:S)\naccumulated substitution:\n\
+                     Y:S --> @1:S\nvariant unifier:\nZ:S --> f(%1:S)\n@1:S --> %1:S";
+    for module in ["NARROW-OTF", "NARROW-OTF-USE"] {
+        let command = format!("vu-narrow [2] in {module} : f(f(Y:S)) =>* Z:S .");
+        assert_eq!(r.eval(&command).output, format!("{command}{solutions}"));
+    }
+
+    // Completion extends both object patterns with a fresh `Atts`, so `other : b` is carried over.
+    let omod = r.eval(
+        "omod NARROW-OO is\n\
+           sort Val .\n\
+           ops a b : -> Val [ctor] .\n\
+           op x : -> Oid [ctor] .\n\
+           class Cell | val : Val, other : Val .\n\
+           var O : Oid .\n\
+           var V : Val .\n\
+           rl [n1] : < O : Cell | val : V > => < O : Cell | val : a > [narrowing] .\n\
+         endom",
+    );
+    assert!(!omod.exit && omod.output.is_empty(), "{}", omod.output);
+    let narrowed = r
+        .eval("vu-narrow [2] in NARROW-OO : < x : Cell | val : b, other : b > =>1 C:Object .")
+        .output;
+    assert!(
+        narrowed.contains(
+            "Solution 1\nrewrites: 1\nstate: < x : Cell | val : a, other : b >\n\
+             accumulated substitution:\nvariant unifier:\n\
+             C:Object --> < x : Cell | val : a, other : b >\n\nNo more solutions."
+        ),
+        "{narrowed}"
+    );
 }

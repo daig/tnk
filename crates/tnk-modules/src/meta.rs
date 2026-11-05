@@ -38,7 +38,8 @@ use tnk_frontend::load::{
     InternerNames, LoadedModule, LoadedModuleBuildError, StatementTraceRef, StmtTrace,
     build_command_dag, build_logic_command_parses, command_parse_furthest,
     executable_variant_equations, maude_variable_name_rank, parse_command_term,
-    parse_statement_trace, try_build_loaded_module_homed_traced_with_host_functions,
+    parse_statement_trace, reject_rewrite_fragment, statement_vars_bound,
+    try_build_loaded_module_homed_traced_with_host_functions,
     try_build_loaded_module_with_host_functions,
     try_build_loaded_module_with_host_functions_and_inline_statements,
 };
@@ -6407,6 +6408,17 @@ fn install_membs(
         if nonexec {
             continue;
         }
+        // The source loader drops an executable membership with a rewrite condition, an unbound condition
+        // variable, or a bare-variable lhs (the kernel indexes statements by lhs top symbol) with a
+        // warning. Reflection has no warning channel, so the reflected set is invalid, like a statement
+        // that does not down-translate. (A well-sorted `cmb` has no `=>` fragment: its condition is an
+        // `EqCondition`.)
+        if reject_rewrite_fragment(&condition, "membership").is_err()
+            || !statement_vars_bound(&lhs, &condition, None)
+        {
+            return None;
+        }
+        lhs.top_symbol()?;
         // Down-installed statements are executable (nonexec skipped above); retain the label from the meta
         // `AttrSet` (as the rule path does) so a down∘up round-trip preserves it.
         let trace = MbTrace {
@@ -6492,6 +6504,14 @@ fn install_eqs(
         if nonexec {
             continue;
         }
+        // Same boundary as `install_membs`: an executable equation with a rewrite condition, an unbound
+        // right-side or condition variable, or a bare-variable lhs invalidates the reflected set.
+        if reject_rewrite_fragment(&condition, "equation").is_err()
+            || !statement_vars_bound(&lhs, &condition, Some(&rhs))
+        {
+            return None;
+        }
+        lhs.top_symbol()?;
         let trace = EqTrace {
             lhs: lhs.clone(),
             rhs: rhs.clone(),
@@ -6979,6 +6999,16 @@ fn install_rules(
             }
             if narrowing && !condition.is_empty() {
                 continue;
+            }
+            // Same boundary as `install_membs` and the source loader: an executable rule with an unbound
+            // right-side or condition variable (`[narrowing]` included), or an executable bare-variable
+            // rule, invalidates the reflected set. `[nonexec]` rules, and `[narrowing]` ones with a
+            // bare-variable lhs, stay symbolic-only below.
+            if !nonexec && !statement_vars_bound(&lhs, &condition, Some(&rhs)) {
+                return None;
+            }
+            if lhs.top_symbol().is_none() && !(nonexec || narrowing) {
+                return None;
             }
             let variable_specs = (0..nr)
                 .map(|slot| {

@@ -6,7 +6,7 @@
 
 ## Current behavior
 
-Appendix H.4 is the user-facing ledger for known invalid-input and unsupported seams. It records silent token skipping, repaired declarations, nonuniform attribute handling, dropped statements, inert hooks/controls, and incomplete command output. The former cyclic-subsort panic is resolved (see item 1). These behaviors are Experimental and are not accepted-input guarantees.
+Appendix H.4 is the user-facing ledger for known invalid-input and unsupported seams. It records silent token skipping, repaired declarations, nonuniform attribute handling, dropped statements, inert hooks/controls, and incomplete command output. The former cyclic-subsort panic is resolved (see item 1), as are the variable-left-hand-side panics (see item 7). These behaviors are Experimental and are not accepted-input guarantees.
 
 ## Developer work
 
@@ -17,7 +17,8 @@ The long-term direction is uniform ownership and state effects, not exact Maude 
 3. make equation/rule/membership attribute parsing follow one policy;
 4. diagnose unsupported hooks and unknown Session controls without claiming success;
 5. expose unsupported unification and SMT `BadDag` outcomes distinctly from no result;
-6. retain atomic module/view and command state transitions on failure.
+6. retain atomic module/view and command state transitions on failure;
+7. ~~eliminate process panics for executable statements whose whole left-hand side is a variable~~ **Done for the panic only.** Source equations now take the membership/rule drop-with-warning path; reflected equations, memberships, and rules of this shape make META descent fail like any other invalid reflected statement (inert descent, `wellFormed` false, `insertModule` error) instead of panicking or being skipped silently; and an imported statement keeps the boundary verdict of its home grammar, so an importer declaration cannot reinterpret it. Pinned by `crates/tnk-frontend/src/load.rs`, `crates/tnk-modules/src/load.rs`, `crates/tnk-repl/src/tests.rs`, and `crates/tnk-repl/tests/cli.rs`; the current boundary is recorded in Appendix H.4.1 and K.3. **Open decision:** whether these statements should execute (offered to every symbol of the variable's kind) or become a §5.4 static requirement. Execution would touch the kernel's top-symbol statement indexes, collapse-pattern and substitution-layout bookkeeping, variant and narrowing tables, strict host-function sealing, symbols created after statements are installed, and the matching-extension semantics of such rules.
 
 ## Constraints
 

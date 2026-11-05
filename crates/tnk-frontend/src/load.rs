@@ -508,6 +508,16 @@ fn statement_line(statement: &Statement) -> Option<u32> {
     .map(|token| token.line)
 }
 
+fn dropped_statement_warning(module: &str, statement: &Statement, error: &str) -> Diagnostic {
+    let kind = statement_kind(statement);
+    Diagnostic::warning(
+        module,
+        statement_line(statement),
+        kind,
+        format!("dropped {kind}: {error}"),
+    )
+}
+
 fn load_statements_before_host_bindings(
     pm: &PreModule,
     m: &mut BuiltModule,
@@ -532,8 +542,10 @@ fn bind_pending_host_functions(m: &mut BuiltModule) -> Result<(), String> {
 /// [`remap_home_grammar`]. This preserves the sorts of home variables when an importer declares
 /// same-named variables (a flattened parse can succeed while silently selecting the importer's
 /// declaration). The flattened grammar remains the fallback when the home is unavailable or its remapped
-/// grammar cannot parse the statement. `homes[k]` is the home-module name of `pm.statements[k]` (from
-/// `flatten_with_homes`); `None` or the flattened module's own name selects the flattened grammar directly.
+/// grammar cannot parse the statement; a statement that the home grammar builds but rejects at the
+/// statement boundary is dropped without a flattened retry. `homes[k]` is the home-module name of
+/// `pm.statements[k]` (from `flatten_with_homes`); `None` or the flattened module's own name selects the
+/// flattened grammar directly.
 pub fn load_statements_homed<'m>(
     pm: &PreModule,
     m: &mut BuiltModule,
@@ -587,11 +599,22 @@ fn load_statements_homed_before_host_bindings<'m>(
                 let remapped = home_mod(home).and_then(|lm| remap_home_grammar(lm, m));
                 home_grammars.insert(home.to_string(), remapped);
             }
-            if let Some(hg) = home_grammars.get(home).and_then(Option::as_ref)
-                && let Ok(registered) = load_one_stmt(stmt, m, hg, true, false, &oo, i)
-            {
-                trace_refs.push(registered.then_some(trace_ref));
-                continue;
+            if let Some(hg) = home_grammars.get(home).and_then(Option::as_ref) {
+                match load_one_stmt(stmt, m, hg, true, false, &oo, i) {
+                    Ok(registered) => {
+                        trace_refs.push(registered.then_some(trace_ref));
+                        continue;
+                    }
+                    // The home grammar built the statement, so its boundary verdict is final. A flattened
+                    // reparse could only accept it by reading an importer declaration (for example a
+                    // constant named like a home variable) into the statement.
+                    Err(StatementLoadError::Invalid(error)) => {
+                        trace_refs.push(None);
+                        diagnostics.push(dropped_statement_warning(home, stmt, &error));
+                        continue;
+                    }
+                    Err(StatementLoadError::Parse(_)) => {}
+                }
             }
         }
         let own_statement = homes
@@ -610,13 +633,7 @@ fn load_statements_homed_before_host_bindings<'m>(
                     .get(idx)
                     .and_then(|home| home.as_deref())
                     .unwrap_or(&pm.name);
-                let kind = statement_kind(stmt);
-                diagnostics.push(Diagnostic::warning(
-                    home,
-                    statement_line(stmt),
-                    kind,
-                    format!("dropped {kind}: {error}"),
-                ));
+                diagnostics.push(dropped_statement_warning(home, stmt, error.message()));
             }
         }
     }
@@ -678,9 +695,13 @@ fn normalize_trace_term_with_bindings(
 /// Finalize narrowing display traces only after every source and inline equation has been installed and
 /// pending host attachments have committed. Public symbolic normalization therefore seals a complete
 /// signature rather than blocking its first attachment.
+///
+/// Variables are named by their interned base names. Not every base name has been interned: the lexer
+/// interns an on-the-fly `Zqx:S` as one token, and object completion invents `V`, `Atts`, ... without
+/// interning. Such names are interned here, as the narrowing command interns its subject variables.
 fn normalize_narrowing_traces(
     m: &mut BuiltModule,
-    interner: &Interner,
+    interner: &mut Interner,
 ) -> Result<(), ReducerFault> {
     let pending: Vec<_> = m
         .rl_traces
@@ -710,10 +731,7 @@ fn normalize_narrowing_traces(
                 let base = source
                     .split_once(':')
                     .map_or(source.as_str(), |(base, _)| base);
-                let name = interner
-                    .get(base)
-                    .expect("statement variable name was interned by the lexer")
-                    .index();
+                let name = interner.intern(base).index();
                 m.engine.make_var(
                     sort.expect("narrowing trace variable occurs in its lhs or rhs"),
                     name,
@@ -892,6 +910,35 @@ fn restore_echo_variable_positions(m: &BuiltModule, source: &Term, normalized: T
     }
 }
 
+/// Why [`load_one_stmt`] registered nothing.
+enum StatementLoadError {
+    /// The statement's bubbles do not parse or build in the grammar used. This is grammar-relative, so an
+    /// imported statement may retry under the flattened grammar.
+    Parse(String),
+    /// The statement parsed and built but is outside the executable statement boundary (a rewrite
+    /// condition outside a rule, an unbound variable, a bare-variable left-hand side, or a conditional
+    /// narrowing rule). This verdict is final for the statement's home grammar.
+    Invalid(String),
+}
+
+impl From<String> for StatementLoadError {
+    fn from(error: String) -> Self {
+        Self::Parse(error)
+    }
+}
+
+impl StatementLoadError {
+    fn invalid(error: &str) -> Self {
+        Self::Invalid(error.to_string())
+    }
+
+    fn message(&self) -> &str {
+        match self {
+            Self::Parse(error) | Self::Invalid(error) => error,
+        }
+    }
+}
+
 /// Parse + build + register one statement's bubbles into `m`, parsing against grammar `g`. `home` selects
 /// the home-grammar path: the rhs is then parsed at the universal start (`g` is the statement's own
 /// unambiguous home grammar, so the flattened-grammar kind-homogeneity trick is neither needed nor valid —
@@ -905,7 +952,7 @@ fn load_one_stmt(
     record_oo_diagnostic: bool,
     oo: &Option<tnk_core::engine::OoInfo>,
     i: &Interner,
-) -> Result<bool, String> {
+) -> Result<bool, StatementLoadError> {
     // Parse + build the rhs: kind-homogeneous with the lhs against the flattened grammar (disambiguates a
     // bare overloaded constant), or universal in the home-grammar path.
     let build_rhs = |rhs: &[Token], lhs_t: &Term, m: &BuiltModule, vars: &mut VarIndex| {
@@ -962,9 +1009,18 @@ fn load_one_stmt(
             let nr = vars.count();
             // Capture the source-form trace metadata before the Terms are moved into the kernel; the
             // kernel returns the dense equation id, which must index `eq_traces` (asserted).
-            reject_rewrite_fragment(&condition, "equation")?;
+            reject_rewrite_fragment(&condition, "equation").map_err(StatementLoadError::Invalid)?;
             if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) {
-                return Err("unbound variable in equation right-hand side or condition".to_string());
+                return Err(StatementLoadError::invalid(
+                    "unbound variable in equation right-hand side or condition",
+                ));
+            }
+            // The kernel indexes executable equations by their lhs top symbol. A bare-variable lhs is
+            // outside the current statement boundary, like the membership and rule cases below.
+            if lhs_t.top_symbol().is_none() {
+                return Err(StatementLoadError::invalid(
+                    "equation left-hand side is a variable",
+                ));
             }
             let trace = EqTrace {
                 lhs: lhs_t.clone(),
@@ -1039,12 +1095,17 @@ fn load_one_stmt(
                 push_oo_diagnostic(m, "membership axiom", source, transformed);
             }
             let nr = vars.count();
-            reject_rewrite_fragment(&condition, "membership")?;
+            reject_rewrite_fragment(&condition, "membership")
+                .map_err(StatementLoadError::Invalid)?;
             if !statement_vars_bound(&lhs_t, &condition, None) {
-                return Err("unbound variable in membership condition".to_string());
+                return Err(StatementLoadError::invalid(
+                    "unbound variable in membership condition",
+                ));
             }
             if lhs_t.top_symbol().is_none() {
-                return Err("membership left-hand side is a variable".to_string());
+                return Err(StatementLoadError::invalid(
+                    "membership left-hand side is a variable",
+                ));
             }
             let trace = MbTrace {
                 lhs: lhs_t.clone(),
@@ -1134,13 +1195,19 @@ fn load_one_stmt(
             };
             // A `[narrowing]` rule cannot carry a condition.
             if *narrowing && !condition.is_empty() {
-                return Err("a narrowing rule cannot have a condition".to_string());
+                return Err(StatementLoadError::invalid(
+                    "a narrowing rule cannot have a condition",
+                ));
             }
             if !statement_vars_bound(&lhs_t, &condition, Some(&rhs_t)) && !*nonexec {
-                return Err("unbound variable in rule right-hand side or condition".to_string());
+                return Err(StatementLoadError::invalid(
+                    "unbound variable in rule right-hand side or condition",
+                ));
             }
             if lhs_t.top_symbol().is_none() && !(*nonexec || *narrowing) {
-                return Err("rule left-hand side is a variable".to_string());
+                return Err(StatementLoadError::invalid(
+                    "rule left-hand side is a variable",
+                ));
             }
             m.engine.add_smt_rule(
                 lhs_t.clone(),
@@ -1598,8 +1665,9 @@ fn stmt_is_nonexec(s: &Statement) -> bool {
 }
 
 /// Reject a rewrite (`=>`) fragment in a non-rule condition. Rewrite conditions are valid only in `crl`;
-/// this guard returns a stable error before the kernel's defensive assertion.
-fn reject_rewrite_fragment(condition: &[ConditionFragment], owner: &str) -> Result<(), String> {
+/// this guard returns a stable error before the kernel's defensive assertion. META down-installation of
+/// reflected equations and memberships applies the same check.
+pub fn reject_rewrite_fragment(condition: &[ConditionFragment], owner: &str) -> Result<(), String> {
     if condition
         .iter()
         .any(|f| matches!(f, ConditionFragment::Rewrite { .. }))
@@ -1613,8 +1681,13 @@ fn reject_rewrite_fragment(condition: &[ConditionFragment], owner: &str) -> Resu
 
 /// Check that every variable is bound before use. A right side and each evaluated condition side may
 /// use left-side variables plus fresh binders from earlier `:=` or `=>` fragments. Violations make the
-/// statement non-executable and retain a dropped-statement diagnostic.
-fn statement_vars_bound(lhs: &Term, condition: &[ConditionFragment], rhs: Option<&Term>) -> bool {
+/// statement non-executable and retain a dropped-statement diagnostic. META down-installation of
+/// reflected statements applies the same check.
+pub fn statement_vars_bound(
+    lhs: &Term,
+    condition: &[ConditionFragment],
+    rhs: Option<&Term>,
+) -> bool {
     let mut bound = Vec::new();
     term_var_indices(lhs, &mut bound);
     let ok = |t: &Term, bound: &Vec<u32>| {
@@ -4681,6 +4754,70 @@ endm
         assert_eq!(rules[1].variable_names, ["X", "Y"]);
         assert_eq!(module.rl_traces.len(), 1);
         assert!(module.rl_traces[0].narrowing);
+    }
+
+    /// Narrowing display traces name variables by interned base name. The lexer interns an on-the-fly
+    /// `Zqx:S` as one token, so its base name `Zqx` is interned on demand when the trace is normalized
+    /// instead of panicking; the rule stays executable and in the narrowing table.
+    #[test]
+    fn narrowing_rule_with_on_the_fly_variable_loads() {
+        let loaded = load_source(
+            "mod NARROW-OTF is\n\
+               sort S .\n\
+               op f : S -> S .\n\
+               rl [n] : f(Zqx:S) => Zqx:S [narrowing] .\n\
+             endm\n",
+        )
+        .expect("load an on-the-fly narrowing variable");
+        let module = &loaded.modules[0].built;
+        assert_eq!(module.engine.narrowing_rules().len(), 1);
+        assert_eq!(module.rl_traces.len(), 1);
+        assert!(module.rl_traces[0].narrowing);
+        assert_eq!(module.rl_traces[0].var_names, ["Zqx:S"]);
+        assert!(loaded.interner.get("Zqx").is_some());
+    }
+
+    /// The kernel indexes executable statements by their lhs top symbol. An executable equation whose lhs
+    /// is a bare variable (plain, conditional, `owise`, or `variant`) is dropped with a statement warning,
+    /// like the membership and rule cases, before any registration. `[nonexec]` equations never reach the
+    /// engine, so they stay silent, and later statements keep dense ids and apply.
+    #[test]
+    fn bare_variable_equation_lhs_is_dropped_before_registration() {
+        let src = "fmod BARE-EQ is\n\
+                     sort S .\n\
+                     ops a b c : -> S .\n\
+                     op f : S -> S .\n\
+                     var X : S .\n\
+                     eq X = c .\n\
+                     ceq X = c if X = a .\n\
+                     eq X = b [owise] .\n\
+                     eq X:S = a [variant] .\n\
+                     eq X = b [nonexec] .\n\
+                     ceq X = b if X = c [nonexec] .\n\
+                     eq f(a) = b .\n\
+                   endfm\n\
+                   red f(a) .\n\
+                   red c .\n";
+        let loaded = load_source(src).expect("load bare-variable equations");
+        let module = &loaded.modules[0];
+        let dropped: Vec<_> = module
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.module.as_deref(),
+                    diagnostic.line,
+                    diagnostic.message.as_str(),
+                )
+            })
+            .collect();
+        let message = "dropped equation: equation left-hand side is a variable";
+        assert_eq!(
+            dropped,
+            [6, 7, 8, 9].map(|line| (Some("BARE-EQ"), Some(line), message))
+        );
+        assert_eq!(module.built.eq_traces.len(), 1, "only `eq f(a) = b` loads");
+        check_rendered_results(src, &[e("S", "b", 1), e("S", "c", 0)]);
     }
 
     /// Load, run, and raw-print every listed frontend fixture. Keeping the fixture list explicit prevents

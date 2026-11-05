@@ -160,3 +160,52 @@ fn cli_reports_subsort_cycle_without_panicking() {
         "unexpected output: {stdout:?}"
     );
 }
+
+#[test]
+fn cli_drops_bare_variable_equation_without_panicking() {
+    let mut child = command()
+        .args(["-no-banner", "-no-prelude"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn tnk-repl");
+
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(
+            b"fmod BEFORE is\n\
+                sort B .\n\
+                op b : -> B .\n\
+              endfm\n\
+              reduce b .\n\
+              fmod BARE is\n\
+                sort S .\n\
+                ops c d : -> S .\n\
+                eq X:S = c .\n\
+                eq d = c .\n\
+              endfm\n\
+              reduce d .\n",
+        )
+        .expect("write source to tnk-repl");
+
+    let output = child.wait_with_output().expect("wait for tnk-repl");
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 stdout");
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 stderr");
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(
+        stdout.starts_with("reduce in BEFORE : b .\nrewrites: 0\nresult B: b\n"),
+        "unexpected output: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("dropped equation: equation left-hand side is a"),
+        "unexpected output: {stdout:?}"
+    );
+    assert!(
+        stdout.ends_with("reduce in BARE : d .\nrewrites: 1\nresult S: c\n"),
+        "unexpected output: {stdout:?}"
+    );
+}
