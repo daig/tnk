@@ -8,6 +8,8 @@
 
 The module layer stores source modules and composes them through flattening. Imported statement bubbles use their home grammar for the implemented point-fix path, while renamed and instantiated composition still depends on merged-grammar reconstruction at some seams. The Reference specifies current observable composition behavior; it does not promise a compiled semantic module algebra.
 
+Flattening also records, per statement, whether an object module or theory declared it (`PreModule::object_statements`), so object-pattern completion follows an object-module statement into every importer (`TNK-OO-002`). Like statement homes, this is build-time provenance carried beside the flattened statements, not a compiled statement representation. One context dependence remains: an object module also completes the object-syntax statements it imports from plain modules, so such a statement means one thing under an object-module root and another under a plain root. Maude completes a statement only in its declaring module. Whether TNK should stop completing imported plain-module statements is left open by the Reference; it reverses behavior that current compositions rely on and belongs with the decision below.
+
 ## Decision
 
 Decide whether TNK should retain the current `PreModule` plus home-grammar strategy or introduce compiled, import-stable statements as the module-algebra representation.

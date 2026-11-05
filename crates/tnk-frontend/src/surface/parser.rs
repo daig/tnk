@@ -927,6 +927,7 @@ impl<'a> Parser<'a> {
             is_theory,
             is_strategy,
             is_object,
+            object_statements: Vec::new(),
             params,
             imports: Vec::new(),
             sorts: Vec::new(),

@@ -5028,8 +5028,17 @@ impl MetaDescent<'_> {
             .iter()
             .map(|&(_, id)| id)
             .collect::<Vec<_>>();
-        let own_traces =
-            merge_statement_traces(&pm.statements, &loaded, self.interner, own_trace_refs);
+        // Object-pattern completion applies per flattened statement, root-owned statements first.
+        let completes = (0..flat_pm.statements.len())
+            .map(|index| flat_pm.completes_object_patterns(index))
+            .collect::<Vec<_>>();
+        let own_traces = merge_statement_traces(
+            &pm.statements,
+            &loaded,
+            self.interner,
+            own_trace_refs,
+            completes.get(..pm.statements.len())?,
+        );
         let own_trace_ends = (own_traces.0.len(), own_traces.1.len(), own_traces.2.len());
         let (mbs, eqs, rls) = if flat {
             merge_statement_traces(
@@ -5037,6 +5046,7 @@ impl MetaDescent<'_> {
                 &loaded,
                 self.interner,
                 &statement_trace_refs,
+                &completes,
             )
         } else {
             own_traces
@@ -5112,6 +5122,7 @@ impl MetaDescent<'_> {
             is_theory,
             is_strategy,
             is_object,
+            object_statements: Vec::new(),
             params: Vec::new(),
             imports: down_imports(ctx, hooks, *kids.get(1)?)?,
             sorts: down_sorts(ctx, hooks, *kids.get(2)?),
@@ -5334,6 +5345,7 @@ impl MetaDescent<'_> {
             // Object declarations are already lowered in the reflected signature. Retaining this bit is
             // still required so object-pattern completion runs when an inserted module is rebuilt.
             is_object,
+            object_statements: Vec::new(),
             params,
             imports,
             sorts,
@@ -8560,20 +8572,31 @@ struct ModulePieces {
 
 /// Partition statements into membership, equation, and rule traces in declaration order. Executable
 /// statements clone the engine traces selected by `trace_refs`; `[nonexec]` statements are parsed on
-/// demand because they have no engine trace. Statements whose trace cannot be recovered are omitted.
+/// demand because they have no engine trace, and are object-completed where `completes` (parallel to
+/// `stmts`) says engine loading completes the statement, so they reflect in the same completed form as
+/// executable statements. Statements whose trace cannot be recovered are omitted.
 fn merge_statement_traces(
     stmts: &[Statement],
     loaded: &LoadedModule,
     i: &Interner,
     trace_refs: &[Option<StatementTraceRef>],
+    completes: &[bool],
 ) -> (Vec<MbTrace>, Vec<EqTrace>, Vec<RlTrace>) {
     let b = &loaded.built;
+    let oo_info = completes
+        .contains(&true)
+        .then(|| b.engine.oo_info())
+        .flatten();
     let (mut mbs, mut eqs, mut rls) = (Vec::new(), Vec::new(), Vec::new());
     for (stmt_index, stmt) in stmts.iter().enumerate() {
+        let oo = oo_info
+            .as_ref()
+            .filter(|_| completes.get(stmt_index).copied().unwrap_or(false));
         match stmt {
             Statement::Mb { nonexec, .. } => {
                 if *nonexec {
-                    if let Ok(StmtTrace::Mb(t)) = parse_statement_trace(stmt, b, &loaded.grammar, i)
+                    if let Ok(StmtTrace::Mb(t)) =
+                        parse_statement_trace(stmt, b, &loaded.grammar, i, oo)
                     {
                         mbs.push(t);
                     }
@@ -8586,7 +8609,8 @@ fn merge_statement_traces(
             }
             Statement::Eq { nonexec, .. } => {
                 if *nonexec {
-                    if let Ok(StmtTrace::Eq(t)) = parse_statement_trace(stmt, b, &loaded.grammar, i)
+                    if let Ok(StmtTrace::Eq(t)) =
+                        parse_statement_trace(stmt, b, &loaded.grammar, i, oo)
                     {
                         eqs.push(t);
                     }
@@ -8599,7 +8623,8 @@ fn merge_statement_traces(
             }
             Statement::Rule { nonexec, .. } => {
                 if *nonexec {
-                    if let Ok(StmtTrace::Rl(t)) = parse_statement_trace(stmt, b, &loaded.grammar, i)
+                    if let Ok(StmtTrace::Rl(t)) =
+                        parse_statement_trace(stmt, b, &loaded.grammar, i, oo)
                     {
                         rls.push(t);
                     }

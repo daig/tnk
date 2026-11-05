@@ -1,6 +1,9 @@
 //! Object-pattern completion for parsed object-module terms. The
-//! transformer runs in [`load_statements`](crate::load) on parsed [`Term`]s from an **object module**
-//! (`omod`) before compilation into engine equations and rules.
+//! transformer runs in [`load_statements`](crate::load) on parsed [`Term`]s before compilation into
+//! engine equations and rules: on every statement of an **object module** (`omod`/`oth`), the
+//! statements it imports included, and on every statement that an object module donates to a
+//! non-object importer (see `PreModule::completes_object_patterns`). Reflection parses `[nonexec]`
+//! statements through the same gate, so they are completed like executable ones.
 //!
 //! For each object pattern `< O : C | atts >` in a statement, completion makes the statement match objects
 //! that carry *more* than the mentioned attributes, and rules written for a class apply to its subclasses:
@@ -21,7 +24,18 @@
 //! Completion is gated structurally: it fires only on object patterns whose class argument is a class
 //! constant or class-sorted variable. CONFIGURATION's `getClass` equation (`< O : C:Cid | A >`, where
 //! `Cid` is not a class sort) and other non-object statements pass through unchanged. The pass is enabled
-//! only for object modules; its structural gate also makes it a no-op for ineligible statements.
+//! only for the statements selected above; its structural gate also makes it a no-op for ineligible
+//! statements.
+//!
+//! Every RHS/condition occurrence of an object must carry the pattern occurrence's class argument (the
+//! same class constant or class variable). A statement that changes an object's class is left exactly as
+//! written, like a statement that fails any other gate: replacing the written class with `V:C` would
+//! discard the class change, and keeping it would carry one class's other attributes into another.
+//! Likewise, every element of the attribute set of a pattern occurrence, or of another occurrence of
+//! that object, must be a unary attribute term `a(v)`, `none`, or the one attribute-set variable. Any
+//! other element (an `Attribute` constant, a non-unary operator) leaves the statement as written, because
+//! step 3 can add only a unary `a(A:[K])` to the pattern. An object first seen on a RHS or in a condition
+//! is a new object: its own class argument and attribute-set elements are neither checked nor changed.
 
 use std::collections::HashMap;
 
@@ -62,6 +76,8 @@ struct ObjInfo {
     /// a class constant that completion replaces with a fresh `V:class_sort` in every occurrence. A
     /// class variable used elsewhere in the statement disables completion.
     class_var: Option<u32>,
+    /// The pattern occurrence's class argument, which every subject occurrence must repeat.
+    class_arg: Term,
     pattern: Occ,
     subjects: Vec<Occ>,
 }
@@ -132,14 +148,14 @@ pub fn complete_statement(
     for obj in &objs {
         // Class constant → a fresh `V:class_sort` variable, shared across all occurrences.
         let class_replace = obj.class_var.is_none().then(|| {
-            let name = choose_fresh("V", obj.class_sort, vars);
+            let name = choose_fresh("V", vars);
             Term::var(vars.index_of(&name, obj.class_sort), obj.class_sort)
         });
         // The attribute-set variable: the pattern's own one, or a fresh `Atts:AttributeSet`.
         let atts_var = match &obj.pattern.set_var {
             Some(v) => Term::Var(v.clone()),
             None => {
-                let name = choose_fresh("Atts", info.attr_set_sort, vars);
+                let name = choose_fresh("Atts", vars);
                 Term::var(vars.index_of(&name, info.attr_set_sort), info.attr_set_sort)
             }
         };
@@ -151,7 +167,7 @@ pub fn complete_statement(
             for (sym, _) in &subj.attrs {
                 if !pattern_syms.contains(sym) && !added_attrs.iter().any(|(s, _)| s == sym) {
                     let kind_sort = attribute_kind_sort(m, info, *sym);
-                    let name = choose_fresh("A", kind_sort, vars);
+                    let name = choose_fresh("A", vars);
                     let var = Term::var(vars.index_of(&name, kind_sort), kind_sort);
                     added_attrs.push((*sym, Term::op(*sym, vec![var])));
                 }
@@ -229,6 +245,7 @@ fn record_object(
                     oid: oid.clone(),
                     class_sort,
                     class_var,
+                    class_arg: class.clone(),
                     pattern,
                     subjects: Vec::new(),
                 });
@@ -242,6 +259,10 @@ fn record_object(
             // A duplicate object name on the LHS disables completion.
             Mode::Pattern => *ignore = true,
             Mode::CondPattern => *ignore = true,
+            // A subject occurrence with a different class argument (a class-changing statement)
+            // disables completion. The pattern's class argument is a class constant or class-sorted
+            // variable, so structural equality is exact.
+            Mode::Subject if *class != objs[idx].class_arg => *ignore = true,
             Mode::Subject => match decompose_attr_set(atts, info, m) {
                 Some(occ) => objs[idx].subjects.push(occ),
                 None => *ignore = true,
@@ -323,8 +344,8 @@ fn walk_attr_set(term: &Term, info: &OoInfo, m: &BuiltModule, occ: &mut Occ) -> 
             occ.set_var = Some(v.clone());
             true
         }
-        // An attribute term: its head must be an attribute operator (ranging on a strict subsort of
-        // AttributeSet, i.e. Attribute), keyed by head; a duplicate head disables completion.
+        // An attribute term: its head must be an attribute operator (unary, ranging on a strict subsort
+        // of AttributeSet, i.e. Attribute), keyed by head; a duplicate head disables completion.
         Term::Op { symbol, .. } if is_attribute_op(*symbol, info, m) => {
             if occ.attrs.iter().any(|(s, _)| s == symbol) {
                 return false; // duplicate attribute — disable
@@ -332,18 +353,24 @@ fn walk_attr_set(term: &Term, info: &OoInfo, m: &BuiltModule, occ: &mut Occ) -> 
             occ.attrs.push((*symbol, term.clone()));
             true
         }
-        // Anything else (a non-attribute operator, a variable of the wrong sort) is unrecognized.
+        // Anything else (a non-attribute operator such as an `Attribute` constant, a variable of the
+        // wrong sort) is unrecognized.
         _ => false,
     }
 }
 
-/// Whether `sym` is an attribute operator: its result is a strict subsort of `AttributeSet`.
+/// Whether `sym` is an attribute operator: a unary operator whose result is a strict subsort of
+/// `AttributeSet`. Only a unary head has the value position that completion fills with a fresh kind
+/// variable (`a(A:[K])`) when it adds the attribute to the pattern, so an `Attribute` constant or a
+/// non-unary operator is unrecognized.
 fn is_attribute_op(sym: SymbolId, info: &OoInfo, m: &BuiltModule) -> bool {
     m.engine
         .symbol_declarations(sym)
         .first()
-        .is_some_and(|(_, range)| {
-            *range != info.attr_set_sort && m.engine.sorts().leq(*range, info.attr_set_sort)
+        .is_some_and(|(domain, range)| {
+            domain.len() == 1
+                && *range != info.attr_set_sort
+                && m.engine.sorts().leq(*range, info.attr_set_sort)
         })
 }
 
@@ -487,8 +514,8 @@ fn apply_object(args: &mut [Term], mode: Mode, plan: &ObjPlan, info: &OoInfo, m:
     };
 }
 
-/// Return the kind sort of an attribute operator's argument. Attribute operators are unary; a nullary
-/// edge case falls back to the `AttributeSet` kind.
+/// Return the kind sort of an attribute operator's argument. [`is_attribute_op`] admits only unary
+/// operators, so the `AttributeSet`-kind fallback is defensive.
 fn attribute_kind_sort(m: &BuiltModule, info: &OoInfo, attr_sym: SymbolId) -> SortId {
     let sorts = m.engine.sorts();
     let dom = m
@@ -521,12 +548,19 @@ fn condition_terms(frag: &ConditionFragment) -> Vec<&Term> {
     }
 }
 
-/// Choose an unused name for a fresh variable of `sort`: `base`, then `base2`, `base3`, and so on. A name
-/// is used when a slot is already spelled that way, or when a variable of that name and `sort` already
-/// exists under another spelling (a written `V:Cls`), which [`VarIndex::index_of`] would otherwise reuse.
-fn choose_fresh(base: &str, sort: SortId, vars: &VarIndex) -> String {
+/// Choose a variable name whose base no statement variable uses: `base`, then `base2`, `base3`, and so on.
+/// A `VarIndex` name is the whole source token (`V:C` for an on-the-fly variable or a flattened declared
+/// one), while printing and reflection identify a variable by its base name and sort, so each entry is
+/// compared by the base before its first `:`.
+fn choose_fresh(base: &str, vars: &VarIndex) -> String {
     let used = |name: &str| {
-        vars.find(name, sort).is_some() || (0..vars.count()).any(|i| vars.name(i) == name)
+        (0..vars.count()).any(|i| {
+            let source = vars.name(i);
+            source
+                .split_once(':')
+                .map_or(source, |(source_base, _)| source_base)
+                == name
+        })
     };
     if !used(base) {
         return base.to_string();
@@ -538,5 +572,31 @@ fn choose_fresh(base: &str, sort: SortId, vars: &VarIndex) -> String {
             return name;
         }
         k += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tnk_core::sort::Sorts;
+
+    /// A fresh name avoids the base name of every statement variable: a bare declared name, an on-the-fly
+    /// `V:C`, a flattened declared variable spelled `A:Oid`, and a fresh name chosen earlier.
+    #[test]
+    fn choose_fresh_avoids_statement_base_names() {
+        let mut sorts = Sorts::new();
+        let class = sorts.add_sort("C");
+        let oid = sorts.add_sort("Oid");
+        let mut vars = VarIndex::new();
+        vars.index_of("O", oid);
+        vars.index_of("V:C", class);
+        vars.index_of("A:Oid", oid);
+        assert_eq!(choose_fresh("O", &vars), "O2");
+        assert_eq!(choose_fresh("V", &vars), "V2");
+        assert_eq!(choose_fresh("A", &vars), "A2");
+        assert_eq!(choose_fresh("Atts", &vars), "Atts");
+        vars.index_of("V2", class);
+        vars.index_of("V3:C", class);
+        assert_eq!(choose_fresh("V", &vars), "V4");
     }
 }

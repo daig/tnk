@@ -69,12 +69,28 @@ pub struct PreModule {
     /// `true` for an object-oriented module or theory (`omod`/`oth`). Its class, subclass, and message
     /// declarations are desugared to ordinary signature entries, and `CONFIGURATION` is imported
     /// implicitly. During statement loading, object patterns are completed with an AttributeSet variable
-    /// and class constants are generalized to class-sorted variables.
+    /// and class constants are generalized to class-sorted variables; see
+    /// [`completes_object_patterns`](Self::completes_object_patterns).
     pub is_object: bool,
+    /// Build-time statement provenance recorded by flattening, parallel to
+    /// [`statements`](Self::statements): whether each statement was declared by an object module or
+    /// theory, directly or through a renamed, instantiated, or parameter-copy donation. Empty for a module
+    /// that was not flattened, whose statements are all its own. Like statement homes, this is not
+    /// reflected statement metadata.
+    pub object_statements: Vec<bool>,
     /// Strategy declarations and definitions; empty for a non-strategy module.
     pub strat_decls: Vec<StratDecl>,
     /// `sd`/`csd` definitions; empty for a non-strategy module.
     pub strat_defs: Vec<StratDef>,
+}
+
+impl PreModule {
+    /// Whether statement loading completes the object patterns of `statements[index]`: every statement
+    /// of an object module or theory, the statements it imports included, and every statement that an
+    /// object module or theory donates to a non-object importer.
+    pub fn completes_object_patterns(&self, index: usize) -> bool {
+        self.is_object || self.object_statements.get(index).copied().unwrap_or(false)
+    }
 }
 
 /// A formal module/view parameter `X :: T`: parameter name and its bounding theory.

@@ -2392,7 +2392,7 @@ fn objects_outcomes(out: &str) -> Vec<String> {
     while let Some(line) = lines.next() {
         if matches!(
             line.split(' ').next(),
-            Some("rewrite" | "reduce" | "search" | "erewrite")
+            Some("rewrite" | "reduce" | "search" | "erewrite" | "vu-narrow")
         ) {
             // Skip the echo block: this line plus continuations, through the trailing ` .`.
             let mut l = line;
@@ -2598,6 +2598,432 @@ fn objects_omod_attrs_through_repl() {
     );
 }
 
+/// A statement whose right side or condition gives an object a class other than its left-side class is
+/// not completed: it keeps the written class, matches only the objects it matches as written, and an
+/// unbound right-side class variable is dropped instead of becoming executable. A class-preserving rule
+/// in the same module is still completed.
+#[test]
+fn objects_omod_class_change_through_repl() {
+    let mut r = repl();
+    let built = r
+        .eval(concat!(
+            "omod SHIFT is\n",
+            "  sort Val .\n",
+            "  op k : -> Val [ctor] .\n",
+            "  class Open | bal : Val .\n",
+            "  class Closed | bal : Val .\n",
+            "  class Frozen | why : Val .\n",
+            "  subclass Frozen < Closed .\n",
+            "  class Gold | perk : Val .\n",
+            "  subclass Gold < Open .\n",
+            "  op junk : -> Cid [ctor] .\n",
+            "  op a : -> Oid [ctor] .\n",
+            "  msgs close toJunk reopen bad go keep : -> Msg .\n",
+            "  msg become : Cid -> Msg .\n",
+            "  op f : Object -> Val .\n",
+            "  var O : Oid .  var N : Val .\n",
+            "  rl close < O : Open | bal : N > => < O : Closed | bal : N > .\n",
+            "  rl toJunk < O : Open | bal : N > => < O : junk | bal : N > .\n",
+            "  rl become(K:Open) < O : Open | bal : N > => < O : K:Open | bal : N > .\n",
+            "  rl reopen < O : C:Closed | bal : N > => < O : Open | bal : N > .\n",
+            "  rl bad < O : Closed | bal : N > => < O : W:Open | bal : N > .\n",
+            "  eq f(< O : Closed | bal : N >) = k .\n",
+            "  crl go < O : Open | bal : N > => < O : Open | bal : N > if f(< O : Closed | bal : N >) = k .\n",
+            "  rl keep < O : Open | bal : N > => < O : Open | bal : N > .\n",
+            "endom\n",
+        ))
+        .output;
+    // Only `bad` is dropped: as written, its right-side class variable `W:Open` is unbound.
+    assert_eq!(
+        built.matches("dropped").count(),
+        1,
+        "only the unbound-class rule is dropped: {built}"
+    );
+    assert!(
+        built.contains("line 20: dropped rule: unbound variable in rule"),
+        "{built}"
+    );
+    let out = r
+        .eval(concat!(
+            "rew close < a : Open | bal : k > .\n",
+            "rew toJunk < a : Open | bal : k > .\n",
+            "rew become(Gold) < a : Open | bal : k > .\n",
+            "rew reopen < a : Closed | bal : k > .\n",
+            "rew reopen < a : Frozen | bal : k, why : k > .\n",
+            "rew bad < a : Closed | bal : k > .\n",
+            "rew go < a : Open | bal : k > .\n",
+            "rew keep < a : Gold | bal : k, perk : k > .\n",
+        ))
+        .output;
+    assert_eq!(
+        objects_outcomes(&out),
+        vec![
+            // The written right-side class is the result class: a class constant, a non-class `Cid`
+            // constant, and a class carried by a message.
+            "rewrites: 1",
+            "result Object: < a : Closed | bal : k >",
+            "rewrites: 1",
+            "result Object: < a : junk | bal : k >",
+            "rewrites: 1",
+            "result Object: < a : Gold | bal : k >",
+            // A left-side class variable still matches the exact object, but the rule does not carry a
+            // Frozen-only attribute into an Open object.
+            "rewrites: 1",
+            "result Object: < a : Open | bal : k >",
+            "rewrites: 0",
+            "result Configuration: reopen < a : Frozen | bal : k, why : k >",
+            // The dropped rule does not fire.
+            "rewrites: 0",
+            "result Configuration: bad < a : Closed | bal : k >",
+            // The condition tests the written Closed object, which the completed `f` equation reduces.
+            "rewrites: 2",
+            "result Object: < a : Open | bal : k >",
+            // Control: the class-preserving rule is completed, so it matches a subclass object that
+            // carries an extra attribute.
+            "rewrites: 1",
+            "result Object: < a : Gold | bal : k, perk : k >",
+        ],
+        "class-changing statements keep their written meaning: {out}"
+    );
+}
+
+/// An `Attribute`-sorted constant or binary operator in an attribute set is not an attribute term, so
+/// completion leaves the statement as written instead of adding a one-argument `flag(A:[K])` to the left
+/// side. The rules fire as written, and `upModule` reflects them uncompleted rather than panicking on an
+/// arity-mismatched pattern.
+#[test]
+fn objects_omod_non_attribute_elements_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude")); // `upModule`
+    let built = r
+        .eval(concat!(
+            "omod TAGS is\n",
+            "  sort Val .\n",
+            "  op k : -> Val [ctor] .\n",
+            "  class C | v : Val .\n",
+            "  op flag : -> Attribute [ctor] .\n",
+            "  op pair : Val Val -> Attribute [ctor] .\n",
+            "  op a : -> Oid [ctor] .\n",
+            "  msgs addFlag addPair dropFlag : -> Msg .\n",
+            "  var O : Oid .  var X : Val .\n",
+            "  rl [af] : addFlag < O : C | v : X > => < O : C | v : X, flag > .\n",
+            "  rl [ap] : addPair < O : C | v : X > => < O : C | v : X, pair(X, X) > .\n",
+            "  rl [df] : dropFlag < O : C | v : X, flag > => < O : C | v : X > .\n",
+            "endom\n",
+        ))
+        .output;
+    assert!(
+        !built.contains("dropped") && !built.contains("error"),
+        "{built}"
+    );
+    let out = r
+        .eval(concat!(
+            "rew addFlag < a : C | v : k > .\n",
+            "rew addPair < a : C | v : k > .\n",
+            "rew dropFlag < a : C | v : k, flag > .\n",
+        ))
+        .output;
+    assert_eq!(
+        objects_outcomes(&out),
+        vec![
+            "rewrites: 1",
+            "result Object: < a : C | flag, v : k >",
+            "rewrites: 1",
+            "result Object: < a : C | v : k, pair(k, k) >",
+            // `flag` is not copied back to the right side, so the rule removes it.
+            "rewrites: 1",
+            "result Object: < a : C | v : k >",
+        ],
+        "statements with non-attribute elements keep their written meaning: {out}"
+    );
+    let up = r
+        .eval("red in META-LEVEL : upModule('TAGS, false) .\n")
+        .output;
+    assert!(up.contains("result SModule: mod 'TAGS is"), "{up}");
+    // All three rules come back as written: each of the six object patterns keeps the class constant
+    // `'C.C`, `'flag.Attribute` stays a constant, and no completion variable is added.
+    assert_eq!(up.matches("'C.C").count(), 6, "uncompleted classes: {up}");
+    assert_eq!(up.matches("'flag.Attribute").count(), 2, "{up}");
+    for absent in ["Atts", "'V:", "'A:"] {
+        assert!(
+            !up.contains(absent),
+            "no completion variable `{absent}`: {up}"
+        );
+    }
+}
+
+/// Completion's fresh class and attribute-set variables avoid the base names of the statement's own
+/// variables. A user `V:C` or `Atts:AttributeSet` and the fresh variable of the same sort therefore stay
+/// two variables when the completed rule is up-translated, so a reused reflected module means the same.
+#[test]
+fn objects_omod_fresh_names_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude")); // `upModule`
+    let built = r
+        .eval(concat!(
+            "omod FRESH is\n",
+            "  sort T .\n",
+            "  op t : -> T [ctor] .\n",
+            "  class C .\n",
+            "  class D .\n",
+            "  subclass D < C .\n",
+            "  class E | n : T .\n",
+            "  msg m : Cid -> Msg .\n",
+            "  msg sync : AttributeSet -> Msg .\n",
+            "  op o : -> Oid [ctor] .\n",
+            "  rl [r] : m(V:C) < O:Oid : C | S:AttributeSet > => < O:Oid : C | S:AttributeSet > .\n",
+            "  rl [s] : sync(Atts:AttributeSet) < O:Oid : E | n : t > => < O:Oid : E | n : t > .\n",
+            "endom\n",
+        ))
+        .output;
+    assert!(
+        !built.contains("dropped") && !built.contains("error"),
+        "{built}"
+    );
+    let out = r
+        .eval(concat!(
+            "rew m(D) < o : C | none > .\n",
+            "rew sync(none) < o : E | n : t > .\n",
+        ))
+        .output;
+    assert_eq!(
+        objects_outcomes(&out),
+        vec![
+            "rewrites: 1",
+            "result Object: < o : C | none >",
+            "rewrites: 1",
+            "result Object: < o : E | n : t >",
+        ],
+        "completed rules fire at object level: {out}"
+    );
+    let up = r
+        .eval("red in META-LEVEL : upModule('FRESH, false) .\n")
+        .output;
+    // Each user variable appears once, as the message argument; the fresh class variable of `[r]` and the
+    // fresh attribute-set variable of `[s]` take other base names in both object occurrences.
+    for (token, count) in [
+        ("'V:C", 1),
+        ("'V2:C", 2),
+        ("'Atts:AttributeSet", 1),
+        ("'Atts2:AttributeSet", 2),
+    ] {
+        assert_eq!(up.matches(token).count(), count, "`{token}`: {up}");
+    }
+}
+
+/// Object-module `[narrowing]` rules that completion transforms load, rewrite, and narrow, also in an
+/// importing module. Completion introduces `V2` in `[r]`, whose on-the-fly `V:C` takes the base `V`, and
+/// `V`, `A2`, and `Atts` in `[s]`. Like an on-the-fly variable, none of these names was lexed on its own,
+/// so building the module interns them for the narrowing display trace instead of panicking.
+#[test]
+fn objects_omod_narrowing_completion_through_repl() {
+    let mut r = repl();
+    let built = r
+        .eval(concat!(
+            "omod NARROW-OO is\n",
+            "  sort Val .\n",
+            "  ops a b : -> Val [ctor] .\n",
+            "  class C | val : Val .\n",
+            "  class D | other : Val .\n",
+            "  subclass D < C .\n",
+            "  msgs m s : Cid -> Msg .\n",
+            "  op o : -> Oid [ctor] .\n",
+            "  var O : Oid .  var S : AttributeSet .\n",
+            "  rl [r] : m(V:C) < O : C | val : X:Val, S > => < O : C | val : a, S > [narrowing] .\n",
+            "  rl [s] : s(A:C) < O : C | val : b > => < O : C | val : a, other : a > [narrowing] .\n",
+            "endom\n",
+        ))
+        .output;
+    assert!(
+        !built.contains("dropped") && !built.contains("error"),
+        "{built}"
+    );
+    // Completed, both rules match a subclass object that carries an extra attribute.
+    let out = r
+        .eval(concat!(
+            "rew m(D) < o : D | val : b, other : b > .\n",
+            "rew s(D) < o : D | val : b, other : b > .\n",
+        ))
+        .output;
+    assert_eq!(
+        objects_outcomes(&out),
+        vec![
+            "rewrites: 1",
+            "result Object: < o : D | val : a, other : b >",
+            "rewrites: 1",
+            "result Object: < o : D | val : a, other : a >",
+        ],
+        "completed narrowing rules rewrite: {out}"
+    );
+    let narrow = concat!(
+        "vu-narrow [1] m(D) < o : D | val : b, other : b > =>1 Y:Configuration .\n",
+        "vu-narrow [1] s(D) < o : D | val : b, other : b > =>1 Y:Configuration .\n",
+    );
+    let answers = vec![
+        "",
+        "Solution 1",
+        "rewrites: 1",
+        "state: < o : D | val : a, other : b >",
+        "accumulated substitution:",
+        "variant unifier:",
+        "Y:Configuration --> < o : D | val : a, other : b >",
+        "",
+        "Solution 1",
+        "rewrites: 1",
+        "state: < o : D | val : a, other : a >",
+        "accumulated substitution:",
+        "variant unifier:",
+        "Y:Configuration --> < o : D | val : a, other : a >",
+    ];
+    let out = r.eval(narrow).output;
+    assert_eq!(
+        objects_outcomes(&out),
+        answers,
+        "narrowing in the module: {out}"
+    );
+    let user = r
+        .eval("omod NARROW-OO-USER is\n  including NARROW-OO .\nendom\n")
+        .output;
+    assert!(!user.contains("error"), "{user}");
+    let out = r.eval(narrow).output;
+    assert_eq!(
+        objects_outcomes(&out),
+        answers,
+        "narrowing in an importer: {out}"
+    );
+}
+
+/// A statement declared by an object module keeps its completion in a non-object importer: a `mod` that
+/// imports an `omod` directly, transitively, renamed, or instantiated runs the completed rule, which
+/// matches a subclass object or an object with an attribute the rule does not mention. An `omod` root
+/// still completes the object-syntax rule of a plain `mod` it imports, which the `mod` itself runs as
+/// written.
+#[test]
+fn objects_imported_omod_completion_through_repl() {
+    let mut r = repl();
+    let built = r
+        .eval(concat!(
+            "omod LAMP is\n",
+            "  sort Mode .\n",
+            "  ops on off : -> Mode [ctor] .\n",
+            "  op k : -> Oid [ctor] .\n",
+            "  class Lamp | st : Mode .\n",
+            "  class Dim | lvl : Mode .\n",
+            "  subclass Dim < Lamp .\n",
+            "  var O : Oid .\n",
+            "  rl [flip] : < O : Lamp | st : off > => < O : Lamp | st : on > .\n",
+            "endom\n",
+            "mod DIRECT is protecting LAMP . endm\n",
+            "mod MID is protecting LAMP . endm\n",
+            "mod TRANS is protecting MID . endm\n",
+            "mod RENAMED is protecting LAMP * (class Lamp to Light, attr st to state) . endm\n",
+            "fth ELT is sort Elt . endfth\n",
+            "omod BOX{X :: ELT} is\n",
+            "  op b : -> Oid [ctor] .\n",
+            "  class Box | val : X$Elt, tag : X$Elt, n : X$Elt .\n",
+            "  vars E F : X$Elt .\n",
+            "  rl [swap] : < b : Box | val : E, tag : F > => < b : Box | val : F, tag : E > .\n",
+            "endom\n",
+            "fmod VAL is sort V . ops p q : -> V [ctor] . endfm\n",
+            "view ToV from ELT to VAL is sort Elt to V . endv\n",
+            "mod INST is protecting BOX{ToV} . endm\n",
+            "mod PLAIN is\n",
+            "  including CONFIGURATION .\n",
+            "  sort Hue .\n",
+            "  ops c d : -> Hue [ctor] .\n",
+            "  op y : -> Oid [ctor] .\n",
+            "  sort Tint .\n",
+            "  subsort Tint < Cid .\n",
+            "  op Tint : -> Tint [ctor] .\n",
+            "  op v :_ : Hue -> Attribute [ctor] .\n",
+            "  op w :_ : Hue -> Attribute [ctor] .\n",
+            "  var O : Oid .\n",
+            "  rl [paint] : < O : Tint | v : c > => < O : Tint | v : d > .\n",
+            "endm\n",
+            "omod OROOT is\n",
+            "  protecting PLAIN .\n",
+            "endom\n",
+        ))
+        .output;
+    assert!(
+        !built.contains("dropped") && !built.contains("error"),
+        "{built}"
+    );
+    let out = r
+        .eval(concat!(
+            "rew in DIRECT : < k : Dim | st : off, lvl : on > .\n",
+            "rew in TRANS : < k : Dim | st : off, lvl : on > .\n",
+            "rew in RENAMED : < k : Dim | state : off, lvl : on > .\n",
+            "rew [1] in INST : < b : Box | val : p, tag : q, n : p > .\n",
+            "rew in PLAIN : < y : Tint | v : c, w : c > .\n",
+            "rew in OROOT : < y : Tint | v : c, w : c > .\n",
+        ))
+        .output;
+    assert_eq!(
+        objects_outcomes(&out),
+        vec![
+            "rewrites: 1",
+            "result Object: < k : Dim | st : on, lvl : on >",
+            "rewrites: 1",
+            "result Object: < k : Dim | st : on, lvl : on >",
+            "rewrites: 1",
+            "result Object: < k : Dim | state : on, lvl : on >",
+            "rewrites: 1",
+            "result Object: < b : Box | val : q, tag : p, n : p >",
+            "rewrites: 0",
+            "result Object: < y : Tint | v : c, w : c >",
+            "rewrites: 1",
+            "result Object: < y : Tint | v : d, w : c >",
+        ],
+        "imported object-module rules stay completed: {out}"
+    );
+}
+
+/// At the metalevel, a reflected `mod` that includes an `omod` runs the omod's completed rule, and the
+/// flat reflection of a `mod` that imports an `omod` shows that completed rule.
+#[test]
+fn objects_imported_omod_completion_meta_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude"));
+    let built = r
+        .eval(concat!(
+            "omod LAMP is\n",
+            "  sort Mode .\n",
+            "  ops on off : -> Mode [ctor] .\n",
+            "  op k : -> Oid [ctor] .\n",
+            "  class Lamp | st : Mode, lvl : Mode .\n",
+            "  var O : Oid .\n",
+            "  rl [flip] : < O : Lamp | st : off > => < O : Lamp | st : on > .\n",
+            "endom\n",
+            "mod DIRECT is\n",
+            "  protecting LAMP .\n",
+            "endm\n",
+        ))
+        .output;
+    assert!(
+        !built.contains("dropped") && !built.contains("error"),
+        "{built}"
+    );
+    let rewritten = r
+        .eval(concat!(
+            "red in META-LEVEL : metaRewrite(mod 'T is including 'LAMP . sorts none . ",
+            "none none none none none endm, ",
+            "'<_:_|_>['k.Oid, 'Lamp.Lamp, '_`,_['st`:_['off.Mode], 'lvl`:_['on.Mode]]], 1) .\n",
+        ))
+        .output;
+    assert!(
+        rewritten.contains("'st`:_['on.Mode]"),
+        "the reflected importer runs the completed rule: {rewritten}"
+    );
+    let up = r
+        .eval("red in META-LEVEL : upRls('DIRECT, true) .\n")
+        .output;
+    for marker in ["'V:Lamp", "'Atts:AttributeSet", "[label('flip)]"] {
+        assert!(up.contains(marker), "flat rule lacks `{marker}`: {up}");
+    }
+    assert!(!up.contains("'Lamp.Lamp"), "flat rule is completed: {up}");
+}
+
 /// The object-message scheduler handles both its single-object fast path and generic multi-object path.
 #[test]
 fn objects_omod_multi_through_repl() {
@@ -2724,6 +3150,94 @@ fn objects_oth_meta_through_repl() {
             "oth rule missing completion marker `{marker}`: {out}"
         );
     }
+}
+
+/// An object module's `[nonexec]` rules, equations, and memberships up-translate completed, like its
+/// executable statements, also in the flat reflection of a non-object importer. A module rebuilt from the
+/// reflected pieces therefore narrows with the completed `[nonexec narrowing]` rule, as the object module
+/// itself does, instead of failing on an object that carries an attribute the rule does not mention.
+#[test]
+fn objects_omod_nonexec_meta_through_repl() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude"));
+    let built = r
+        .eval(concat!(
+            "omod NONEXEC is\n",
+            "  sorts Mode Lit .\n",
+            "  subsort Lit < Object .\n",
+            "  ops on off : -> Mode [ctor] .\n",
+            "  op x : -> Oid [ctor] .\n",
+            "  class Lamp | st : Mode, w : Mode .\n",
+            "  op flip : Object -> Object .\n",
+            "  var O : Oid .\n",
+            "  var M : Mode .\n",
+            "  rl [ne] : < O : Lamp | st : M > => < O : Lamp | st : off > [nonexec] .\n",
+            "  rl [nr] : < O : Lamp | st : M > => < O : Lamp | st : on > [nonexec narrowing] .\n",
+            "  eq flip(< O : Lamp | st : M >) = < O : Lamp | st : on > [nonexec] .\n",
+            "  mb (< O : Lamp | st : on >) : Lit [nonexec] .\n",
+            "endom\n",
+            "mod NONEXEC-USER is\n",
+            "  protecting NONEXEC .\n",
+            "endm\n",
+        ))
+        .output;
+    assert!(
+        !built.contains("dropped") && !built.contains("error"),
+        "{built}"
+    );
+    let up = r
+        .eval(concat!(
+            "red in META-LEVEL : upRls('NONEXEC, false) .\n",
+            "red in META-LEVEL : upEqs('NONEXEC, false) .\n",
+            "red in META-LEVEL : upMbs('NONEXEC, false) .\n",
+        ))
+        .output;
+    assert!(
+        !up.contains("'Lamp.Lamp"),
+        "no class constant remains: {up}"
+    );
+    // Two object occurrences in each rule and the equation, one in the membership.
+    assert_eq!(up.matches("'V:Lamp").count(), 7, "{up}");
+    assert_eq!(up.matches("'Atts:AttributeSet").count(), 7, "{up}");
+    for attributes in [
+        "[nonexec label('ne)]",
+        "nonexec narrowing label('nr)]",
+        "]]] [nonexec] .",
+        "'Lit [nonexec] .",
+    ] {
+        assert!(up.contains(attributes), "`{attributes}`: {up}");
+    }
+    let flat = r
+        .eval("red in META-LEVEL : upRls('NONEXEC-USER, true) .\n")
+        .output;
+    assert!(!flat.contains("'Lamp.Lamp"), "{flat}");
+    assert_eq!(flat.matches("'Atts:AttributeSet").count(), 4, "{flat}");
+
+    let object = r
+        .eval("vu-narrow [1] in NONEXEC : < x : Lamp | st : off, w : off > =>1 Z:Object .\n")
+        .output;
+    assert!(
+        object.contains("state: < x : Lamp | st : on, w : off >"),
+        "{object}"
+    );
+    // A fresh module name keeps the named-module facade from resolving the descent to `NONEXEC` itself.
+    let rebuilt = r
+        .eval(concat!(
+            "red in META-LEVEL : metaNarrowingSearch(mod 'COPY is ",
+            "getImports(upModule('NONEXEC, false)) ",
+            "sorts getSorts(upModule('NONEXEC, false)) . ",
+            "getSubsorts(upModule('NONEXEC, false)) getOps(upModule('NONEXEC, false)) ",
+            "getMbs(upModule('NONEXEC, false)) getEqs(upModule('NONEXEC, false)) ",
+            "getRls(upModule('NONEXEC, false)) endm, ",
+            "'<_:_|_>['x.Oid, 'Lamp.Lamp, '_`,_['st`:_['off.Mode], 'w`:_['off.Mode]]], ",
+            "'Z:Object, '+, 1, 'none, 0) .\n",
+        ))
+        .output;
+    assert!(
+        !rebuilt.contains("(failure)") && rebuilt.contains("result NarrowingSearchResult: {"),
+        "the rebuilt module narrows: {rebuilt}"
+    );
+    assert!(rebuilt.contains("'st`:_['on.Mode]"), "{rebuilt}");
 }
 
 /// `upEqs`/`upMbs`/`upRls` retain a module's own `[nonexec]` axioms and labels in declaration order.

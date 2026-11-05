@@ -567,9 +567,14 @@ fn load_statements_homed_before_host_bindings<'m>(
     home_mod: &dyn Fn(&str) -> Option<&'m LoadedModule>,
     i: &Interner,
 ) -> Result<(Vec<Option<StatementTraceRef>>, Vec<Diagnostic>), String> {
-    // Resolve object-pattern completion context once for a flattened object module: its CONFIGURATION
-    // object constructor, AttributeSet operator, and class sorts. No context means no completion.
-    let oo = pm.is_object.then(|| m.engine.oo_info()).flatten();
+    // Resolve object-pattern completion context once: its CONFIGURATION object constructor, AttributeSet
+    // operator, and class sorts. It applies to the statements selected by
+    // `PreModule::completes_object_patterns`: all of a flattened object module's statements, and an
+    // object module's statements under any importer. No context means no completion.
+    let oo = (pm.is_object || pm.object_statements.contains(&true))
+        .then(|| m.engine.oo_info())
+        .flatten();
+    let no_oo = None;
     // Cache home-module grammars remapped onto this flattened module's symbols. Imported statements use
     // these first; `None` means the home is unavailable or cannot be remapped, so the flat grammar is used.
     let mut home_grammars: HashMap<String, Option<CompiledGrammar>> = HashMap::new();
@@ -589,6 +594,11 @@ fn load_statements_homed_before_host_bindings<'m>(
             Statement::Eq { .. } => StatementTraceRef::Equation(m.eq_traces.len()),
             Statement::Rule { .. } => StatementTraceRef::Rule(m.rl_traces.len()),
         };
+        let stmt_oo = if pm.completes_object_patterns(idx) {
+            &oo
+        } else {
+            &no_oo
+        };
         // Imported statements belong to their defining grammar. Trying the flattened grammar first is
         // unsafe even when it parses: importer declarations can shadow a home variable name and change
         // its sort without producing an error.
@@ -600,7 +610,7 @@ fn load_statements_homed_before_host_bindings<'m>(
                 home_grammars.insert(home.to_string(), remapped);
             }
             if let Some(hg) = home_grammars.get(home).and_then(Option::as_ref) {
-                match load_one_stmt(stmt, m, hg, true, false, &oo, i) {
+                match load_one_stmt(stmt, m, hg, true, false, stmt_oo, i) {
                     Ok(registered) => {
                         trace_refs.push(registered.then_some(trace_ref));
                         continue;
@@ -623,7 +633,7 @@ fn load_statements_homed_before_host_bindings<'m>(
             .is_some_and(|home| home == m.name);
         // Home parsing was not applicable or failed. A statement whose flattened parse/build fails is
         // dropped with an owned diagnostic; nothing is registered before the last fallible check.
-        match load_one_stmt(stmt, m, g, false, own_statement, &oo, i) {
+        match load_one_stmt(stmt, m, g, false, own_statement, stmt_oo, i) {
             Ok(registered) => {
                 trace_refs.push(registered.then_some(trace_ref));
             }
@@ -664,7 +674,7 @@ fn load_statements_homed_before_host_bindings<'m>(
 /// normalized `Term`s, so AC and ACU arguments follow canonical rather than parser order.
 fn normalize_trace_term(
     m: &mut BuiltModule,
-    i: &Interner,
+    i: &mut Interner,
     vars: &VarIndex,
     term: &Term,
 ) -> Result<Term, ReducerFault> {
@@ -672,10 +682,7 @@ fn normalize_trace_term(
         .map(|slot| {
             let source = vars.name(slot);
             let base = source.split_once(':').map_or(source, |(base, _)| base);
-            let name = i
-                .get(base)
-                .expect("statement variable name was interned by the lexer")
-                .index();
+            let name = i.intern(base).index();
             m.engine.make_var(vars.sort(slot), name, slot)
         })
         .collect();
@@ -696,9 +703,9 @@ fn normalize_trace_term_with_bindings(
 /// pending host attachments have committed. Public symbolic normalization therefore seals a complete
 /// signature rather than blocking its first attachment.
 ///
-/// Variables are named by their interned base names. Not every base name has been interned: the lexer
-/// interns an on-the-fly `Zqx:S` as one token, and object completion invents `V`, `Atts`, ... without
-/// interning. Such names are interned here, as the narrowing command interns its subject variables.
+/// A variable's base name need not have been lexed on its own: the lexer interns an on-the-fly `X:S` as
+/// one token, and object completion introduces names such as `V2` or `Atts`. Such base names are
+/// interned here, as the narrowing command path interns its variables' base names.
 fn normalize_narrowing_traces(
     m: &mut BuiltModule,
     interner: &mut Interner,
@@ -1419,14 +1426,18 @@ pub enum StmtTrace {
 }
 
 /// Parse a statement's raw bubbles into a [`StmtTrace`] against an already-built module's grammar and
-/// signature without registering it or completing object patterns. This exposes `[nonexec]` statements
-/// to reflective rendering even though engine loading skips them. The left side, condition, and right
-/// side share one variable index; the trace retains `nonexec`, `owise`, and `label`.
+/// signature without registering it. This exposes `[nonexec]` statements to reflective rendering even
+/// though engine loading does not register them. When `oo` is the object-pattern completion context (the
+/// statement satisfies `PreModule::completes_object_patterns`), the statement is completed first, as
+/// engine loading completes executable statements and the rules of the narrowing and SMT tables. The left
+/// side, condition, and right side share one variable index; the trace retains `nonexec`, `owise`, and
+/// `label`.
 pub fn parse_statement_trace(
     stmt: &Statement,
     m: &BuiltModule,
     g: &CompiledGrammar,
     i: &Interner,
+    oo: Option<&tnk_core::engine::OoInfo>,
 ) -> Result<StmtTrace, String> {
     match stmt {
         Statement::Eq {
@@ -1439,13 +1450,23 @@ pub fn parse_statement_trace(
             label,
         } => {
             let mut vars = VarIndex::new();
-            let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+            let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
             let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
-            let condition = match cond {
+            let mut condition = match cond {
                 Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
                 None => Vec::new(),
             };
-            let rhs_t = parse_build_rhs(rhs, &lhs_t, g, m, i, &mut vars)?;
+            let mut rhs_t = parse_build_rhs(rhs, &lhs_t, g, m, i, &mut vars)?;
+            if let Some(info) = oo {
+                oo_complete::complete_statement(
+                    info,
+                    m,
+                    &mut vars,
+                    &mut lhs_t,
+                    Some(&mut rhs_t),
+                    &mut condition,
+                );
+            }
             reject_rewrite_fragment(&condition, "equation")?;
             let nr = vars.count();
             Ok(StmtTrace::Eq(EqTrace {
@@ -1467,13 +1488,23 @@ pub fn parse_statement_trace(
             label,
         } => {
             let mut vars = VarIndex::new();
-            let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+            let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
             let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
             let sort_id = resolve_sort(sort, m, i)?;
-            let condition = match cond {
+            let mut condition = match cond {
                 Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
                 None => Vec::new(),
             };
+            if let Some(info) = oo {
+                oo_complete::complete_statement(
+                    info,
+                    m,
+                    &mut vars,
+                    &mut lhs_t,
+                    None,
+                    &mut condition,
+                );
+            }
             reject_rewrite_fragment(&condition, "membership")?;
             let nr = vars.count();
             Ok(StmtTrace::Mb(MbTrace {
@@ -1494,13 +1525,23 @@ pub fn parse_statement_trace(
             narrowing,
         } => {
             let mut vars = VarIndex::new();
-            let lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+            let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
             let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
-            let condition = match cond {
+            let mut condition = match cond {
                 Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
                 None => Vec::new(),
             };
-            let rhs_t = parse_build_rhs(rhs, &lhs_t, g, m, i, &mut vars)?;
+            let mut rhs_t = parse_build_rhs(rhs, &lhs_t, g, m, i, &mut vars)?;
+            if let Some(info) = oo {
+                oo_complete::complete_statement(
+                    info,
+                    m,
+                    &mut vars,
+                    &mut lhs_t,
+                    Some(&mut rhs_t),
+                    &mut condition,
+                );
+            }
             // (a rule condition may carry a rewrite fragment `t => p`, so no reject here)
             let nr = vars.count();
             Ok(StmtTrace::Rl(RlTrace {
@@ -4756,21 +4797,25 @@ endm
         assert!(module.rl_traces[0].narrowing);
     }
 
-    /// Narrowing display traces name variables by interned base name. The lexer interns an on-the-fly
-    /// `Zqx:S` as one token, so its base name `Zqx` is interned on demand when the trace is normalized
-    /// instead of panicking; the rule stays executable and in the narrowing table.
+    /// The lexer interns an on-the-fly variable such as `Zqx:S` as one token, never its base name `Zqx`.
+    /// Normalizing the narrowing display trace of a rule that uses one interns the base name rather than
+    /// assuming the lexer did.
     #[test]
     fn narrowing_rule_with_on_the_fly_variable_loads() {
         let loaded = load_source(
-            "mod NARROW-OTF is\n\
-               sort S .\n\
-               op f : S -> S .\n\
-               rl [n] : f(Zqx:S) => Zqx:S [narrowing] .\n\
-             endm\n",
+            r#"
+mod NARROW-ON-THE-FLY is
+  sort S .
+  op f : S -> S .
+  rl [n] : f(Zqx:S) => Zqx:S [narrowing] .
+endm
+"#,
         )
-        .expect("load an on-the-fly narrowing variable");
+        .expect("load on-the-fly narrowing rule");
         let module = &loaded.modules[0].built;
-        assert_eq!(module.engine.narrowing_rules().len(), 1);
+        let rules = module.engine.narrowing_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].label.as_deref(), Some("n"));
         assert_eq!(module.rl_traces.len(), 1);
         assert!(module.rl_traces[0].narrowing);
         assert_eq!(module.rl_traces[0].var_names, ["Zqx:S"]);

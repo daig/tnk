@@ -590,6 +590,7 @@ fn premodule_of(d: &FlatDecls) -> PreModule {
         // This temporary module exists only to build the source grammar; no statements execute here, so
         // object-pattern completion is irrelevant.
         is_object: false,
+        object_statements: Vec::new(),
         params: Vec::new(),
         imports: Vec::new(),
         sorts: d.sorts.clone(),
@@ -775,6 +776,7 @@ mod tests {
             ops: vec![],
             vars: vec![],
             statements: vec![],
+            object_statements: vec![],
             strat_decls: vec![],
             strat_defs: vec![],
         }
@@ -843,6 +845,7 @@ mod tests {
             subsorts: pm.subsorts,
             ops: pm.ops,
             vars: pm.vars,
+            object_statements: vec![false; pm.statements.len()],
             statements: pm.statements,
             strat_decls: pm.strat_decls,
             strat_defs: pm.strat_defs,

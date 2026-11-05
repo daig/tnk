@@ -25,6 +25,10 @@ pub struct FlatDecls {
     pub ops: Vec<OpDecl>,
     pub vars: Vec<VarDecl>,
     pub statements: Vec<Statement>,
+    /// Whether each statement was declared by an object module or theory, parallel to
+    /// [`statements`](Self::statements). Renaming and instantiation rewrite statements in place, so the
+    /// flags stay aligned; the flattened module exposes them as [`PreModule::object_statements`].
+    pub object_statements: Vec<bool>,
     pub strat_decls: Vec<tnk_frontend::surface::ast::StratDecl>,
     pub strat_defs: Vec<tnk_frontend::surface::ast::StratDef>,
 }
@@ -39,6 +43,9 @@ struct Acc {
     vars: Vec<VarDecl>,
     var_set: HashSet<String>,
     statements: Vec<Statement>,
+    /// Per-statement object-module provenance ([`FlatDecls::object_statements`]), in lockstep with
+    /// `statements`.
+    object_statements: Vec<bool>,
     strat_decls: Vec<tnk_frontend::surface::ast::StratDecl>,
     strat_defs: Vec<tnk_frontend::surface::ast::StratDef>,
     /// Per-statement **home** module name, parallel to [`statements`](Self::statements). `Some(name)` marks
@@ -77,7 +84,13 @@ impl Acc {
             home.map(str::to_string),
             d.statements.len(),
         ));
+        debug_assert_eq!(
+            d.object_statements.len(),
+            d.statements.len(),
+            "object_statements parallel to statements"
+        );
         self.statements.extend(d.statements);
+        self.object_statements.extend(d.object_statements);
         self.strat_decls.extend(d.strat_decls);
         self.strat_defs.extend(d.strat_defs);
     }
@@ -89,6 +102,7 @@ impl Acc {
             ops: self.ops,
             vars: self.vars,
             statements: self.statements,
+            object_statements: self.object_statements,
             strat_decls: self.strat_decls,
             strat_defs: self.strat_defs,
         }
@@ -96,7 +110,7 @@ impl Acc {
 }
 
 /// The declaration bundle a module contributes *itself* (excludes its imports — those are collected
-/// separately, before it).
+/// separately, before it). Its statements carry the module's own object-orientation.
 fn own_decls(pm: &PreModule) -> FlatDecls {
     FlatDecls {
         sorts: pm.sorts.clone(),
@@ -104,6 +118,7 @@ fn own_decls(pm: &PreModule) -> FlatDecls {
         ops: pm.ops.clone(),
         vars: pm.vars.clone(),
         statements: pm.statements.clone(),
+        object_statements: vec![pm.is_object; pm.statements.len()],
         strat_decls: pm
             .strat_decls
             .iter()
@@ -207,10 +222,12 @@ pub fn flatten_with_homes(
     // (`mod` stays a system module — its rules survive flattening) and its theory flag.
     let root = db.get(name);
     // Root statements precede imported statements; imports donate post-order, deepest first. Move the
-    // root-owned block to the front while preserving declaration order and rotating home tags in lockstep.
+    // root-owned block to the front while preserving declaration order and rotating home tags and
+    // object-module provenance in lockstep.
     if let Some(pm) = root {
         acc.statements.rotate_right(pm.statements.len());
         acc.statement_homes.rotate_right(pm.statements.len());
+        acc.object_statements.rotate_right(pm.statements.len());
         acc.strat_decls.rotate_right(pm.strat_decls.len());
         acc.strat_defs.rotate_right(pm.strat_defs.len());
     }
@@ -262,6 +279,9 @@ pub fn flatten_with_homes(
         // The flattened module keeps the root's object-orientation, so `load_statements` runs the
         // object-pattern completion on its (own + imported) statements when the root is an `omod`.
         is_object,
+        // Under any root, a statement declared by an object module is completed: importing an `omod`
+        // into a `mod` keeps the meaning of the omod's statements.
+        object_statements: d.object_statements,
         // The flattened module is fully resolved: each parameter's copy (its `X$s` sorts) is inlined, so
         // no formal parameters remain.
         params: Vec::new(),
@@ -322,6 +342,7 @@ pub fn flatten_pre(
     acc.add(own, None);
     acc.statements.rotate_right(pm.statements.len());
     acc.statement_homes.rotate_right(pm.statements.len());
+    acc.object_statements.rotate_right(pm.statements.len());
     acc.strat_decls.rotate_right(pm.strat_decls.len());
     acc.strat_defs.rotate_right(pm.strat_defs.len());
     let d = acc.into_decls();
@@ -333,6 +354,7 @@ pub fn flatten_pre(
         is_theory: pm.is_theory,
         is_strategy: pm.is_strategy,
         is_object: pm.is_object,
+        object_statements: d.object_statements,
         params: Vec::new(),
         imports: Vec::new(),
         sorts: d.sorts,
@@ -2462,5 +2484,109 @@ fmod TOP is protecting L . protecting R . endfm
             .collect::<Vec<_>>();
         assert_eq!(declarations, ["local", "imported"]);
         assert_eq!(definitions, ["local", "imported"]);
+    }
+
+    /// Flattening records which statements an object module or theory declared, through plain and
+    /// transitive imports, a renaming, an instantiation, and a parameter copy, in lockstep with the
+    /// root-first statement order. A non-object root therefore completes exactly its imported
+    /// object-module statements; an object root completes every statement.
+    #[test]
+    fn object_statements_follow_the_declaring_module() {
+        let (mut db, views, mut interner) = db_of(
+            "omod OBJ is
+               sort V .
+               op v : -> V [ctor] .
+               class C | a : V .
+               var X : Oid .
+               rl [obj] : < X : C | a : v > => < X : C | a : v > .
+             endom
+             oth OTH is
+               sort W .
+               op w : -> W .
+               class D | b : W .
+               var Y : Oid .
+               rl [oth] : < Y : D | b : w > => < Y : D | b : w > .
+             endoth
+             fth ELT is sort Elt . endfth
+             omod BOX{X :: ELT} is
+               class Box | e : X$Elt .
+               var Z : Oid .
+               rl [box] : < Z : Box | e : E:X$Elt > => < Z : Box | e : E:X$Elt > .
+             endom
+             fmod PLAIN is sort S . ops p q : -> S . eq [plain] : p = q . endfm
+             view ToS from ELT to PLAIN is sort Elt to S . endv
+             mod MID is protecting OBJ . endm
+             mod USE{T :: OTH} is
+               protecting MID .
+               protecting OBJ * (class C to C2) .
+               protecting BOX{ToS} .
+               protecting PLAIN .
+               sort U .
+               ops u u' : -> U .
+               eq [own] : u = u' .
+             endm
+             omod OROOT is protecting PLAIN . protecting OBJ .
+             endom",
+        );
+        for name in ["OBJ", "OTH", "BOX"] {
+            let imports = db.get(name).expect("object module").imports.clone();
+            crate::prelude::ensure_builtins(&imports, &mut db, &mut interner);
+        }
+        let labelled = |pm: &PreModule| {
+            assert_eq!(pm.object_statements.len(), pm.statements.len());
+            pm.statements
+                .iter()
+                .enumerate()
+                .filter_map(|(index, statement)| {
+                    let (Statement::Eq { label, .. }
+                    | Statement::Mb { label, .. }
+                    | Statement::Rule { label, .. }) = statement;
+                    label.clone().map(|label| {
+                        (
+                            label,
+                            pm.object_statements[index],
+                            pm.completes_object_patterns(index),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let entry =
+            |label: &str, object: bool, completes: bool| (label.to_string(), object, completes);
+
+        // Root-owned first, then the parameter copy, MID's OBJ, the renamed OBJ, and the instance, whose
+        // view target PLAIN is collected before BOX's own statements.
+        let flat = flatten("USE", &db, &views, &mut interner).expect("flatten USE");
+        assert!(!flat.is_object);
+        assert_eq!(
+            labelled(&flat),
+            [
+                entry("own", false, false),
+                entry("oth", true, true),
+                entry("obj", true, true),
+                entry("obj", true, true),
+                entry("plain", false, false),
+                entry("box", true, true),
+            ]
+        );
+
+        let flat = flatten("OROOT", &db, &views, &mut interner).expect("flatten OROOT");
+        assert_eq!(
+            labelled(&flat),
+            [entry("plain", false, true), entry("obj", true, true)]
+        );
+
+        // A transient root (META-LEVEL descent) keeps its own statements first, in lockstep.
+        let mut transient = db.get("USE").expect("USE").clone();
+        transient.params.clear();
+        transient.imports.truncate(1);
+        let flat = flatten_pre(&transient, &db, &views, &mut interner).expect("flatten_pre");
+        assert_eq!(
+            labelled(&flat),
+            [entry("own", false, false), entry("obj", true, true)]
+        );
+        // An unflattened module records no provenance; its own orientation decides.
+        let source = db.get("OBJ").expect("OBJ");
+        assert!(source.object_statements.is_empty() && source.completes_object_patterns(0));
     }
 }

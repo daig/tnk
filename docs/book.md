@@ -3769,7 +3769,7 @@ Rust module paths, exhaustive enum shapes, and source compatibility are Experime
 **Feature status:** Experimental hook-loaded surface with Stable ownership boundary  
 **Profile:** loaded META-LEVEL/object/external hook libraries as required  
 **Prerequisites:** Chapters 12, 18, and 19  
-**Reference map:** `TNK-BUILTIN-001`, `TNK-META-*`, `TNK-OO-001`
+**Reference map:** `TNK-BUILTIN-001`, `TNK-META-*`, `TNK-OO-001`, `TNK-OO-002`
 
 Reflection represents modules, terms, and commands as data. Object modules provide configuration-oriented notation. External managers connect rewriting to host-owned I/O. These facilities meet at an important boundary: engine-local IDs never leave the owning engine.
 
@@ -3856,6 +3856,10 @@ When object patterns are built:
 
 - an attribute-set variable completes omitted attributes;
 - class constants in patterns generalize to class-sorted variables.
+
+Completion leaves the statements that `TNK-OO-002` lists exactly as written. For example, `< O : Open | bal : N > => < O : Closed | bal : N >` changes the object's class, so it is not completed: the result really is a `Closed` object, and the rule matches only an `Open` object whose attribute set is exactly `bal : N`.
+
+A module that imports an object module, even a plain `mod`, uses the object module's statements in completed form too.
 
 After desugaring, ordinary matching, equations, rules, search, and external rewriting operate on the resulting terms. Object syntax is a modeling layer, not a separate execution engine.
 

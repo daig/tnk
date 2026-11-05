@@ -783,9 +783,11 @@ The reflection layer supports native descent for reduction/normalization, rewrit
 
 ### 16.3 Object modules and local interpreters
 
-Object module `class`, `subclass`, and `msg` declarations are desugared to ordinary signature declarations; `CONFIGURATION` is imported implicitly. Object patterns are completed with an attribute-set variable, and class constants in patterns are generalized to class-sorted variables.
+Object module `class`, `subclass`, and `msg` declarations are desugared to ordinary signature declarations; `CONFIGURATION` is imported implicitly. Object patterns are completed with an attribute-set variable, and class constants in patterns are generalized to class-sorted variables, as limited by `TNK-OO-002`.
 
 **TNK-OO-001 — Local interpreter isolation.** A local interpreter is an independent child `Session` owned by its parent. Its module/current/continuation state does not alias the parent. Requests and replies use owned reflected envelopes. Create, operation, and quit are synchronous; malformed or invalidated target traffic is rejected without consuming the request.
+
+**TNK-OO-002 — Object-pattern completion.** Completion transforms an object-module statement as a whole or leaves it exactly as written; either way the result is then checked like any other statement (`TNK-COND-002`, `TNK-STMT-001`). Completion applies to the statements that an object module or theory declares, in that module and in every module that imports them, directly, transitively, through a renaming or an instantiation, or through a parameter theory, whether or not the importing module is itself an object module. An object term on the right side or in the condition whose object name is the same term as that of a left-side object pattern is another occurrence of that object. A statement in which such an occurrence carries a class argument different from the pattern's changes the object's class and is left as written, whether the pattern's class argument is a class constant or a class variable. An attribute term has a unary head operator: a statement in which the attribute set of a left-side object pattern, or of another occurrence of that object, contains an element whose head operator ranges on a strict subsort of `AttributeSet` but is not unary, such as an `Attribute`-sorted constant, is left as written. A variable that completion introduces has a base name that no variable of the statement uses, so printing or reflecting the completed statement keeps it distinct from the statement's own variables; its spelling is otherwise Implementation-defined (Appendix K.3). Which unary operators are attribute operators, the other conditions under which completion leaves a statement as written, whether doing so is reported, and whether an object module or theory also completes the statements it imports from non-object modules are not specified here.
 
 ---
 
@@ -1049,7 +1051,7 @@ For strict host reducers, construct an immutable `HostFunctionCatalog`, create t
 | ordinary flattening, sums, structural renaming | Stable | all | `TNK-MOD-002/005/006/007` |
 | import-mode protection obligations | Experimental | modes currently donate equally | `TNK-MOD-003` |
 | parameter instantiation and full view validation | Experimental | deferred cases named in §5.5 | `TNK-MOD-004`, `TNK-VIEW-001` |
-| object-module desugaring | Experimental | object modules | `TNK-OO-001` |
+| object-module desugaring | Experimental | object modules | `TNK-OO-002` |
 | listed reflection descent | Experimental | loaded hook/facade capability | `TNK-META-*` |
 | built-in operator families | Optional | only after hooks resolve | `TNK-BUILTIN-001`, Appendix G |
 | strict host-provided Rust reducers | Optional | configured immutable `HostFunctionCatalog`; trusted in-process callbacks | `TNK-HOST-*`, Appendix G.3 |
@@ -1835,7 +1837,7 @@ The identifier is the stable reference; section numbers are navigational. The in
 | built-ins | `TNK-BUILTIN-001` | §16.1 |
 | strict host reducers | `TNK-HOST-001`, `TNK-HOST-002`, `TNK-HOST-003`, `TNK-HOST-004` | §16.1.1 |
 | reflection | `TNK-META-001`, `TNK-META-002` | §16.2 |
-| objects/interpreters | `TNK-OO-001` | §16.3 |
+| objects/interpreters | `TNK-OO-001`, `TNK-OO-002` | §16.3 |
 | Session state | `TNK-SESSION-001`, `TNK-SESSION-002`, `TNK-SESSION-003`, `TNK-SESSION-004`, `TNK-SESSION-005`, `TNK-SESSION-006` | §17 |
 | loading | `TNK-LOAD-001`, `TNK-LOAD-002` | §17.5 |
 | output and diagnostics | `TNK-OUT-001`, `TNK-OUT-002`, `TNK-OUT-003` | §18 |
