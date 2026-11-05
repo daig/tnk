@@ -15,6 +15,20 @@ All notable user-visible changes are documented here. This project follows Seman
 
 - Cyclic subsort declarations, including self-loops and cycles formed only through imports, are now rejected with an ordinary `error:` module diagnostic instead of panicking (the CLI previously exited with status `101`). The invalid module is not installed and the Session continues. `Sorts::subsort_cycle` and `Engine::subsort_cycle` expose the check to low-level callers.
 
+- `modExp(B, E, M)` now reduces to `B^E mod M` for every natural base, including a base at or above the modulus and any base with modulus `1`, instead of panicking (the CLI previously exited with status `101` and printed nothing for the whole submission). This also covers `metaReduce` of such terms. A zero modulus still leaves the term unreduced.
+
+- The CONVERSION built-ins no longer read the kind-level `I / 0` that the division built-in leaves unreduced as a rational: `float(I / 0)` now stays unreduced instead of panicking, and `string(I / 0, B)` stays unreduced instead of producing the invented string `"I/0"`. `rat(S, B)` likewise falls through when the denominator in `S` is negative, instead of dropping its sign (`rat("3/-2", 10)` gave `3/2`).
+
+- `irredundant unify`, `metaIrredundantUnify`, and variant generation (for example `get variants`) no longer panic when a binding under an operator with a one-sided identity contains an `iter` count of `2^64` or more; the redundancy filter now keeps the arbitrary-precision count.
+
+- `find`, `rfind`, and `substr` now reduce when an index or count argument is `2^64` or more. The answer is the same as for any other position past the end of the string: `notFound` for `find`, the last occurrence for `rfind`, and a clamped slice for `substr`. These applications previously stayed unreduced, so for example `find("ab", "b", 18446744073709551616) == notFound` gave `false`.
+
+- `_^_`, `_<<_`, and `_>>_` now reduce for an exponent or shift count of `2^64` or more whenever the exact result is small: `0 ^ N`, `1 ^ N`, `(-1) ^ N` (by parity), `0 << N`, and `I >> N` (`0`, or `-1` for a negative `I`). Previously these applications stayed unreduced, so `1 ^ 18446744073709551616 == 1` gave `false`. Any other base, and any nonzero value shifted left, still stays unreduced for such counts. A negative shift count lies outside `_<<_`/`_>>_ : Int Nat -> Int`, so the application now stays unreduced, as one with a negative exponent already does. Previously it shifted by the count's magnitude: `7 >> -1` gave `3`.
+
+- `I ^ N` no longer returns a wrong value, panics, or aborts when `N` fits 64 bits but the power's size bound, the bit length of `|I|` times `N`, overflows 64 bits (such a power has more than `2^63` bits). In these cases the numeric backend's unchecked size arithmetic wrapped: `2 ^ 9223372036854775808` reduced to `1`, `7 ^ 6148914691236517206` panicked (the CLI exited with status `101`), and `3 ^ 18446744073709551615` aborted. Both crashes lost the whole submission's output. Such a power now stays unreduced, as one with an exponent of `2^64` or more already did. Other powers too large to allocate, such as `3 ^ 9223372036854775807`, are unchanged by this fix.
+
+- Each `CounterSymbol` operator now has its own `0, 1, 2, ...` sequence. Previously all counter operators in a module drew from one shared value. This affected two directly declared counters as well as a renamed copy such as `COUNTER * (op counter to counter2)`. With such a copy, `rewrite counter counter2 counter counter2 .` gave `0 1 2 3` instead of `0 0 1 1`, and in a fresh `rewrite counter2 counter2 counter .` the `counter` gave `2` instead of `0`. The fix applies to `rewrite`, `frewrite`, `erewrite`, `continue`, `metaRewrite`, and `metaFrewrite`. All counters still restart at `0` for each top-level rewriting command. Modules with a single counter operator are unaffected.
+
 ### Documentation
 
 - Documented the public reducer API, source attachment grammar, purity/trust boundary, fault policy, supported typed adapters, feature status, and end-to-end configured Session workflow.

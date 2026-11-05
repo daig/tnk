@@ -61,6 +61,9 @@ pub struct Rewriting {
 struct RewritingCheckpoint {
     current: DagId,
     _root: RootGuard,
+    /// Every `counter` operator's value at the start of the drive. Counters fire only inside these
+    /// drives and are not part of the engine's `SemanticCheckpoint`, so a fault restores them here.
+    counters: HashMap<SymbolId, u64>,
 }
 
 /// The outcome of one bounded [`Rewriting::run`]: the current term, whether a normal form was reached
@@ -309,6 +312,7 @@ impl Rewriting {
         RewritingCheckpoint {
             current: self.current,
             _root: engine.root(self.current),
+            counters: engine.counter_snapshot(),
         }
     }
 
@@ -323,6 +327,7 @@ impl Rewriting {
             Ok(value) => Ok(value),
             Err(fault) => {
                 engine.restore_semantic_checkpoint(checkpoint);
+                engine.restore_counters(session_checkpoint.counters);
                 self.current = session_checkpoint.current;
                 self.root.set(session_checkpoint.current);
                 self.done = true;

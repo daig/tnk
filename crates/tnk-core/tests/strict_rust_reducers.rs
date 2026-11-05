@@ -2,7 +2,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tnk_core::dag::NodeRepr;
+use tnk_core::dag::{DagId, NodeRepr};
 use tnk_core::engine::{Engine, RewriteKind, TraceEvent};
 use tnk_core::host::{
     HookSort, HostBindingError, HostFunctionCatalog, ReducerFault, ResolvedHostHooks, StrictCall,
@@ -10,7 +10,7 @@ use tnk_core::host::{
 };
 use tnk_core::search::Arrow;
 use tnk_core::sort::SortId;
-use tnk_core::symbol::{SpecialOp, SymbolClass, SymbolId};
+use tnk_core::symbol::{NatHooks, SpecialOp, SymbolClass, SymbolId};
 use tnk_core::term::{ConditionFragment, Equation, Membership, Term};
 
 #[derive(Clone)]
@@ -1926,6 +1926,103 @@ fn rule_fair_rewriting_fault_is_terminal_on_repeat_call() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(rewriting.current(), initial_dag);
     assert_no_semantic_effects(&mut engine);
+}
+
+/// Decode a numeral that a `counter` special yields: the zero constant or a compact `s^n(0)`.
+fn counter_numeral(engine: &Engine, id: DagId, zero: SymbolId) -> String {
+    match engine.node(id).repr() {
+        NodeRepr::Iter { count, .. } => count,
+        NodeRepr::App if engine.node(id).symbol() == zero => "0".to_string(),
+        _ => panic!("counter result is not a numeral"),
+    }
+}
+
+/// A reducer fault rolls back every `counter` operator to its value at the start of the faulted
+/// rule-fair or position-fair drive. Both operators fire before the fault. Each has its own
+/// sequence, so a later drive, started without `reset_counter`, yields 0 for both again.
+#[test]
+fn rewriting_fault_restores_every_counter_operator() {
+    for position_fair in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let catalog = HostFunctionCatalog::builder()
+            .register(
+                "counter.fail",
+                CountedFaultReducer {
+                    calls: Arc::clone(&calls),
+                    message: "counter fault",
+                },
+                StrictReducerDescriptor::builder(0).build(),
+            )
+            .expect("register counter fault reducer")
+            .build();
+        let mut engine = Engine::with_host_functions(catalog);
+        let zero_sort = engine.add_sort("Zero");
+        let nz_nat = engine.add_sort("NzNat");
+        let nat = engine.add_sort("Nat");
+        let state = engine.add_sort("State");
+        engine.add_subsort(zero_sort, nat);
+        engine.add_subsort(nz_nat, nat);
+        engine.close_sorts();
+        let zero = engine.add_op("0", vec![], zero_sort);
+        let succ = engine.add_op_iter("s", vec![nat], nz_nat);
+        let nat_hooks = NatHooks {
+            succ,
+            zero,
+            minus: None,
+        };
+        let tick = engine.add_op("tick", vec![], nat);
+        let tock = engine.add_op("tock", vec![], nat);
+        engine.set_special(tick, SpecialOp::Counter { nat: nat_hooks });
+        engine.set_special(tock, SpecialOp::Counter { nat: nat_hooks });
+        let trigger = engine.add_op("trigger", vec![], state);
+        let faulting = engine.add_op("faulting", vec![], state);
+        engine
+            .bind_host_function(faulting, "counter.fail", no_hooks())
+            .expect("bind counter fault reducer");
+        let triple = engine.add_op("triple", vec![nat, nat, state], state);
+        let pair = engine.add_op("pair", vec![nat, nat], state);
+        engine.add_rule(Term::constant(trigger), Term::constant(faulting), 0);
+
+        // Rule-fair: `tick`, then `tock`, then `trigger => faulting`, whose reduction faults.
+        // Position-fair: the same three positions in one pass.
+        let leaves = [tick, tock, trigger].map(|symbol| engine.make_const(symbol));
+        let initial = engine.make_free(triple, leaves.to_vec());
+        let mut rewriting = if position_fair {
+            engine.frewrite(initial, 1)
+        } else {
+            engine.rewrite(initial)
+        };
+        let fault = rewriting
+            .try_run(&mut engine, None)
+            .expect_err("reducing `faulting` after both counters fired");
+        assert_fault(&fault, "counter.fail", "counter fault");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rewriting.current(), initial);
+        assert_eq!(engine.rewrites(), 0);
+
+        let counters = [tick, tock].map(|symbol| engine.make_const(symbol));
+        let fresh = engine.make_free(pair, counters.to_vec());
+        let mut rewriting = if position_fair {
+            engine.frewrite(fresh, 1)
+        } else {
+            engine.rewrite(fresh)
+        };
+        let step = rewriting
+            .try_run(&mut engine, None)
+            .expect("counters alone rewrite to a normal form");
+        assert!(step.done);
+        assert_eq!(engine.node(step.term).symbol(), pair);
+        let values: Vec<String> = engine
+            .node(step.term)
+            .children()
+            .map(|value| counter_numeral(&engine, value, zero))
+            .collect();
+        assert_eq!(
+            values,
+            ["0", "0"],
+            "position_fair = {position_fair}: both counters restart after the rollback"
+        );
+    }
 }
 
 #[test]

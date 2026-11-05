@@ -263,11 +263,10 @@ fn rebuild(
             e.make_cui(sym, nx, ny)
         }
         Shape::S(sym, count, arg) => {
+            // Keep the arbitrary-precision count: a binding's count may exceed a machine word.
             let narg = rebuild(e, arg, leaf);
-            let n = count
-                .to_u64()
-                .expect("S count of a unifier binding fits u64");
-            e.make_iter(sym, n, narg)
+            let (sig, rt) = e.parts_mut();
+            rt.make_s(sig, sym, count, narg)
         }
     }
 }
@@ -318,5 +317,43 @@ mod tests {
         let kept = irredundant(&mut e, vec![instance, general]);
         assert_eq!(kept.len(), 1);
         assert!(matches!(e.node(kept[0][0]).term, NodeTerm::Var { .. }));
+    }
+
+    /// A one-sided identity sends `subsumes` through the frozen-unification fallback, which rebuilds
+    /// each binding. An `iter` count beyond `u64` must survive that rebuild in both directions.
+    #[test]
+    fn one_sided_identity_fallback_keeps_bignum_iter_counts() {
+        use crate::symbol::IdentitySide;
+        let mut e = Engine::new();
+        let n = e.add_sort("N");
+        e.close_sorts();
+        let z = e.add_op("z", vec![], n);
+        let a = e.add_op("a", vec![], n);
+        let s = e.add_op_iter("s_", vec![n], n);
+        let g = e.add_op("g", vec![n, n], n);
+        e.reserve_one_sided_identity(g, IdentitySide::Left, n);
+        e.set_one_sided_identity_term(g, Term::constant(z));
+        let count = "18446744073709551619"; // 2^64 + 3
+
+        // General: X --> s^count(g(#1, #2)); instance: X --> s^count(g(#3, a)).
+        let (v1, v2, v3) = (
+            e.make_var(n, 1, 0),
+            e.make_var(n, 2, 1),
+            e.make_var(n, 3, 2),
+        );
+        let inner = e.make_free(g, vec![v1, v2]);
+        let general = vec![e.make_iter_decimal(s, count, inner).unwrap()];
+        let ac = e.make_const(a);
+        let inner = e.make_free(g, vec![v3, ac]);
+        let instance = vec![e.make_iter_decimal(s, count, inner).unwrap()];
+
+        assert!(
+            subsumes(&mut e, &general, &instance),
+            "general subsumes instance"
+        );
+        assert!(
+            !subsumes(&mut e, &instance, &general),
+            "instance does not subsume general"
+        );
     }
 }

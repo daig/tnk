@@ -141,8 +141,9 @@ impl Runtime {
         }
     }
 
-    /// Read a rational from `id`: an integer numeral → `(i, 1)`, or a `_/_` node `I / N` → `(I, N)`.
-    /// `None` if `id` is neither.
+    /// Read a rational from `id`: an integer numeral → `(i, 1)`, or a `_/_` node `I / N` with
+    /// `N != 0` → `(I, N)`. `None` if `id` is neither; the kind-level `I / 0` that the division
+    /// built-in leaves unreduced denotes no rational.
     fn as_rational(
         &self,
         id: DagId,
@@ -155,7 +156,11 @@ impl Runtime {
         let div = division?;
         match &self.node(id).term {
             NodeTerm::Free { symbol, args } if *symbol == div && args.len() == 2 => {
-                Some((self.as_int(args[0], nat)?, self.as_nat(args[1], nat)?))
+                let den = self.as_nat(args[1], nat)?;
+                if den.is_zero() {
+                    return None;
+                }
+                Some((self.as_int(args[0], nat)?, den))
             }
             _ => None,
         }
@@ -199,7 +204,7 @@ impl Runtime {
             // `float : Rat -> Float` — the nearest double to the rational.
             ConvOp::RatToFloat => {
                 let (num, den) = self.as_rational(kids[0], nat?, division)?;
-                let f = num::f64_of_rational(&num, &den);
+                let f = num::f64_of_rational(&num, &den)?;
                 Some(self.make_na(sig, float_sym?, NaValue::Float(f.to_bits())))
             }
             // `rat : FiniteFloat -> Rat` — the exact rational of the double.
@@ -223,17 +228,21 @@ impl Runtime {
                 };
                 Some(self.make_na(sig, str_sym?, NaValue::Str(s.into_bytes().into())))
             }
-            // `rat : String NzNat -> Rat` — a rational parsed from the base (`I` or `I/N`).
+            // `rat : String NzNat ~> Rat` — a rational parsed from the base (`I` or `I/N`). A zero or
+            // negative denominator (`"3/0"`, `"3/-2"`) is not an `I/N` numeral ⇒ fall through.
             ConvOp::StringToRat => {
                 let nat = nat?;
                 let s = self.as_str(kids[0])?;
                 let s = std::str::from_utf8(&s).ok()?; // non-UTF-8 bytes are not a numeral ⇒ fall through
                 let base = conv_base(self.as_nat(kids[1], nat)?)?;
                 let (num, den) = match s.split_once('/') {
-                    Some((n, d)) => (
-                        Int::from_string_base(base, n)?,
-                        Int::from_string_base(base, d)?.magnitude(),
-                    ),
+                    Some((n, d)) => {
+                        let d = Int::from_string_base(base, d)?;
+                        if d.is_negative() {
+                            return None;
+                        }
+                        (Int::from_string_base(base, n)?, d.magnitude())
+                    }
                     None => (Int::from_string_base(base, s)?, Nat::one()),
                 };
                 if den.is_zero() {
@@ -279,24 +288,27 @@ impl Runtime {
         }
     }
 
-    /// Fire a `counter` redex at `node` during rewriting: yield the next natural, advance the counter,
-    /// and count one rewrite. Non-counter nodes return `None`; reduction never calls this path.
+    /// Fire a `counter` redex at `node` during rewriting: yield the next natural of that counter
+    /// operator, advance that operator's value only, and count one rewrite. Non-counter nodes return
+    /// `None`; reduction never calls this path. Only `Rewriting` drives may call it, because they
+    /// alone roll the counter values back on a reducer fault (see `Runtime::counter_values`).
     pub(crate) fn try_counter(&mut self, sig: &Signature, node: DagId) -> Option<DagId> {
         let symbol = self.node(node).symbol();
         let nat = match sig.symbol(symbol).special() {
             Some(SpecialOp::Counter { nat }) => *nat,
             _ => return None,
         };
-        let v = self.counter_value;
-        self.counter_value += 1;
+        let slot = self.counter_values.entry(symbol).or_insert(0);
+        let v = *slot;
+        *slot += 1;
         self.rewrite_count += 1;
         self.make_int(sig, &nat, Int::from_nat(&Nat::from_u64(v)))
     }
 
-    /// Reset the `counter` built-in to 0 — called at the start of each top-level `rewrite`/`frewrite`
-    /// command (not on `continue`, which resumes the running count).
+    /// Reset every `counter` operator to 0 — called at the start of each top-level rewriting command
+    /// (not on `continue`, which resumes the running counts).
     pub(crate) fn reset_counter(&mut self) {
-        self.counter_value = 0;
+        self.counter_values.clear();
     }
 
     /// `random : Nat -> Nat`: return the n-th output of MT19937 seeded with 0. A non-numeral argument
@@ -939,8 +951,9 @@ impl Runtime {
     }
 
     /// Reduce a free numeric operator over already-reduced operands. A non-numeric argument, zero
-    /// divisor, negative result without a `minus` hook, or unrepresentable exponent falls through.
-    /// Relational operators build a Bool constant; arithmetic operators build a Nat or Int.
+    /// divisor, negative exponent or shift count, negative result without a `minus` hook, or
+    /// power/left shift with no representable result falls through. Relational operators build a
+    /// Bool constant; arithmetic operators build a Nat or Int.
     fn reduce_number_op(
         &mut self,
         sig: &Signature,
@@ -990,28 +1003,30 @@ impl Runtime {
                 if a[1].is_negative() {
                     return None; // `_^_ : Int Nat -> Int` needs a non-negative exponent
                 }
-                let e = a[1].magnitude().to_usize()? as u64; // too-large exponent ⇒ fall through
-                self.make_int(sig, nat, a[0].pow_u64(e))
+                let r = a[0].pow_nat(&a[1].magnitude())?; // no representable power ⇒ fall through
+                self.make_int(sig, nat, r)
             }
-            // `modExp(b, e, m) = b^e mod m` (`modExp : Nat Nat NzNat ~> Nat`): non-negative operands.
+            // `modExp(b, e, m) = b^e mod m` (`modExp : Nat Nat NzNat ~> Nat`): non-negative operands,
+            // any base (including `b >= m`). Modulus 0 is off the `NzNat` domain and falls through.
             NumOp::ModExp => {
-                if a[2].is_zero() {
-                    return None; // modulus 0 (the `NzNat` arg guards this; defend anyway)
-                }
                 let r = a[0]
                     .magnitude()
-                    .mod_pow(&a[1].magnitude(), &a[2].magnitude());
+                    .mod_pow(&a[1].magnitude(), &a[2].magnitude())?;
                 self.make_int(sig, nat, Int::from_nat(&r))
             }
             // `_>>_` / `_<<_ : Int Nat -> Int`: arithmetic shifts on the signed value (`>>` floors toward
-            // −∞ — `-8 >> 1 = -4`, `-1 >> 100 = -1`; `-5 << 2 = -20`). Shift count is a machine `u64`
-            // (a bignum count is unrepresentable ⇒ fall through).
+            // −∞ — `-8 >> 1 = -4`, `-1 >> 100 = -1`; `-5 << 2 = -20`). `x >> k` and `0 << k` reduce for
+            // every natural count; a nonzero value shifted left by `2^64` or more has no representation
+            // and falls through.
             NumOp::Shr | NumOp::Shl => {
-                let amount = a[1].magnitude().to_u64()?;
+                if a[1].is_negative() {
+                    return None; // the count is a `Nat`; a negative one is off the domain
+                }
+                let amount = a[1].magnitude();
                 let r = if matches!(op, NumOp::Shr) {
-                    a[0].shr(amount)
+                    a[0].shr_nat(&amount)
                 } else {
-                    a[0].shl(amount)
+                    a[0].shl_nat(&amount)?
                 };
                 self.make_int(sig, nat, r)
             }
@@ -1098,7 +1113,8 @@ impl Runtime {
                 let len = self.as_str(kids[0])?.len();
                 self.make_int(sig, nat?, Int::from_nat(&Nat::from_u64(len as u64)))
             }
-            // `substr : String Nat Nat -> String` — a byte slice with skip/take clamping.
+            // `substr : String Nat Nat -> String` — a byte slice with skip/take clamping. Every natural
+            // start and length is in the domain: one wider than a machine word clamps like any other.
             StrOp::Substr => {
                 let nat = nat?;
                 let a = self.as_str(kids[0])?;
@@ -1106,7 +1122,10 @@ impl Runtime {
                 if start.is_negative() || len.is_negative() {
                     return None;
                 }
-                let (start, len) = (start.magnitude().to_usize()?, len.magnitude().to_usize()?);
+                let (start, len) = (
+                    start.magnitude().to_usize_saturating(),
+                    len.magnitude().to_usize_saturating(),
+                );
                 let r: Vec<u8> = a.iter().copied().skip(start).take(len).collect();
                 Some(make_str(self, r))
             }
@@ -1132,7 +1151,8 @@ impl Runtime {
             }
             // `find` / `rfind : String String Nat -> FindResult` search the raw byte sequence:
             // first/last occurrence of `pat` starting at an index `>= start` / `<= start`, or the
-            // `notFound` constant. Byte and character indices coincide for ASCII.
+            // `notFound` constant. Byte and character indices coincide for ASCII. A start wider than a
+            // machine word is past the end like any other (`find`: `notFound`; `rfind`: from the end).
             StrOp::Find | StrOp::Rfind => {
                 let nat = nat?;
                 let (s, pat) = (self.as_str(kids[0])?, self.as_str(kids[1])?);
@@ -1140,7 +1160,7 @@ impl Runtime {
                 if start.is_negative() {
                     return None;
                 }
-                let start = start.magnitude().to_usize()?;
+                let start = start.magnitude().to_usize_saturating();
                 let (hay, needle) = (s.as_ref(), pat.as_ref());
                 let found = if matches!(op, StrOp::Find) {
                     byte_find(hay, needle, start)

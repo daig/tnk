@@ -251,7 +251,8 @@ pub enum SpecialOp {
     /// `_quo_` / `_rem_` / `_^_` / `_<<_` / `_>>_` / `_<_` / `_<=_` / `_>_` / `_>=_` /
     /// `_divides_`: evaluate a free operator over numeric arguments. Relational operations return a Bool;
     /// arithmetic operations build a Nat or Int according to `nat.minus`. Non-numeric arguments, zero
-    /// divisors, unrepresentable results, and negative results without a minus hook fall through.
+    /// divisors, negative exponents and shift counts, unrepresentable results, and negative results
+    /// without a minus hook fall through.
     NumberOp {
         op: NumOp,
         nat: NatHooks,
@@ -286,8 +287,9 @@ pub enum SpecialOp {
     /// zero, making the operation a deterministic pure function of `n`.
     Random { nat: NatHooks },
     /// `counter : -> [Nat]`: a stateful rule-special that is inert under `reduce`. Each
-    /// `rewrite`/`frewrite` step at a counter redex yields the next natural, starting at zero and
-    /// resetting for each top-level rewriting command. The rewrite traversal handles it directly.
+    /// `rewrite`/`frewrite` step at a counter redex yields that operator's next natural, starting at
+    /// zero and resetting for each top-level rewriting command. Every operator carrying this special
+    /// has its own sequence. The rewrite traversal handles it directly.
     Counter { nat: NatHooks },
     /// `string : Qid -> String` / `qid : String ~> Qid`: convert between a quoted identifier and
     /// its text. `qid_sym` and `str_sym` build the respective atomic results.

@@ -1000,6 +1000,35 @@ fn prelude_nat_through_repl() {
     );
 }
 
+/// `modExp` reduces any natural base, including one at or above the modulus (the backend's
+/// modular power needs a pre-reduced base and used to panic, losing the whole submission's output).
+/// Modulus 1 gives 0; a zero modulus is off the `NzNat` domain and stays unreduced.
+#[test]
+fn prelude_nat_mod_exp_reduces_any_base() {
+    let src = format!(
+        "{}\nred modExp(9, 1, 4) .\nred modExp(6, 2, 6) .\nred modExp(23, 5, 7) .\n\
+         red modExp(18446744073709551621, 2, 1000) .\nred modExp(4, 0, 1) .\n\
+         red modExp(5, 3, 0) .\n",
+        conformance_file!("prelude-nat.maude")
+    );
+    let out = repl().eval(&src).output;
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(
+        results[results.len() - 6..],
+        [
+            "result NzNat: 1",   // 9 ≡ 1 (mod 4)
+            "result Zero: 0",    // base == modulus
+            "result NzNat: 4",   // 23 ≡ 2, 2^5 = 32 ≡ 4 (mod 7)
+            "result NzNat: 641", // 2^64 + 5 ≡ 621, 621^2 ≡ 641 (mod 1000)
+            "result Zero: 0",    // modulus 1, even for x^0
+            "result [Nat]: modExp(5, 3, 0)",
+        ],
+        "{out}"
+    );
+    // The fixture's 24 one-rewrite reductions plus the five reducing `modExp`s above.
+    assert_eq!(out.matches("rewrites: 1\n").count(), 24 + 5, "{out}");
+}
+
 /// Tier 2 — the remaining built-in data types + leaf special ops: INT (`abs`/`~`, signed bignum +
 /// two's-complement bitwise), RAT (rationals on the Division op), FLOAT (full op set + partiality:
 /// `/0`/NaN don't reduce, but `log(0.0) = -Infinity` does), STRING/QID (`ascii`/`char`/`find`/case +
@@ -1076,6 +1105,200 @@ fn prelude_tier2_through_repl() {
     assert!(
         out.contains("rewrite in COUNTER :") && out.contains("rewrites: 5\n"),
         "counter: {out}"
+    );
+}
+
+/// Under META descent, each `CounterSymbol` operator of the reflected module counts from 0 on its
+/// own (manual §16.1), for `metaRewrite` and `metaFrewrite`, and every call starts again from 0.
+#[test]
+fn meta_rewrite_counter_operators_are_independent() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude"));
+    let out = r
+        .eval(concat!(
+            "mod META-COUNTERS is\n",
+            "  protecting NAT .\n",
+            "  sort Seq .\n",
+            "  subsort Nat < Seq .\n",
+            "  op _;_ : Seq Seq -> Seq [assoc] .\n",
+            "  op up : -> [Nat] [special (id-hook CounterSymbol op-hook succSymbol (s_ : Nat ~> NzNat))] .\n",
+            "  op dn : -> [Nat] [special (id-hook CounterSymbol op-hook succSymbol (s_ : Nat ~> NzNat))] .\n",
+            "endm\n",
+            "red in META-LEVEL : metaRewrite(['META-COUNTERS], '_;_['up.Nat, 'dn.Nat, 'up.Nat], 3) .\n",
+            "red in META-LEVEL : metaRewrite(['META-COUNTERS], '_;_['up.Nat, 'dn.Nat, 'up.Nat], 3) .\n",
+            "red in META-LEVEL : metaFrewrite(['META-COUNTERS], '_;_['dn.Nat, 'up.Nat, 'dn.Nat], 3, 1) .\n",
+        ))
+        .output;
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(
+        results, ["result ResultPair: {'_;_['0.Zero, '0.Zero, 's_['0.Zero]], 'Seq}"; 3],
+        "{out}"
+    );
+}
+
+/// TNK-BUILTIN-001: the kind-level `I / 0` left by the division built-in is not a rational, so
+/// `float` and `string` of it stay unreduced (they used to panic, or render an invented `"3/0"`).
+/// Likewise `rat` of a string whose denominator is negative falls through instead of dropping the
+/// sign (`"3/-2"` gave `3/2`).
+#[test]
+fn conversion_of_non_rational_division_falls_through() {
+    let src = format!(
+        "{}\nred in CONVERSION : float(-7 / (2 - 2)) .\nred in CONVERSION : float(0 / 0) .\n\
+         red in CONVERSION : string(3 / 0, 10) .\nred in CONVERSION : rat(\"3/-2\", 10) .\n\
+         red in CONVERSION : rat(\"-ff/-10\", 16) .\nred in CONVERSION : float(1 / 4) .\n\
+         red in CONVERSION : string(-3 / 4, 2) .\nred in CONVERSION : rat(\"-3/2\", 10) .\n",
+        conformance_file!("prelude-tier2.maude")
+    );
+    let out = repl().eval(&src).output;
+    let results: Vec<&str> = out.lines().filter(|l| l.starts_with("result ")).collect();
+    assert_eq!(
+        results[results.len() - 8..],
+        [
+            "result [Float]: float(-7 / 0)",
+            "result [Float]: float(0 / 0)",
+            "result [String]: string(3 / 0, 10)",
+            "result [Rat,FindResult]: rat(\"3/-2\", 10)",
+            "result [Rat,FindResult]: rat(\"-ff/-10\", 16)",
+            // Controls: proper rationals still convert.
+            "result FiniteFloat: 2.5e-1",
+            "result String: \"-11/100\"",
+            "result NzRat: -3/2",
+        ],
+        "{out}"
+    );
+}
+
+/// `find`, `rfind`, and `substr` are total, so an index or count of `2^64` or more is past the end
+/// like any other (they stayed unreduced, and `find(..) == notFound` was `false`). The partial `char`
+/// still leaves an out-of-range code unreduced.
+#[test]
+fn string_index_past_machine_width_through_repl() {
+    let src = format!(
+        "{}\nred in STRING : find(\"pqrpqr\", \"qr\", 18446744073709551616) .\n\
+         red in STRING : rfind(\"pqrpqr\", \"qr\", 98765432109876543210987) .\n\
+         red in STRING : substr(\"lmnopq\", 3, 18446744073709551616) .\n\
+         red in STRING : substr(\"lmnopq\", 18446744073709551616, 3) .\n\
+         red in STRING : find(\"pqr\", \"\", 18446744073709551616) .\n\
+         red in STRING : rfind(\"pqr\", \"\", 18446744073709551616) .\n\
+         red in STRING : find(\"pqrpqr\", \"qr\", 18446744073709551616) == notFound .\n\
+         red in STRING : char(18446744073709551616) .\n",
+        conformance_file!("prelude-tier2.maude")
+    );
+    let out = repl().eval(&src).output;
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("rewrites: ") || l.starts_with("result "))
+        .collect();
+    assert_eq!(
+        lines[lines.len() - 16..],
+        [
+            "rewrites: 1",
+            "result FindResult: notFound",
+            "rewrites: 1",
+            "result NzNat: 4", // the last occurrence
+            "rewrites: 1",
+            "result String: \"opq\"",
+            "rewrites: 1",
+            "result String: \"\"",
+            "rewrites: 1",
+            "result FindResult: notFound", // as for any start past the end
+            "rewrites: 1",
+            "result NzNat: 3",
+            "rewrites: 2",
+            "result Bool: true",
+            "rewrites: 0",
+            "result [String]: char(18446744073709551616)",
+        ],
+        "{out}"
+    );
+}
+
+/// `_^_`, `_<<_`, and `_>>_` reduce for counts of `2^64` or more whenever the exact result is small:
+/// bases `0` and `±1`, `0 << k`, and `x >> k` (`0`, or `-1` below zero). They used to stay unreduced,
+/// so `1 ^ k == 1` was `false`. A nonzero left shift or other base that far still stays unreduced,
+/// and a negative count is off the `Nat` domain: `7 >> -1` stays unreduced instead of giving `3`.
+#[test]
+fn int_pow_and_shift_counts_past_u64_through_repl() {
+    let src = format!(
+        "{}\nred in INT : 1 ^ 18446744073709551616 .\nred in INT : -1 ^ 18446744073709551616 .\n\
+         red in INT : -1 ^ 55340232221128654849 .\nred in INT : 0 ^ 55340232221128654849 .\n\
+         red in INT : 0 << 18446744073709551616 .\nred in INT : 7 >> 18446744073709551616 .\n\
+         red in INT : -7 >> 55340232221128654849 .\nred in INT : 1 ^ 18446744073709551616 == 1 .\n\
+         red in INT : 2 ^ 18446744073709551616 .\nred in INT : -3 << 18446744073709551616 .\n\
+         red in INT : 7 >> -1 .\nred in INT : 7 << -1 .\nred in INT : 0 << -18446744073709551616 .\n",
+        conformance_file!("prelude-tier2.maude")
+    );
+    let out = repl().eval(&src).output;
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("rewrites: ") || l.starts_with("result "))
+        .collect();
+    assert_eq!(
+        lines[lines.len() - 26..],
+        [
+            "rewrites: 1",
+            "result NzNat: 1",
+            "rewrites: 1",
+            "result NzNat: 1", // even exponent
+            "rewrites: 1",
+            "result NzInt: -1", // odd exponent
+            "rewrites: 1",
+            "result Zero: 0",
+            "rewrites: 1",
+            "result Zero: 0",
+            "rewrites: 1",
+            "result Zero: 0",
+            "rewrites: 1",
+            "result NzInt: -1", // floors toward -infinity
+            "rewrites: 2",
+            "result Bool: true",
+            "rewrites: 0",
+            "result NzNat: 2 ^ 18446744073709551616",
+            "rewrites: 0",
+            "result Int: -3 << 18446744073709551616",
+            "rewrites: 0",
+            "result [Int]: 7 >> -1",
+            "rewrites: 0",
+            "result [Int]: 7 << -1",
+            "rewrites: 0",
+            "result [Int]: 0 << -18446744073709551616",
+        ],
+        "{out}"
+    );
+}
+
+/// A machine-word exponent whose result size `bits(|base|) · e` overflows `u64` (a power of more
+/// than `2^63` bits) stays unreduced. The backend's unchecked size arithmetic used to wrap:
+/// `2 ^ 2^63` reduced to `1`, `7 ^ 6148914691236517206` panicked, and `3 ^ (2^64 - 1)` aborted,
+/// losing the whole submission's output.
+#[test]
+fn pow_result_size_overflow_stays_unreduced_through_repl() {
+    let src = format!(
+        "{}\nred in NAT : 2 ^ 9223372036854775808 .\nred in INT : -2 ^ 9223372036854775809 .\n\
+         red in NAT : 7 ^ 6148914691236517206 .\nred in NAT : 3 ^ 18446744073709551615 .\n\
+         red in NAT : 2 ^ 64 .\n",
+        conformance_file!("prelude-tier2.maude")
+    );
+    let out = repl().eval(&src).output;
+    let lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.starts_with("rewrites: ") || l.starts_with("result "))
+        .collect();
+    assert_eq!(
+        lines[lines.len() - 10..],
+        [
+            "rewrites: 0",
+            "result NzNat: 2 ^ 9223372036854775808",
+            "rewrites: 0",
+            "result NzInt: -2 ^ 9223372036854775809",
+            "rewrites: 0",
+            "result NzNat: 7 ^ 6148914691236517206",
+            "rewrites: 0",
+            "result NzNat: 3 ^ 18446744073709551615",
+            "rewrites: 1",
+            "result NzNat: 18446744073709551616", // an ordinary power still reduces
+        ],
+        "{out}"
     );
 }
 
@@ -2729,6 +2952,59 @@ endfm
             "No more matchers.",
         ]
         .map(str::to_string)
+    );
+}
+
+/// A one-sided identity sends the irredundant filter's subsumption check through frozen
+/// unification, which rebuilds each binding; an `iter` count beyond `u64` used to panic there.
+#[test]
+fn irredundant_unify_keeps_bignum_iter_counts() {
+    let out = repl()
+        .eval(
+            "fmod LID-ITER is
+               sort N .
+               op z : -> N [ctor] .
+               op s_ : N -> N [ctor iter] .
+               op g : N N -> N [left id: z] .
+               op f : N N -> N [comm] .
+             endfm
+             irredundant unify f(X:N, s_^18446744073709551617(g(Y:N, Z:N)))
+               =? f(s_^18446744073709551617(A:N), B:N) .",
+        )
+        .output;
+    // The same two most-general unifiers as for a small count.
+    assert_eq!(out.matches("\nUnifier ").count(), 2, "{out}");
+    assert!(
+        out.contains("X:N --> s_^18446744073709551617(")
+            && out.contains("B:N --> s_^18446744073709551617(g("),
+        "{out}"
+    );
+}
+
+/// Variant narrowing filters redundant steps with the same subsumption check, so `get variants`
+/// over a one-sided-identity operator must keep a bignum `iter` count as well.
+#[test]
+fn get_variants_keeps_bignum_iter_counts() {
+    let out = repl()
+        .eval(
+            "fmod LID-ITER-VARIANTS is
+               sort T .
+               op e : -> T [ctor] .
+               op q_ : T -> T [ctor iter] .
+               op h : T T -> T [ctor left id: e] .
+               op f : T -> T .
+               vars X Y : T .
+               eq f(q_^18446744073709551618(h(X, Y))) = Y [variant] .
+               eq f(q_^18446744073709551618(X)) = X [variant] .
+             endfm
+             get variants f(W:T) .",
+        )
+        .output;
+    // `W --> q^n(h(X, Y))` is an instance of `W --> q^n(X)` and is filtered out.
+    assert_eq!(out.matches("\nVariant ").count(), 2, "{out}");
+    assert!(
+        out.contains("W:T --> q_^18446744073709551618(") && out.contains("No more variants."),
+        "{out}"
     );
 }
 

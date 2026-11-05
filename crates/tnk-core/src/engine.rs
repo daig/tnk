@@ -882,7 +882,6 @@ pub(crate) struct SemanticCheckpoint {
     rule_rewrite_count: u64,
     variant_narrowing_count: u64,
     narrowing_count: u64,
-    counter_value: u64,
     model_check_stats_len: usize,
     sat_solve_stats_len: usize,
     trace_len: Option<usize>,
@@ -925,10 +924,17 @@ pub(crate) struct Runtime {
     model_check_stats: Vec<ModelCheckStats>,
     /// Completed satisfiability statistics waiting for the command layer to consume them.
     sat_solve_stats: Vec<SatSolveStats>,
-    /// Next value for the `counter` built-in. Each rule-style counter redex yields this value and
-    /// increments it. Reset to 0 at the start of each top-level command except `continue`; inert under
+    /// Next value of each `CounterSymbol` operator, keyed by symbol; an absent entry means 0. A
+    /// rule-style counter redex yields its own operator's value and increments it, so distinct counter
+    /// operators (two declared directly, or a renamed copy of `counter`) have independent sequences.
+    /// Cleared at the start of each top-level rewriting command except `continue`; inert under
     /// equational `reduce`.
-    pub(crate) counter_value: u64,
+    ///
+    /// Not part of [`SemanticCheckpoint`]: only the [`Rewriting`] drives fire counters
+    /// ([`try_counter`](Self::try_counter) is reached from `rewrite_step` and `frewrite_pass` alone),
+    /// and they snapshot and restore this map themselves on a reducer fault
+    /// ([`Engine::counter_snapshot`]). Any other caller of `try_counter` must do the same.
+    pub(crate) counter_values: HashMap<SymbolId, u64>,
     /// When `Some`, [`reduce`](Engine::reduce) records a structured [`TraceEvent`] stream here (opt-in
     /// via [`Engine::set_trace`]); `None` (the default) is zero-cost. Holds intermediate node ids, so it
     /// is rooted by [`safe_point_gc`](Self::safe_point_gc) — but it is meant for the REPL, which runs
@@ -4136,7 +4142,6 @@ impl Runtime {
             rule_rewrite_count: self.rule_rewrite_count,
             variant_narrowing_count: self.variant_narrowing_count,
             narrowing_count: self.narrowing_count,
-            counter_value: self.counter_value,
             model_check_stats_len: self.model_check_stats.len(),
             sat_solve_stats_len: self.sat_solve_stats.len(),
             trace_len: self.trace.as_ref().map(Vec::len),
@@ -4149,7 +4154,6 @@ impl Runtime {
         self.rule_rewrite_count = checkpoint.rule_rewrite_count;
         self.variant_narrowing_count = checkpoint.variant_narrowing_count;
         self.narrowing_count = checkpoint.narrowing_count;
-        self.counter_value = checkpoint.counter_value;
         self.model_check_stats
             .truncate(checkpoint.model_check_stats_len);
         self.sat_solve_stats
@@ -8058,10 +8062,22 @@ impl Engine {
         self.sig.invalidate_normal_forms();
     }
 
-    /// Reset the `counter` built-in to zero at the start of a top-level `rewrite` or `frewrite`.
-    /// `continue` deliberately preserves it.
+    /// Reset every `counter` built-in operator to zero at the start of a top-level `rewrite`,
+    /// `frewrite`, or `erewrite`. Each counter operator keeps its own sequence; `continue`
+    /// deliberately preserves them.
     pub fn reset_counter(&mut self) {
         self.rt.reset_counter();
+    }
+
+    /// Snapshot every `counter` operator's next value, for fault rollback by the owning
+    /// [`Rewriting`] drive (counters are not part of [`SemanticCheckpoint`]).
+    pub(crate) fn counter_snapshot(&self) -> HashMap<SymbolId, u64> {
+        self.rt.counter_values.clone()
+    }
+
+    /// Restore a [`counter_snapshot`](Self::counter_snapshot).
+    pub(crate) fn restore_counters(&mut self, snapshot: HashMap<SymbolId, u64>) {
+        self.rt.counter_values = snapshot;
     }
 
     /// Clear captured external stream output and the reply mailbox before a new `erewrite` command.
@@ -11250,6 +11266,109 @@ mod tests {
         assert_eq!(cmp(&mut e, 3, -2), ff, "3 < -2 = ff");
     }
 
+    /// `_^_`, `_<<_`, and `_>>_` take `Nat` counts of any width. Bases `0` and `±1`, `0 << k`, and
+    /// `x >> k` reduce in one rewrite for counts of `2^64` or more. Other bases and nonzero left
+    /// shifts that far, powers whose size `bits(|x|) · e` overflows `u64`, and negative (non-`Nat`)
+    /// counts stay unreduced.
+    #[test]
+    fn builtin_pow_and_shift_counts_past_u64() {
+        use crate::symbol::{NatHooks, NumOp, SpecialOp};
+        let mut e = Engine::new();
+        let zero = e.add_sort("Zero");
+        let nznat = e.add_sort("NzNat");
+        let nat = e.add_sort("Nat");
+        let nzint = e.add_sort("NzInt");
+        let int = e.add_sort("Int");
+        e.add_subsort(zero, nat);
+        e.add_subsort(nznat, nat);
+        e.add_subsort(nznat, nzint);
+        e.add_subsort(nat, int);
+        e.add_subsort(nzint, int);
+        e.close_sorts();
+        let z = e.add_op("0", vec![], zero);
+        let s = e.add_op_iter("s", vec![nat], nznat);
+        let minus = e.add_op("-", vec![nznat], nzint);
+        e.add_op_decl(minus, vec![int], int);
+        let nh = NatHooks {
+            succ: s,
+            zero: z,
+            minus: Some(minus),
+        };
+        e.set_special(minus, SpecialOp::Minus { nat: nh });
+        let num_op = |e: &mut Engine, name: &'static str, op: NumOp| -> SymbolId {
+            let o = e.add_op(name, vec![int, nat], int);
+            e.set_special(
+                o,
+                SpecialOp::NumberOp {
+                    op,
+                    nat: nh,
+                    bool_: None,
+                },
+            );
+            o
+        };
+        let pow = num_op(&mut e, "^", NumOp::Pow);
+        let shl = num_op(&mut e, "<<", NumOp::Shl);
+        let shr = num_op(&mut e, ">>", NumOp::Shr);
+        // A signed decimal numeral: `s^n(0)`, or `-(s^n(0))`.
+        let num = |e: &mut Engine, v: &str| -> DagId {
+            let z0 = e.make_const(z);
+            let p = e
+                .make_iter_decimal(s, v.trim_start_matches('-'), z0)
+                .expect("decimal");
+            if v.starts_with('-') {
+                e.make_free(minus, vec![p])
+            } else {
+                p
+            }
+        };
+        // `op(x, k)` → (the result as a signed decimal, or "stuck" if unreduced; rewrites).
+        let red = |e: &mut Engine, op: SymbolId, x: &str, k: &str| -> (String, u64) {
+            e.reset_rewrites();
+            let (x, k) = (num(e, x), num(e, k));
+            let q = e.make_free(op, vec![x, k]);
+            let r = e.reduce(q);
+            let magnitude = |id: DagId| match &e.node(id).term {
+                NodeTerm::S { count, .. } => Some(count.to_decimal()),
+                _ if e.node(id).symbol() == z => Some("0".to_string()),
+                _ => None,
+            };
+            let shown = match &e.node(r).term {
+                NodeTerm::Free { symbol, args } if *symbol == minus => {
+                    magnitude(args[0]).map(|m| format!("-{m}"))
+                }
+                _ => magnitude(r),
+            };
+            (shown.unwrap_or_else(|| "stuck".into()), e.rewrites())
+        };
+        let ok = |v: &str| -> (String, u64) { (v.to_string(), 1) };
+        let stuck = ("stuck".to_string(), 0);
+        let two_64 = "18446744073709551616";
+        let odd_wide = "55340232221128654849"; // 3 · 2^64 + 1
+        assert_eq!(red(&mut e, pow, "1", two_64), ok("1"));
+        assert_eq!(red(&mut e, pow, "-1", two_64), ok("1"));
+        assert_eq!(red(&mut e, pow, "-1", odd_wide), ok("-1"));
+        assert_eq!(red(&mut e, pow, "0", odd_wide), ok("0"));
+        assert_eq!(red(&mut e, shl, "0", two_64), ok("0"));
+        assert_eq!(red(&mut e, shr, "7", two_64), ok("0"));
+        assert_eq!(red(&mut e, shr, "-7", odd_wide), ok("-1"));
+        // No representable result for any other base, or a nonzero left shift, that far.
+        assert_eq!(red(&mut e, pow, "2", two_64), stuck);
+        assert_eq!(red(&mut e, shl, "-3", two_64), stuck);
+        // The power's size `bits(|x|) · e` overflows `u64`.
+        assert_eq!(red(&mut e, pow, "2", "9223372036854775808"), stuck);
+        assert_eq!(red(&mut e, pow, "7", "6148914691236517206"), stuck);
+        // A negative count is off the `Nat` domain.
+        assert_eq!(red(&mut e, shr, "7", "-1"), stuck);
+        assert_eq!(red(&mut e, shl, "7", "-1"), stuck);
+        assert_eq!(red(&mut e, shl, "0", &format!("-{two_64}")), stuck);
+        assert_eq!(red(&mut e, pow, "2", "-1"), stuck);
+        // Machine-word counts compute as before.
+        assert_eq!(red(&mut e, pow, "-3", "3"), ok("-27"));
+        assert_eq!(red(&mut e, shl, "-5", "2"), ok("-20"));
+        assert_eq!(red(&mut e, shr, "-8", "1"), ok("-4"));
+    }
+
     /// Strings and quoted identifiers are atomic `NodeTerm::Na` constants. String hooks provide
     /// concatenation, length, substring, and comparisons; quoted identifiers match only themselves.
     #[test]
@@ -11414,6 +11533,95 @@ mod tests {
         };
         assert_eq!(qcmp(&mut e, "foo", "foo"), tt, "'foo == 'foo");
         assert_eq!(qcmp(&mut e, "foo", "bar"), ff, "'foo == 'bar is false");
+    }
+
+    /// `find`, `rfind`, and `substr` are total over `Nat` indices: an index or count of `2^64` or
+    /// more is past the end like any other, and the application reduces in one rewrite.
+    #[test]
+    fn builtin_string_index_past_machine_width() {
+        use crate::dag::NaValue;
+        use crate::symbol::{NatHooks, SpecialOp, StrOp};
+        let mut e = Engine::new();
+        let zero = e.add_sort("Zero");
+        let nznat = e.add_sort("NzNat");
+        let nat = e.add_sort("Nat");
+        let found = e.add_sort("FindResult");
+        let str_s = e.add_sort("Str");
+        e.add_subsort(zero, nat);
+        e.add_subsort(nznat, nat);
+        e.add_subsort(nat, found);
+        e.close_sorts();
+        let z = e.add_op("0", vec![], zero);
+        let s = e.add_op_iter("s", vec![nat], nznat);
+        let strsym = e.add_op("<Strings>", vec![], str_s);
+        let not_found = e.add_op("notFound", vec![], found);
+        let nh = NatHooks {
+            succ: s,
+            zero: z,
+            minus: None,
+        };
+        let str_op = |e: &mut Engine, op: StrOp, dom: Vec<SortId>, range: SortId| -> SymbolId {
+            let o = e.add_op(format!("{op:?}"), dom, range);
+            e.set_special(
+                o,
+                SpecialOp::StringOp {
+                    op,
+                    str_sym: strsym,
+                    nat: Some(nh),
+                    bool_: None,
+                    not_found: Some(not_found),
+                },
+            );
+            o
+        };
+        let find = str_op(&mut e, StrOp::Find, vec![str_s, str_s, nat], found);
+        let rfind = str_op(&mut e, StrOp::Rfind, vec![str_s, str_s, nat], found);
+        let substr = str_op(&mut e, StrOp::Substr, vec![str_s, nat, nat], str_s);
+        let text = |e: &mut Engine, v: &[u8]| e.make_string(strsym, v);
+        let num = |e: &mut Engine, v: &str| {
+            let z0 = e.make_const(z);
+            e.make_iter_decimal(s, v, z0).expect("decimal")
+        };
+        // `op(args)` → (the result shown as a string, numeral, or `notFound`; rewrites).
+        let red = |e: &mut Engine, op: SymbolId, args: Vec<DagId>| -> (String, u64) {
+            e.reset_rewrites();
+            let q = e.make_free(op, args);
+            let r = e.reduce(q);
+            let shown = match &e.node(r).term {
+                NodeTerm::Na {
+                    value: NaValue::Str(v),
+                    ..
+                } => format!("{:?}", String::from_utf8_lossy(v)),
+                NodeTerm::S { count, .. } => count.to_decimal(),
+                _ if e.node(r).symbol() == not_found => "notFound".to_string(),
+                _ => "stuck".to_string(),
+            };
+            (shown, e.rewrites())
+        };
+        for wide in ["18446744073709551616", "98765432109876543210987"] {
+            let args = vec![
+                text(&mut e, b"pqrpqr"),
+                text(&mut e, b"qr"),
+                num(&mut e, wide),
+            ];
+            assert_eq!(
+                red(&mut e, find, args),
+                ("notFound".into(), 1),
+                "find @ {wide}"
+            );
+            let args = vec![
+                text(&mut e, b"pqrpqr"),
+                text(&mut e, b"qr"),
+                num(&mut e, wide),
+            ];
+            assert_eq!(red(&mut e, rfind, args), ("4".into(), 1), "rfind @ {wide}");
+            let args = vec![text(&mut e, b"lmnopq"), num(&mut e, "3"), num(&mut e, wide)];
+            let opq = (format!("{:?}", "opq"), 1);
+            assert_eq!(red(&mut e, substr, args), opq, "substr length @ {wide}");
+            let args = vec![text(&mut e, b"lmnopq"), num(&mut e, wide), num(&mut e, "3")];
+            let empty = (format!("{:?}", ""), 1);
+            assert_eq!(red(&mut e, substr, args), empty, "substr start @ {wide}");
+        }
     }
 
     /// FLOAT hooks provide arithmetic, negation, absolute value, square root, and comparisons over

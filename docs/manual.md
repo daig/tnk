@@ -752,7 +752,7 @@ When the loaded signature supplies valid hooks, TNK implements these classes:
 
 **TNK-BUILTIN-001 — Fallthrough.** A partial built-in applied outside its domain does not invent a value. It remains unreduced or falls through to user equations as appropriate. Division by zero, invalid character conversion, malformed Qid conversion, and negative results in a natural-only family follow this rule unless the loaded source defines an equation for them.
 
-`counter` is inert under `reduce`; during `rewrite`/`frewrite` it yields `0,1,2,...` and resets for each new top-level rewriting command, not for `continue`.
+`counter` is inert under `reduce`; during `rewrite`/`frewrite` it yields `0,1,2,...` and resets for each new top-level rewriting command, not for `continue`. This holds separately for each `CounterSymbol`-attached operator: every such operator has its own sequence, no other counter operator advances it, and all of them reset together.
 
 ### 16.1.1 Strict Rust reducers
 
@@ -1500,7 +1500,7 @@ Built-ins are activated by resolved `special` attachments; spelling alone does n
 | `CommutativeDecomposeEqualitySymbol` | equality terms; optional conjunction/disjunction | constructor-sensitive decomposing equality |
 | `BranchSymbol` | numbered term hooks | lazy branch selection |
 | `RandomOpSymbol` | natural hooks | deterministic MT19937 stream |
-| `CounterSymbol` | natural hooks | per-top-level-rewrite counter |
+| `CounterSymbol` | natural hooks | per-operator, per-top-level-rewrite counter |
 
 Numeric operation classes are `ACU_NumberOpSymbol`, `CUI_NumberOpSymbol`, and `NumberOpSymbol`. Supported operation codes are `+`, `*`, `gcd`, `lcm`, `min`, `max`, `xor`, `&`, `|`, `sd`, `-`, `quo`, `rem`, `^`, `modExp`, `>>`, `<<`, `abs`, `~`, `<`, `<=`, `>`, `>=`, and `divides`, subject to the class's arity/theory and `TNK-BUILTIN-001`.
 

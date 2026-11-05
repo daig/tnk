@@ -206,3 +206,85 @@ fn cyclic_subsorts_are_rejected_atomically_and_session_recovers() {
     assert!(later.output.contains("result D: d"), "{}", later.output);
     assert_eq!(session.current(), Some("CYCLE-AFTER"));
 }
+
+/// Manual §16.1: each `CounterSymbol` operator has its own `0, 1, 2, ...` sequence. All of them
+/// restart for each top-level `rewrite`/`frewrite`/`erewrite` and keep their values across
+/// `continue`. Covers a renamed copy of one counter and two counters declared directly.
+#[test]
+fn counter_operators_keep_independent_sequences() {
+    let mut session = Session::new();
+    let entered = session.eval(
+        "fmod PEANO is
+           sorts Zero NzNat Nat .
+           subsorts Zero NzNat < Nat .
+           op 0 : -> Zero [ctor] .
+           op s_ : Nat -> NzNat [ctor iter special (id-hook SuccSymbol term-hook zeroTerm (0))] .
+         endfm
+         mod TICKER is
+           protecting PEANO .
+           op tick : -> [Nat] [special (id-hook CounterSymbol op-hook succSymbol (s_ : Nat ~> NzNat))] .
+         endm
+         mod RENAMED-PAIR is
+           including TICKER .
+           including TICKER * (op tick to tock) .
+           sort Seq .
+           subsort Nat < Seq .
+           op _;_ : Seq Seq -> Seq [assoc] .
+         endm
+         mod DIRECT-PAIR is
+           protecting PEANO .
+           op up : -> [Nat] [special (id-hook CounterSymbol op-hook succSymbol (s_ : Nat ~> NzNat))] .
+           op dn : -> [Nat] [special (id-hook CounterSymbol op-hook succSymbol (s_ : Nat ~> NzNat))] .
+           sort Seq .
+           subsort Nat < Seq .
+           op _;_ : Seq Seq -> Seq [assoc] .
+         endm",
+        false,
+    );
+    assert!(!entered.exit);
+    assert_eq!(entered.output, "");
+
+    let mut expect = |command: &str, expected: &str| {
+        let out = session.eval(command, false);
+        assert!(!out.exit);
+        assert!(
+            out.output.trim_end().ends_with(expected),
+            "{command}\nexpected suffix:\n{expected}\ngot:\n{}",
+            out.output
+        );
+    };
+    expect("select RENAMED-PAIR .", "");
+    expect(
+        "rewrite tick ; tock ; tick ; tock .",
+        "rewrites: 4\nresult Seq: 0 ; 0 ; 1 ; 1",
+    );
+    // A fresh command restarts both counters.
+    expect(
+        "rewrite tock ; tock ; tick .",
+        "rewrites: 3\nresult Seq: 0 ; 1 ; 0",
+    );
+    expect(
+        "frewrite tick ; tock ; tick ; tock .",
+        "rewrites: 4\nresult Seq: 0 ; 0 ; 1 ; 1",
+    );
+    expect(
+        "erewrite tock ; tick ; tock .",
+        "rewrites: 3\nresult Seq: 0 ; 0 ; 1",
+    );
+    expect(
+        "rewrite [2] tick ; tock ; tick ; tock .",
+        "rewrites: 2\nresult [Seq]: 0 ; 0 ; tick ; tock",
+    );
+    // `continue` resumes each counter where the bounded run left it.
+    expect("continue .", "rewrites: 2\nresult Seq: 0 ; 0 ; 1 ; 1");
+
+    expect("select DIRECT-PAIR .", "");
+    expect(
+        "rewrite up ; dn ; up ; dn .",
+        "rewrites: 4\nresult Seq: 0 ; 0 ; 1 ; 1",
+    );
+    expect(
+        "frewrite dn ; dn ; up .",
+        "rewrites: 3\nresult Seq: 0 ; 1 ; 0",
+    );
+}
