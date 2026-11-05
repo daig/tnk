@@ -947,9 +947,10 @@ impl StatementLoadError {
 }
 
 /// Parse + build + register one statement's bubbles into `m`, parsing against grammar `g`. `home` selects
-/// the home-grammar path: the rhs is then parsed at the universal start (`g` is the statement's own
-/// unambiguous home grammar, so the flattened-grammar kind-homogeneity trick is neither needed nor valid —
-/// its `Nt::Comp(kind, …)` start would name a *flattened* kind absent from the home grammar). Registers
+/// the home-grammar path, where `g` is the statement's home grammar remapped onto `m`'s symbols. Both
+/// paths parse an equation or rule right side in its left side's kind, which disambiguates a bare
+/// overloaded constant such as `none`. The home grammar numbers kinds as the home module does, so the home
+/// path takes that kind from the left side's own home parse rather than from the flattened `m`. Registers
 /// nothing before the last fallible parse, so a returned `Err` leaves `m` unchanged (safe to retry).
 fn load_one_stmt(
     stmt: &Statement,
@@ -960,11 +961,17 @@ fn load_one_stmt(
     oo: &Option<tnk_core::engine::OoInfo>,
     i: &Interner,
 ) -> Result<bool, StatementLoadError> {
-    // Parse + build the rhs: kind-homogeneous with the lhs against the flattened grammar (disambiguates a
-    // bare overloaded constant), or universal in the home-grammar path.
-    let build_rhs = |rhs: &[Token], lhs_t: &Term, m: &BuiltModule, vars: &mut VarIndex| {
+    // Parse + build the rhs kind-homogeneous with the lhs. `lhs_home_kind` is the kind of the lhs parse in
+    // `g`; it is only meaningful (and only used) on the home path. A bare-variable lhs leaves the rhs
+    // unconstrained on both paths.
+    let build_rhs = |rhs: &[Token],
+                     lhs_t: &Term,
+                     lhs_home_kind: Option<KindId>,
+                     m: &BuiltModule,
+                     vars: &mut VarIndex| {
         if home {
-            parse_build(rhs, g, m, i, vars)
+            let kind = lhs_t.top_symbol().and(lhs_home_kind);
+            parse_build_in_kind(rhs, kind, g, m, i, vars)
         } else {
             parse_build_rhs(rhs, lhs_t, g, m, i, vars)
         }
@@ -982,13 +989,13 @@ fn load_one_stmt(
             // Build order: lhs → condition (assigns fresh `:=` vars + tracks bound) → rhs, all sharing
             // one variable index. Then add via the matching kernel facade.
             let mut vars = VarIndex::new();
-            let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+            let (mut lhs_t, lhs_home_kind) = parse_build_with_kind(lhs, g, m, i, &mut vars)?;
             let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
             let mut condition = match cond {
                 Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
                 None => Vec::new(),
             };
-            let mut rhs_t = build_rhs(rhs, &lhs_t, m, &mut vars)?;
+            let mut rhs_t = build_rhs(rhs, &lhs_t, lhs_home_kind, m, &mut vars)?;
             let oo_source = (record_oo_diagnostic && oo.is_some()).then(|| {
                 let source_count = vars.count();
                 let names = oo_variable_names(m, &vars, source_count);
@@ -1151,13 +1158,13 @@ fn load_one_stmt(
             // Rules use the same lhs → condition → rhs build order and shared variable index as
             // equations, then register in the kernel's separate rule table.
             let mut vars = VarIndex::new();
-            let mut lhs_t = parse_build(lhs, g, m, i, &mut vars)?;
+            let (mut lhs_t, lhs_home_kind) = parse_build_with_kind(lhs, g, m, i, &mut vars)?;
             let mut bound: BTreeSet<u32> = (0..vars.count()).collect();
             let mut condition = match cond {
                 Some(c) => parse_condition(c, g, m, i, &mut vars, &mut bound)?,
                 None => Vec::new(),
             };
-            let mut rhs_t = build_rhs(rhs, &lhs_t, m, &mut vars)?;
+            let mut rhs_t = build_rhs(rhs, &lhs_t, lhs_home_kind, m, &mut vars)?;
             let oo_source = (record_oo_diagnostic && oo.is_some()).then(|| {
                 let source_count = vars.count();
                 let names = oo_variable_names(m, &vars, source_count);
@@ -2093,6 +2100,26 @@ pub(crate) fn parse_build(
     build_term(&parse_forest(&tokens, g, i)?, g, m, &tokens, i, vars)
 }
 
+/// [`parse_build`], also returning the parse's kind as numbered in `g`: the `<k>Term` nonterminal the
+/// universal start lifts (`TERM ::= <k>Term`). A remapped home grammar keeps its home module's kind
+/// numbering, which the flattened module's kinds do not index.
+fn parse_build_with_kind(
+    tokens: &[Token],
+    g: &CompiledGrammar,
+    m: &BuiltModule,
+    i: &Interner,
+    vars: &mut VarIndex,
+) -> Result<(Term, Option<KindId>), String> {
+    let tokens = fill_empty_object_attributes(tokens, m, i);
+    let tree = parse_forest(&tokens, g, i)?;
+    let kind = match g.prods[tree.prod as usize].rhs.as_slice() {
+        [GSym::N(Nt::Comp(kind, NtType::Term))] => Some(*kind),
+        _ => None,
+    };
+    let term = build_term(&tree, g, m, &tokens, i, vars)?;
+    Ok((term, kind))
+}
+
 /// The kind of a built term's top — its top symbol's range, or `None` for a bare variable (whose kind we
 /// don't constrain against). Used to parse an equation's rhs in the *same* kind as its lhs.
 fn term_kind(t: &Term, m: &BuiltModule) -> Option<KindId> {
@@ -2111,14 +2138,28 @@ fn parse_build_rhs(
     i: &Interner,
     vars: &mut VarIndex,
 ) -> Result<Term, String> {
-    let rhs = fill_empty_object_attributes(rhs, m, i);
-    if let Some(k) = term_kind(lhs, m) {
+    parse_build_in_kind(rhs, term_kind(lhs, m), g, m, i, vars)
+}
+
+/// Parse and build `tokens` starting at `kind`'s term nonterminal of `g` (when given), retrying from the
+/// universal start symbol when that yields no unique parse, so the underlying parse or build error is
+/// reported. `kind` must be numbered as in `g`.
+fn parse_build_in_kind(
+    tokens: &[Token],
+    kind: Option<KindId>,
+    g: &CompiledGrammar,
+    m: &BuiltModule,
+    i: &Interner,
+    vars: &mut VarIndex,
+) -> Result<Term, String> {
+    let tokens = fill_empty_object_attributes(tokens, m, i);
+    if let Some(k) = kind {
         let start = Nt::Comp(k, NtType::Term);
-        if let Ok(tree) = parse_forest_at(&rhs, g, i, start) {
-            return build_term(&tree, g, m, &rhs, i, vars);
+        if let Ok(tree) = parse_forest_at(&tokens, g, i, start) {
+            return build_term(&tree, g, m, &tokens, i, vars);
         }
     }
-    parse_build(&rhs, g, m, i, vars)
+    parse_build(&tokens, g, m, i, vars)
 }
 
 /// Like [`parse_forest`] but starting at an arbitrary nonterminal (a per-kind term nonterminal), to parse

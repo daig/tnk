@@ -1270,6 +1270,76 @@ fn prelude_meta_qidset_operations_reduce() {
     );
 }
 
+/// An importer of META-LEVEL may declare variables spelled like META-MODULE's own (`SS`, `IL`). The
+/// plain-imported getRls/getStrats/getSds equations whose right side is the overloaded constant `none`
+/// are reparsed in META-MODULE's grammar at their left side's kind. They keep META-MODULE's variables
+/// instead of falling back to the importer's grammar, where those names would no longer parse.
+#[test]
+fn meta_module_none_equations_survive_importer_variable_names() {
+    let mut r = repl();
+    r.eval(conformance_file!("prelude-meta.maude"));
+    let out = r
+        .eval(concat!(
+            "fmod META-VAR-CLASH is\n",
+            "  including META-LEVEL .\n",
+            "  vars SS ST : String .\n",
+            "  var IL : Bool .\n",
+            "endfm\n",
+            "red getRls(fmod 'H is nil sorts none . none none none none endfm) .\n",
+            "red getStrats(th 'T is nil sorts none . none none none none none endth) .\n",
+            "red getSds(mod 'H is nil sorts none . none none none none none endm) .\n",
+        ))
+        .output;
+    assert!(
+        !out.contains("warning: module `META-MODULE`"),
+        "no META-MODULE statement is dropped for the importer: {out}"
+    );
+    assert_eq!(
+        prelude_results(&out),
+        vec![
+            "[1] RuleSet: (none).RuleSet",
+            "[1] StratDeclSet: (none).StratDeclSet",
+            "[1] StratDefSet: (none).StratDefSet",
+        ],
+        "META-MODULE projections reduce in the importer: {out}"
+    );
+}
+
+/// The stock WEAKLY-SORTABLE-LIST and WEAKLY-SORTABLE-LIST' receive BOOL-OPS without a home, through their
+/// parameter copy and inside their renamed LIST instance. Their own `vars A A' L L' : List{X}` do not
+/// re-bind BOOL-OPS' `A`, so the Boolean equations stay installed and reduce in the parameterized modules.
+#[test]
+fn prelude_weakly_sortable_lists_keep_bool_equations() {
+    let mut r = repl();
+    let load = r.eval(conformance_file!("prelude-meta.maude")).output;
+    assert!(
+        !load.contains("module `WEAKLY-SORTABLE-LIST"),
+        "no WEAKLY-SORTABLE-LIST statement is dropped: {load}"
+    );
+    let out = r
+        .eval(concat!(
+            "select WEAKLY-SORTABLE-LIST .\n",
+            "red true and false .\n",
+            "red false xor true .\n",
+            "red not false .\n",
+            "select WEAKLY-SORTABLE-LIST' .\n",
+            "red true and true .\n",
+            "red true implies false .\n",
+        ))
+        .output;
+    assert_eq!(
+        prelude_results(&out),
+        vec![
+            "[1] Bool: false",
+            "[1] Bool: true",
+            "[2] Bool: true",
+            "[1] Bool: true",
+            "[5] Bool: false",
+        ],
+        "BOOL-OPS reduces in the sortable-list modules: {out}"
+    );
+}
+
 /// Exercise LEXICAL tokenization, punctuation/backquote canonicalization, and byte-level token printing.
 #[test]
 fn lexical_token_hooks_through_repl() {
@@ -1492,6 +1562,193 @@ fn var_shadowing_through_repl() {
         vec!["result T: e e", "result T: e", "result S: a"],
         "shadow values: {out}"
     );
+}
+
+/// Statements donated through a renamed import or a parameter copy keep their home variables. Another
+/// declaration of the same name, by the importer, an earlier sibling import, or the parameterized module,
+/// neither drops them nor changes their sort. This covers a variable the home sees only through its own
+/// import, an instantiated renamed module `(M * R){V}`, a constant renamed to a home variable's spelling,
+/// and a strategy definition. Names the importer binds identically keep their spelling: a variable
+/// spelled like an operator token still parses, and `L[X <- t]` still names a renamed rule's variable.
+#[test]
+fn renamed_and_parameter_copy_statements_keep_home_variables() {
+    let out = repl()
+        .eval(concat!(
+            "fmod TV is\n",
+            "  sorts Tv Nv .\n",
+            "  ops tt ff : -> Tv [ctor] .\n",
+            "  op n : -> Nv [ctor] .\n",
+            "  op _&_ : Tv Tv -> Tv .\n",
+            "  op ok : Tv -> Tv .\n",
+            "  op ok : Nv -> Tv .\n",
+            "  var A : Tv .\n",
+            "  eq tt & A = A .\n",
+            "  eq ok(A) = tt .\n",
+            "endfm\n",
+            "fmod USER is\n",
+            "  protecting TV * (sort Tv to Truth) .\n",
+            "  var A : Nv .\n",
+            "endfm\n",
+            "red tt & ff .\n",
+            "red ok(ff) .\n",
+            "red ok(n) .\n",
+            "fmod SIB is\n",
+            "  sort U .\n",
+            "  var A : U .\n",
+            "endfm\n",
+            "fmod USER2 is\n",
+            "  protecting SIB .\n",
+            "  protecting TV * (op n to m) .\n",
+            "endfm\n",
+            "red tt & ff .\n",
+            "fth TH is\n",
+            "  protecting TV .\n",
+            "  sort Elt .\n",
+            "endfth\n",
+            "fmod PM{X :: TH} is\n",
+            "  sort Foo .\n",
+            "  var A : Foo .\n",
+            "endfm\n",
+            "red tt & ff .\n",
+            "fmod VA is\n",
+            "  sort S .\n",
+            "  ops a b : -> S [ctor] .\n",
+            "  var X : S .\n",
+            "endfm\n",
+            "fmod VB is\n",
+            "  protecting VA .\n",
+            "  op h : S -> S .\n",
+            "  eq h(X) = a .\n",
+            "endfm\n",
+            "fmod VC is\n",
+            "  protecting VB * (op h to k) .\n",
+            "  sort Other .\n",
+            "  var X : Other .\n",
+            "endfm\n",
+            "red k(b) .\n",
+            "fmod OPV is\n",
+            "  sorts Foo Bar .\n",
+            "  op a : -> Bar .\n",
+            "  op z : -> Foo .\n",
+            "  op s_ : Foo -> Foo .\n",
+            "  op h : Foo -> Foo .\n",
+            "  op k : Bar -> Bar .\n",
+            "  op j : Bar -> Bar .\n",
+            "  var s : Bar .\n",
+            "  eq k(s) = j(s) .\n",
+            "  eq h(s z) = z .\n",
+            "endfm\n",
+            "fmod OPVR is\n",
+            "  including OPV * (sort Bar to Baz) .\n",
+            "endfm\n",
+            "red h(s z) .\n",
+            "red k(a) .\n",
+            "fmod TVB is\n",
+            "  sort Tv .\n",
+            "  ops tt ff : -> Tv .\n",
+            "  op _&_ : Tv Tv -> Tv .\n",
+            "  var A : Tv .\n",
+            "  eq tt & A = A .\n",
+            "endfm\n",
+            "fth T1 is\n",
+            "  sort Elt .\n",
+            "endfth\n",
+            "fmod BOX{X :: T1} is\n",
+            "  protecting TVB .\n",
+            "  sort Box{X} .\n",
+            "  op box : X$Elt -> Box{X} .\n",
+            "endfm\n",
+            "fmod ELT is\n",
+            "  sort E .\n",
+            "  op e : -> E .\n",
+            "endfm\n",
+            "view VE from T1 to ELT is\n",
+            "  sort Elt to E .\n",
+            "endv\n",
+            "fmod USE is\n",
+            "  protecting (BOX * (sort Box{X} to Crate{X})){VE} .\n",
+            "  sort Other .\n",
+            "  var A : Other .\n",
+            "endfm\n",
+            "red tt & ff .\n",
+            "fmod HC is\n",
+            "  sort Tv .\n",
+            "  ops n p : -> Tv .\n",
+            "  op f : Tv -> Tv .\n",
+            "  var m : Tv .\n",
+            "  eq f(m) = n .\n",
+            "endfm\n",
+            "fmod RC is\n",
+            "  protecting HC * (op n to m) .\n",
+            "endfm\n",
+            "red f(p) .\n",
+            "smod SSRC is\n",
+            "  sort S .\n",
+            "  ops a b : -> S .\n",
+            "  op f : S -> S .\n",
+            "  var X : S .\n",
+            "  rl [step] : f(a) => b .\n",
+            "  strat go : S @ S .\n",
+            "  sd go(X) := match f(X) ; step .\n",
+            "endsm\n",
+            "smod SUSER is\n",
+            "  protecting SSRC * (sort S to T) .\n",
+            "  sort Other .\n",
+            "  var X : Other .\n",
+            "endsm\n",
+            "srew f(a) using go(a) .\n",
+            "smod RSRC is\n",
+            "  sort S .\n",
+            "  ops a b : -> S .\n",
+            "  op f : S -> S .\n",
+            "  var X : S .\n",
+            "  rl [step] : f(X) => X .\n",
+            "endsm\n",
+            "smod RUSER is\n",
+            "  protecting RSRC * (op b to b2) .\n",
+            "  strat go : @ S .\n",
+            "  sd go := step[X <- a] .\n",
+            "endsm\n",
+            "srew f(a) using go .\n",
+        ))
+        .output;
+    assert!(
+        !out.contains("dropped"),
+        "no donated statement drops: {out}"
+    );
+    let (reductions, strategies) = out
+        .split_once("srewrite in SUSER")
+        .expect("strategy command echo");
+    assert_eq!(
+        prelude_results(reductions),
+        vec![
+            "[1] Truth: ff",
+            "[1] Truth: tt",
+            // `ok(A)` is about `A : Tv`; the importer's `A : Nv` does not capture `ok(n)`.
+            "[0] Truth: ok(n)",
+            "[1] Tv: ff",
+            "[1] Tv: ff",
+            "[1] S: a",
+            "[1] Foo: z",
+            "[1] Baz: j(a)",
+            "[1] Tv: ff",
+            // `f(m) = n` renamed by `op n to m`: the left `m` stays the variable, the right one the constant.
+            "[1] Tv: m",
+        ],
+        "renamed and copied equations: {out}"
+    );
+    let (renamed_definition, renamed_rule) = strategies
+        .split_once("srewrite in RUSER")
+        .expect("second strategy command echo");
+    for (label, block, result) in [
+        ("renamed definition", renamed_definition, "result T: b"),
+        ("renamed rule variable", renamed_rule, "result S: a"),
+    ] {
+        assert!(
+            block.contains("Solution 1") && block.contains(result),
+            "{label}: {out}"
+        );
+    }
 }
 
 /// A theory becomes current; `[nonexec]` axioms remain inert while ordinary theory equations execute.

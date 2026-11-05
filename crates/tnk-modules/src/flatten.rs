@@ -6,6 +6,7 @@
 //! order. The result has no imports and can be compiled directly.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use tnk_frontend::lex::{Interner, Token, tokenize};
 use tnk_frontend::rename_terms::{ReconTarget, ViewOpMap, ViewOpSubst, rewrite_op_hook_signature};
 use tnk_frontend::surface::ast::{
@@ -33,6 +34,165 @@ pub struct FlatDecls {
     pub strat_defs: Vec<tnk_frontend::surface::ast::StratDef>,
 }
 
+/// The bare variables a statement's source scope declares: each variable name visible in its home
+/// module's own grammar (imported aliases included), mapped to its sort as spelled in the donated bubble.
+type VarScope = HashMap<String, String>;
+
+/// Source variable scopes of home-less donations, parallel to an accumulator's statements and strategy
+/// definitions. `Some` marks a statement or definition from a renamed or parameter-copy bundle whose bare
+/// variables still mean their home declarations. `None` marks one that keeps its home tag or whose
+/// variables are already inlined (an instance's own declarations).
+#[derive(Default)]
+struct DonationScopes {
+    statements: Vec<Option<Rc<VarScope>>>,
+    strat_defs: Vec<Option<Rc<VarScope>>>,
+}
+
+impl DonationScopes {
+    /// Respell each scope's sorts through a renaming's sort maps, matching how the renaming rewrites the
+    /// bundle's variable declarations and colon variables (`A : Tv ↦ A : Truth`).
+    fn renamed(self, items: &[RenameItem]) -> Self {
+        let sort_map: HashMap<&str, &str> = items
+            .iter()
+            .filter_map(|item| match item {
+                RenameItem::Sort { from, to } => Some((from.as_str(), to.as_str())),
+                _ => None,
+            })
+            .collect();
+        if sort_map.is_empty() {
+            return self;
+        }
+        let mut memo: HashMap<*const VarScope, Rc<VarScope>> = HashMap::new();
+        let mut rename = |scope: Option<Rc<VarScope>>| {
+            scope.map(|scope| {
+                memo.entry(Rc::as_ptr(&scope))
+                    .or_insert_with(|| {
+                        Rc::new(
+                            scope
+                                .iter()
+                                .map(|(name, sort)| {
+                                    let sort = sort_map.get(sort.as_str()).copied().unwrap_or(sort);
+                                    (name.clone(), sort.to_string())
+                                })
+                                .collect(),
+                        )
+                    })
+                    .clone()
+            })
+        };
+        Self {
+            statements: self.statements.into_iter().map(&mut rename).collect(),
+            strat_defs: self.strat_defs.into_iter().map(&mut rename).collect(),
+        }
+    }
+
+    /// Inline every scoped variable named in `names` into its statement or strategy definition in `d`
+    /// (parallel to these scopes) at its scope sort, and drop it from the scope, so that
+    /// [`inline_rebound_vars`] leaves later bare occurrences of the name alone.
+    fn inline_and_forget(
+        self,
+        d: &mut FlatDecls,
+        names: &HashSet<String>,
+        i: &mut Interner,
+    ) -> Self {
+        if names.is_empty() {
+            return self;
+        }
+        // Each distinct scope splits once into the variables inlined now and the scope kept.
+        let mut splits: HashMap<*const VarScope, (Rc<VarScope>, Rc<VarScope>)> = HashMap::new();
+        let mut split = |scope: &Rc<VarScope>| {
+            splits
+                .entry(Rc::as_ptr(scope))
+                .or_insert_with(|| {
+                    let (now, kept): (VarScope, VarScope) = scope
+                        .iter()
+                        .map(|(name, sort)| (name.clone(), sort.clone()))
+                        .partition(|(name, _)| names.contains(name));
+                    (Rc::new(now), Rc::new(kept))
+                })
+                .clone()
+        };
+        let mut statements = Vec::with_capacity(self.statements.len());
+        for (st, scope) in d.statements.iter_mut().zip(&self.statements) {
+            statements.push(scope.as_ref().map(|scope| {
+                let (now, kept) = split(scope);
+                if now.is_empty() {
+                    return scope.clone();
+                }
+                inline_statement_vars(st, &now, i);
+                kept
+            }));
+        }
+        let mut strat_defs = Vec::with_capacity(self.strat_defs.len());
+        for (def, scope) in d.strat_defs.iter_mut().zip(&self.strat_defs) {
+            strat_defs.push(scope.as_ref().map(|scope| {
+                let (now, kept) = split(scope);
+                if now.is_empty() {
+                    return scope.clone();
+                }
+                inline_strat_def_vars(def, &now, i);
+                kept
+            }));
+        }
+        Self {
+            statements,
+            strat_defs,
+        }
+    }
+}
+
+/// The constants a renaming introduces: the target name of each operator rename that applies to a nullary
+/// declaration in `ops` (`op n to m` for `op n : -> Tv` introduces `m`).
+fn introduced_constants(
+    items: &[RenameItem],
+    ops: &[OpDecl],
+    interner: &Interner,
+) -> HashSet<String> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let RenameItem::Op {
+                from,
+                to,
+                dom_range,
+                ..
+            } = item
+            else {
+                return None;
+            };
+            let renames_constant = ops.iter().any(|op| {
+                op.domain.is_empty()
+                    && dom_range
+                        .as_ref()
+                        .is_none_or(|(domain, range)| domain.is_empty() && *range == op.range)
+                    && op
+                        .name
+                        .iter()
+                        .map(|token| interner.resolve(token.sym))
+                        .collect::<String>()
+                        == *from
+            });
+            renames_constant.then(|| to.clone())
+        })
+        .collect()
+}
+
+/// Rename a home-less bundle together with its source variable scopes. A scoped variable spelled like a
+/// constant the renaming introduces (`var m : Tv` under `op n to m`) is inlined first, while a bare `m`
+/// still means the variable, and leaves its scope: once renamed, a bare `m` also names the constant, and
+/// no importer's variable table keeps an imported alias that a visible constant redeclares.
+fn rename_bundle(
+    mut decls: FlatDecls,
+    scopes: DonationScopes,
+    items: &[RenameItem],
+    interner: &mut Interner,
+) -> Result<(FlatDecls, DonationScopes), String> {
+    let constants = introduced_constants(items, &decls.ops, interner);
+    let scopes = scopes.inline_and_forget(&mut decls, &constants, interner);
+    let renamed = apply_renaming(decls, items, interner)?;
+    Ok((renamed, scopes.renamed(items)))
+}
+
 /// Accumulates merged declarations, de-duplicating sorts and variable names.
 #[derive(Default)]
 struct Acc {
@@ -51,15 +211,53 @@ struct Acc {
     /// Per-statement **home** module name, parallel to [`statements`](Self::statements). `Some(name)` marks
     /// a plain named-module donation whose statement may need reparsing in that module's own grammar when
     /// the flattened grammar is ambiguous. `None` marks a renamed, instantiated, or parameter-copy
-    /// donation whose bubbles were already rewritten for the flattened grammar. Root statements carry
-    /// `Some(root_name)`, which the loader treats as "self". Kept in lockstep with `statements`.
+    /// donation, which parses against the flattened grammar. Root statements carry `Some(root_name)`,
+    /// which the loader treats as "self". Kept in lockstep with `statements`.
     statement_homes: Vec<Option<String>>,
+    /// Source variable scopes of renamed and parameter-copy donations, in lockstep with `statements` and
+    /// `strat_defs`. [`inline_rebound_vars`] uses them once the flattened variable table is final.
+    scopes: DonationScopes,
+    /// Whether renamed and parameter-copy bundles record their source variable scopes. Set for a
+    /// flattening that keeps its statements ([`flatten_with_homes`], [`flatten_pre`]) and inherited by its
+    /// bundle accumulators ([`Self::bundle`]). Off for a collection that only reads declarations, such as
+    /// a home's variable table ([`home_var_scope`]), so computing one scope never computes another.
+    track_scopes: bool,
 }
 
 impl Acc {
+    /// The accumulator of a flattening whose home-less donations carry their source variable scopes.
+    fn tracking_scopes() -> Self {
+        Self {
+            track_scopes: true,
+            ..Self::default()
+        }
+    }
+
+    /// A fresh accumulator for a renamed or parameter-copy bundle collected inside this one.
+    fn bundle(&self) -> Self {
+        Self {
+            track_scopes: self.track_scopes,
+            ..Self::default()
+        }
+    }
+
     /// Merge a declaration bundle, retaining each new sort and variable name once and appending every
     /// other declaration. `home` tags all statements in `d` in lockstep with the statement list.
     fn add(&mut self, d: FlatDecls, home: Option<&str>) {
+        let scopes = DonationScopes {
+            statements: vec![None; d.statements.len()],
+            strat_defs: vec![None; d.strat_defs.len()],
+        };
+        self.add_scoped(d, home, scopes);
+    }
+
+    /// [`Self::add`] for a home-less renamed or parameter-copy bundle whose statements and strategy
+    /// definitions carry their source variable `scopes`.
+    fn add_scoped(&mut self, d: FlatDecls, home: Option<&str>, scopes: DonationScopes) {
+        debug_assert_eq!(scopes.statements.len(), d.statements.len());
+        debug_assert_eq!(scopes.strat_defs.len(), d.strat_defs.len());
+        self.scopes.statements.extend(scopes.statements);
+        self.scopes.strat_defs.extend(scopes.strat_defs);
         for s in d.sorts {
             if self.sort_set.insert(s.clone()) {
                 self.sorts.push(s);
@@ -93,6 +291,57 @@ impl Acc {
         self.object_statements.extend(d.object_statements);
         self.strat_decls.extend(d.strat_decls);
         self.strat_defs.extend(d.strat_defs);
+    }
+
+    /// The source variable scope of each statement and strategy definition, taken before this bundle is
+    /// renamed and donated without home tags. One still tagged with its home module takes that module's
+    /// grammar variable table, computed once per home; a nested home-less donation keeps the scope it
+    /// already carries. `root` names the module this bundle was collected from, when it is a named module:
+    /// a fresh accumulator holding exactly its import closure, so its table comes from this accumulator's
+    /// own declarations ([`root_var_table`]) rather than from flattening it again. Any other home is
+    /// collected afresh without scopes ([`home_var_scope`]). Without scope tracking every scope is `None`.
+    fn donation_scopes(
+        &self,
+        root: Option<&str>,
+        db: &ModuleDb,
+        views: &ViewDb,
+        i: &mut Interner,
+    ) -> DonationScopes {
+        if !self.track_scopes {
+            return DonationScopes {
+                statements: vec![None; self.statements.len()],
+                strat_defs: vec![None; self.strat_defs.len()],
+            };
+        }
+        let mut by_home: HashMap<String, Rc<VarScope>> = HashMap::new();
+        let mut scope_of = |home: &str, i: &mut Interner| -> Rc<VarScope> {
+            if let Some(scope) = by_home.get(home) {
+                return scope.clone();
+            }
+            let scope = match db.get(home) {
+                Some(module) if root == Some(home) => {
+                    var_scope(root_var_table(self.vars.clone(), &self.ops, module, i))
+                }
+                _ => home_var_scope(home, db, views, i),
+            };
+            let scope = Rc::new(scope);
+            by_home.insert(home.to_string(), scope.clone());
+            scope
+        };
+        let mut scopes = DonationScopes::default();
+        for (home, scope) in self.statement_homes.iter().zip(&self.scopes.statements) {
+            scopes.statements.push(match home {
+                Some(home) => Some(scope_of(home, i)),
+                None => scope.clone(),
+            });
+        }
+        for (def, scope) in self.strat_defs.iter().zip(&self.scopes.strat_defs) {
+            scopes.strat_defs.push(match &def.home {
+                Some(home) => Some(scope_of(home, i)),
+                None => scope.clone(),
+            });
+        }
+        scopes
     }
 
     fn into_decls(self) -> FlatDecls {
@@ -171,23 +420,171 @@ fn inline_shadowed_vars(d: &mut FlatDecls, prior: &Acc, i: &mut Interner) {
     if var_inline.is_empty() {
         return;
     }
-    let (no_bindings, no_ops) = (HashMap::new(), HashMap::new());
-    let go = |b: &[Token], i: &mut Interner| subst_bubble(b, &no_bindings, &no_ops, &var_inline, i);
     for st in &mut d.statements {
-        match st {
-            Statement::Eq { lhs, rhs, cond, .. } | Statement::Rule { lhs, rhs, cond, .. } => {
-                *lhs = go(lhs, i);
-                *rhs = go(rhs, i);
-                if let Some(c) = cond {
-                    *c = go(c, i);
-                }
+        inline_statement_vars(st, &var_inline, i);
+    }
+}
+
+/// Rewrite every bare occurrence of a `var_inline` name in a statement's term bubbles as a single-token
+/// colon variable at its mapped sort (`A` ↦ `A:Bool`). A membership's sort is not a term bubble.
+fn inline_statement_vars(st: &mut Statement, var_inline: &VarScope, i: &mut Interner) {
+    let (no_bindings, no_ops) = (HashMap::new(), HashMap::new());
+    let go = |b: &[Token], i: &mut Interner| subst_bubble(b, &no_bindings, &no_ops, var_inline, i);
+    match st {
+        Statement::Eq { lhs, rhs, cond, .. } | Statement::Rule { lhs, rhs, cond, .. } => {
+            *lhs = go(lhs, i);
+            *rhs = go(rhs, i);
+            if let Some(c) = cond {
+                *c = go(c, i);
             }
-            Statement::Mb { lhs, cond, .. } => {
-                *lhs = go(lhs, i);
-                if let Some(c) = cond {
-                    *c = go(c, i);
-                }
+        }
+        Statement::Mb { lhs, cond, .. } => {
+            *lhs = go(lhs, i);
+            if let Some(c) = cond {
+                *c = go(c, i);
             }
+        }
+    }
+}
+
+/// [`inline_statement_vars`] for a strategy definition: its call-pattern parameters, every term bubble of
+/// its body (including application-substitution variables, so `L[X <- t]` keeps naming the inlined rule
+/// variable of a co-donated rule), and its condition, so one name keeps one spelling in the definition.
+fn inline_strat_def_vars(
+    def: &mut tnk_frontend::surface::ast::StratDef,
+    var_inline: &VarScope,
+    i: &mut Interner,
+) {
+    let (no_bindings, no_ops) = (HashMap::new(), HashMap::new());
+    for param in &mut def.params {
+        *param = subst_bubble(param, &no_bindings, &no_ops, var_inline, i);
+    }
+    rewrite_strategy_bubbles(&mut def.body, &mut |bubble| {
+        subst_bubble(bubble, &no_bindings, &no_ops, var_inline, i)
+    });
+    if let Some(cond) = &mut def.cond {
+        *cond = subst_bubble(cond, &no_bindings, &no_ops, var_inline, i);
+    }
+}
+
+/// The variable table of the flattened module `root`, whose import closure (the root included) declared
+/// `vars` (name-deduplicated, first declaration first) and `ops`. Imported variable aliases participate
+/// only when no visible nullary operator redeclares the token; the root's own declarations are then
+/// restored authoritatively.
+fn root_var_table(
+    mut vars: Vec<VarDecl>,
+    ops: &[OpDecl],
+    root: &PreModule,
+    interner: &Interner,
+) -> Vec<VarDecl> {
+    let own_var_names: HashSet<&str> = root
+        .vars
+        .iter()
+        .flat_map(|v| v.names.iter().map(String::as_str))
+        .collect();
+    let constant_names: HashSet<String> = ops
+        .iter()
+        .filter(|op| op.domain.is_empty())
+        .map(|op| {
+            op.name
+                .iter()
+                .map(|token| interner.resolve(token.sym))
+                .collect()
+        })
+        .collect();
+    for vd in &mut vars {
+        vd.names.retain(|name| {
+            !own_var_names.contains(name.as_str()) && !constant_names.contains(name)
+        });
+    }
+    vars.retain(|vd| !vd.names.is_empty());
+    vars.extend(root.vars.iter().cloned());
+    vars
+}
+
+/// A variable table as a scope: each declared name mapped to its sort.
+fn var_scope(vars: Vec<VarDecl>) -> VarScope {
+    let mut scope = VarScope::new();
+    for v in vars {
+        for name in v.names {
+            scope.entry(name).or_insert_with(|| v.sort.clone());
+        }
+    }
+    scope
+}
+
+/// A home module's grammar variable table, the scope its own statements are parsed in: the aliases its
+/// flattened grammar declares ([`root_var_table`]: imports included, imported names that a visible
+/// constant redeclares left out, its own declarations authoritative). Only declarations are read, so the
+/// home's closure is collected without donation scopes. A home that does not flatten falls back to its
+/// own declarations.
+fn home_var_scope(home: &str, db: &ModuleDb, views: &ViewDb, i: &mut Interner) -> VarScope {
+    let Some(module) = db.get(home) else {
+        return VarScope::new();
+    };
+    let mut acc = Acc::default();
+    let vars = match collect_named(home, db, views, &mut acc, &mut HashSet::new(), i) {
+        Ok(()) => root_var_table(acc.vars, &acc.ops, module, i),
+        Err(_) => module.vars.clone(),
+    };
+    var_scope(vars)
+}
+
+/// Keep home-less renamed and parameter-copy donations independent of the flattened module's variable
+/// table. Their bubbles parse against the flattened grammar, whose bare variables are the importer's own
+/// declarations plus the first-donated imported alias of each name, so a bare variable there can change
+/// sort or stop parsing. Each statement or strategy definition carrying a source scope gets the names that
+/// the flattened variable table binds differently (at another sort, or not at all) inlined as single-token
+/// colon variables at their source sort, the [`instantiate_decls`] technique. Names the flattened table
+/// binds identically stay bare, keeping their spelling.
+fn inline_rebound_vars(d: &mut FlatDecls, scopes: &DonationScopes, i: &mut Interner) {
+    if scopes
+        .statements
+        .iter()
+        .chain(&scopes.strat_defs)
+        .all(Option::is_none)
+    {
+        return;
+    }
+    let mut flat_vars: HashMap<&str, &str> = HashMap::new();
+    for v in &d.vars {
+        for name in &v.names {
+            flat_vars.entry(name.as_str()).or_insert(v.sort.as_str());
+        }
+    }
+    let mut rebound: HashMap<*const VarScope, Rc<VarScope>> = HashMap::new();
+    let mut rebound_of = |scope: &Rc<VarScope>| -> Rc<VarScope> {
+        rebound
+            .entry(Rc::as_ptr(scope))
+            .or_insert_with(|| {
+                Rc::new(
+                    scope
+                        .iter()
+                        .filter(|(name, sort)| flat_vars.get(name.as_str()) != Some(&sort.as_str()))
+                        .map(|(name, sort)| (name.clone(), sort.clone()))
+                        .collect(),
+                )
+            })
+            .clone()
+    };
+    let statement_inlines: Vec<Option<Rc<VarScope>>> = scopes
+        .statements
+        .iter()
+        .map(|scope| scope.as_ref().map(&mut rebound_of))
+        .collect();
+    let def_inlines: Vec<Option<Rc<VarScope>>> = scopes
+        .strat_defs
+        .iter()
+        .map(|scope| scope.as_ref().map(&mut rebound_of))
+        .collect();
+    for (st, inline) in d.statements.iter_mut().zip(statement_inlines) {
+        if let Some(inline) = inline.filter(|inline| !inline.is_empty()) {
+            inline_statement_vars(st, &inline, i);
+        }
+    }
+    for (def, inline) in d.strat_defs.iter_mut().zip(def_inlines) {
+        if let Some(inline) = inline.filter(|inline| !inline.is_empty()) {
+            inline_strat_def_vars(def, &inline, i);
         }
     }
 }
@@ -215,7 +612,7 @@ pub fn flatten_with_homes(
     views: &ViewDb,
     interner: &mut Interner,
 ) -> Result<(PreModule, Vec<Option<String>>), String> {
-    let mut acc = Acc::default();
+    let mut acc = Acc::tracking_scopes();
     let mut visited = HashSet::new();
     collect_named(name, db, views, &mut acc, &mut visited, interner)?;
     // The flattened module is the root module with its imports inlined, so it keeps the root's kind
@@ -228,45 +625,29 @@ pub fn flatten_with_homes(
         acc.statements.rotate_right(pm.statements.len());
         acc.statement_homes.rotate_right(pm.statements.len());
         acc.object_statements.rotate_right(pm.statements.len());
+        acc.scopes.statements.rotate_right(pm.statements.len());
         acc.strat_decls.rotate_right(pm.strat_decls.len());
         acc.strat_defs.rotate_right(pm.strat_defs.len());
+        acc.scopes.strat_defs.rotate_right(pm.strat_defs.len());
     }
     let (kind, is_theory, is_strategy, is_object) = root
         .map(|pm| (pm.kind, pm.is_theory, pm.is_strategy, pm.is_object))
         .unwrap_or((ModuleKind::Functional, false, false, false));
     let homes = std::mem::take(&mut acc.statement_homes);
+    let scopes = std::mem::take(&mut acc.scopes);
     let mut d = acc.into_decls();
     // Imported variable aliases participate only when no visible nullary operator redeclares the token.
     // Root-owned variables are then restored authoritatively.
     if let Some(pm) = root {
-        let own_var_names: HashSet<String> = pm
-            .vars
-            .iter()
-            .flat_map(|v| v.names.iter().cloned())
-            .collect();
-        let constant_names: HashSet<String> = d
-            .ops
-            .iter()
-            .filter(|op| op.domain.is_empty())
-            .map(|op| {
-                op.name
-                    .iter()
-                    .map(|token| interner.resolve(token.sym))
-                    .collect()
-            })
-            .collect();
-        for vd in &mut d.vars {
-            vd.names
-                .retain(|name| !own_var_names.contains(name) && !constant_names.contains(name));
-        }
-        d.vars.retain(|vd| !vd.names.is_empty());
-        d.vars.extend(pm.vars.iter().cloned());
+        d.vars = root_var_table(std::mem::take(&mut d.vars), &d.ops, pm, interner);
     }
     debug_assert_eq!(
         homes.len(),
         d.statements.len(),
         "statement_homes parallel to statements"
     );
+    // The variable table is now final: keep renamed and parameter-copy statements on their source scope.
+    inline_rebound_vars(&mut d, &scopes, interner);
     let pm = PreModule {
         name: name.to_string(),
         source_line: root.and_then(|module| module.source_line),
@@ -309,7 +690,7 @@ pub fn flatten_pre(
     interner: &mut Interner,
 ) -> Result<PreModule, String> {
     const SENTINEL: &str = "%META-DOWN%";
-    let mut acc = Acc::default();
+    let mut acc = Acc::tracking_scopes();
     let mut visited = HashSet::new();
     visited.insert(SENTINEL.to_string());
     let params: Vec<(String, String)> = pm
@@ -343,9 +724,13 @@ pub fn flatten_pre(
     acc.statements.rotate_right(pm.statements.len());
     acc.statement_homes.rotate_right(pm.statements.len());
     acc.object_statements.rotate_right(pm.statements.len());
+    acc.scopes.statements.rotate_right(pm.statements.len());
     acc.strat_decls.rotate_right(pm.strat_decls.len());
     acc.strat_defs.rotate_right(pm.strat_defs.len());
-    let d = acc.into_decls();
+    acc.scopes.strat_defs.rotate_right(pm.strat_defs.len());
+    let scopes = std::mem::take(&mut acc.scopes);
+    let mut d = acc.into_decls();
+    inline_rebound_vars(&mut d, &scopes, interner);
     Ok(PreModule {
         name: SENTINEL.to_string(),
         source_line: pm.source_line,
@@ -529,9 +914,10 @@ fn add_parameter_copy(
     acc: &mut Acc,
     interner: &mut Interner,
 ) -> Result<(), String> {
-    let mut tmp = Acc::default();
+    let mut tmp = acc.bundle();
     let mut tmp_visited = HashSet::new();
     collect_named(theory, db, views, &mut tmp, &mut tmp_visited, interner)?;
+    let scopes = tmp.donation_scopes(Some(theory), db, views, interner);
     let decls = tmp.into_decls();
     // The theory's genuine sorts (theory-declared, excluding module-origin) — the ones renamed to `X$s`.
     let param_sorts = theory_param_sorts(theory, db, views, interner)?;
@@ -557,10 +943,11 @@ fn add_parameter_copy(
             });
         }
     }
-    let renamed = apply_renaming(decls, &items, interner)?;
+    let (renamed, scopes) = rename_bundle(decls, scopes, &items, interner)?;
     // Parameter-copy statements are rewritten for the flattened grammar and therefore have no distinct
-    // statement home; only plain named imports retain homes.
-    acc.add(renamed, None);
+    // statement home; only plain named imports retain homes. Their source variable scopes travel along so
+    // the importer's variables cannot re-bind them.
+    acc.add_scoped(renamed, None, scopes);
     Ok(())
 }
 
@@ -744,7 +1131,7 @@ fn collect_expr(
             if !visited.insert(canonical_key(expr)) {
                 return Ok(());
             }
-            let mut tmp = Acc::default();
+            let mut tmp = acc.bundle();
             let mut tmp_visited = HashSet::new();
             collect_expr(
                 inner,
@@ -755,7 +1142,12 @@ fn collect_expr(
                 interner,
                 scope,
             )?;
-            let renamed = if items
+            let root = match &**inner {
+                ModuleExpr::Named(name) => Some(name.as_str()),
+                _ => None,
+            };
+            let scopes = tmp.donation_scopes(root, db, views, interner);
+            let (renamed, scopes) = if items
                 .iter()
                 .any(|item| renames_free_parameter_sort(item, scope))
             {
@@ -765,13 +1157,14 @@ fn collect_expr(
                     .filter(|item| !renames_free_parameter_sort(item, scope))
                     .cloned()
                     .collect();
-                apply_renaming(tmp.into_decls(), &effective, interner)?
+                rename_bundle(tmp.into_decls(), scopes, &effective, interner)?
             } else {
-                apply_renaming(tmp.into_decls(), items, interner)?
+                rename_bundle(tmp.into_decls(), scopes, items, interner)?
             };
             // Renamed donation: bubbles are rewritten in-place and parse against the flattened grammar,
-            // unlike plain named imports.
-            acc.add(renamed, None);
+            // unlike plain named imports. Their source variable scopes travel along so the importer's
+            // variables cannot re-bind them.
+            acc.add_scoped(renamed, None, scopes);
             Ok(())
         }
         ModuleExpr::Instantiation(base, args) => {
@@ -783,7 +1176,7 @@ fn collect_expr(
             // apply `R` to module-level sorts and operators. Parameter-theory sort mappings are no-ops
             // after substitution.
             if let ModuleExpr::Rename(inner, items) = &**base {
-                let mut tmp = Acc::default();
+                let mut tmp = acc.bundle();
                 let mut tmp_visited = HashSet::new();
                 let inst = ModuleExpr::Instantiation(inner.clone(), args.clone());
                 collect_expr(
@@ -798,8 +1191,9 @@ fn collect_expr(
                 // Rename items use the inner module's parameter names while instance sorts use argument
                 // names. Substitute parameters positionally before matching structured names.
                 let items = subst_rename_item_params(inner, args, db, items);
-                let renamed = apply_renaming(tmp.into_decls(), &items, interner)?;
-                acc.add(renamed, None);
+                let scopes = tmp.donation_scopes(None, db, views, interner);
+                let (renamed, scopes) = rename_bundle(tmp.into_decls(), scopes, &items, interner)?;
+                acc.add_scoped(renamed, None, scopes);
                 return Ok(());
             }
             let (mname, arg_lists) = unchain(expr)
@@ -2405,7 +2799,7 @@ fmod TOP is protecting L . protecting R . endfm
             definition.params[0]
                 .iter()
                 .any(|token| token.text(&interner) == "X"),
-            "bare declared variables are re-bound by the renamed result grammar"
+            "a declared variable that the result grammar binds at its renamed sort stays bare"
         );
         let StratExpr::Seq(test, application) = &definition.body else {
             panic!("expected nested test/application sequence");
@@ -2601,5 +2995,247 @@ fmod TOP is protecting L . protecting R . endfm
         // An unflattened module records no provenance; its own orientation decides.
         let source = db.get("OBJ").expect("OBJ");
         assert!(source.object_statements.is_empty() && source.completes_object_patterns(0));
+    }
+
+    fn texts(bubble: &[Token], interner: &Interner) -> Vec<String> {
+        bubble
+            .iter()
+            .map(|token| token.text(interner).to_string())
+            .collect()
+    }
+
+    fn eq_sides(statement: &Statement, interner: &Interner) -> (Vec<String>, Vec<String>) {
+        let Statement::Eq { lhs, rhs, .. } = statement else {
+            panic!("expected an equation");
+        };
+        (texts(lhs, interner), texts(rhs, interner))
+    }
+
+    /// Statements of a renamed import keep their home variables. A name the importer's flattened grammar
+    /// binds differently (`A`, redeclared by the importer) is inlined at its renamed home sort; a name it
+    /// binds identically (`B`, the renamed alias itself) stays bare. A variable the home only sees through
+    /// its own import (`Y`) is part of the home's scope too.
+    #[test]
+    fn renamed_import_inlines_only_rebound_home_variables() {
+        let (db, views, mut i) = db_of(
+            "fmod BASE is sort Tv . var Y : Tv . endfm\n\
+             fmod HOME is\n\
+               protecting BASE .\n\
+               sort Nv . ops tt ff : -> Tv . op n : -> Nv .\n\
+               op _&_ : Tv Tv -> Tv . op ok : Tv -> Tv . op id : Tv -> Tv .\n\
+               vars A B : Tv .\n\
+               eq tt & A = A .\n\
+               eq ok(B) = tt .\n\
+               eq id(Y) = Y .\n\
+             endfm\n\
+             fmod USER is\n\
+               protecting HOME * (sort Tv to Truth) .\n\
+               sort Other . var A : Nv . var Y : Other .\n\
+             endfm\n",
+        );
+        let flat = flatten("USER", &db, &views, &mut i).expect("flatten");
+        let sides: Vec<_> = flat.statements.iter().map(|st| eq_sides(st, &i)).collect();
+        assert_eq!(sides.len(), 3, "{sides:?}");
+        let (and_lhs, and_rhs) = &sides[0];
+        assert!(and_lhs.contains(&"A:Truth".to_string()), "{and_lhs:?}");
+        assert_eq!(and_rhs, &["A:Truth"]);
+        let (ok_lhs, _) = &sides[1];
+        assert!(ok_lhs.contains(&"B".to_string()), "{ok_lhs:?}");
+        let (id_lhs, id_rhs) = &sides[2];
+        assert!(id_lhs.contains(&"Y:Truth".to_string()), "{id_lhs:?}");
+        assert_eq!(id_rhs, &["Y:Truth"]);
+    }
+
+    /// A parameter copy carries its theory closure's statements. The parameterized module's own `A` does
+    /// not re-bind the copied import's `A`, and the copy's strategy definition keeps one spelling for its
+    /// parameter and body.
+    #[test]
+    fn parameter_copy_inlines_rebound_home_variables() {
+        let (db, views, mut i) = db_of(
+            "smod TV is\n\
+               sort Tv .\n\
+               ops tt ff : -> Tv .\n\
+               op _&_ : Tv Tv -> Tv .\n\
+               var A : Tv .\n\
+               eq tt & A = A .\n\
+               strat keep : Tv @ Tv .\n\
+               sd keep(A) := match A .\n\
+             endsm\n\
+             sth TH is\n\
+               protecting TV .\n\
+               sort Elt .\n\
+             endsth\n\
+             smod PM{X :: TH} is\n\
+               sort Foo .\n\
+               var A : Foo .\n\
+             endsm\n",
+        );
+        let flat = flatten("PM", &db, &views, &mut i).expect("flatten");
+        let sides: Vec<_> = flat.statements.iter().map(|st| eq_sides(st, &i)).collect();
+        assert_eq!(sides.len(), 1, "{sides:?}");
+        assert!(sides[0].0.contains(&"A:Tv".to_string()), "{sides:?}");
+        assert_eq!(sides[0].1, ["A:Tv"]);
+        let keep = flat
+            .strat_defs
+            .iter()
+            .find(|definition| definition.name == "keep")
+            .expect("copied definition");
+        assert_eq!(texts(&keep.params[0], &i), ["A:Tv"]);
+        let StratExpr::Test { pattern, .. } = &keep.body else {
+            panic!("expected a test body");
+        };
+        assert_eq!(texts(pattern, &i), ["A:Tv"]);
+    }
+
+    /// A transient (reflected) module flattens the same way: an earlier sibling import's `Q : U` wins the
+    /// name-deduplicated table, so the renamed import's `Q` is inlined at its home sort.
+    #[test]
+    fn transient_module_inlines_rebound_home_variables() {
+        let (db, views, mut i) = db_of(
+            "fmod TVM is sort Tv . ops tt ff : -> Tv . op n : -> Tv . op _&_ : Tv Tv -> Tv . \
+             var Q : Tv . eq tt & Q = Q . endfm\n\
+             fmod SIBM is sort U . var Q : U . endfm\n",
+        );
+        let toks = tokenize(
+            "fmod TRANSIENT is including SIBM . including TVM * (op n to m) . endfm",
+            &mut i,
+        );
+        let transient = Parser::new(&toks, &i)
+            .parse_source()
+            .expect("parse transient")
+            .modules
+            .remove(0);
+        let flat = flatten_pre(&transient, &db, &views, &mut i).expect("flatten transient");
+        let sides: Vec<_> = flat.statements.iter().map(|st| eq_sides(st, &i)).collect();
+        assert_eq!(sides.len(), 1, "{sides:?}");
+        assert!(sides[0].0.contains(&"Q:Tv".to_string()), "{sides:?}");
+        assert_eq!(sides[0].1, ["Q:Tv"]);
+    }
+
+    /// A chain of 24 nested renamed imports, each level with its own variable `Yk : Sk`, under an importer
+    /// that re-declares every nested level's variable. Each nested statement keeps its level's variable
+    /// through all the enclosing bundles; the top level's statement keeps its home and its bare variable.
+    /// Each bundle's root scope comes from the bundle itself, so the chain flattens in polynomial time;
+    /// re-flattening each level's home inside every enclosing bundle doubled the work per level.
+    #[test]
+    fn nested_renaming_chain_keeps_each_level_variable() {
+        const DEPTH: usize = 24;
+        let mut src = String::from(
+            "fmod M0 is sort S0 . ops a0 b0 : -> S0 . op f0 : S0 -> S0 . var Y0 : S0 . \
+             eq f0(Y0) = a0 . endfm\n",
+        );
+        for k in 1..=DEPTH {
+            let p = k - 1;
+            src.push_str(&format!(
+                "fmod M{k} is protecting M{p} * (op b{p} to c{p}) . sort S{k} . ops a{k} b{k} : -> S{k} . \
+                 op f{k} : S{k} -> S{k} . var Y{k} : S{k} . eq f{k}(Y{k}) = a{k} . endfm\n"
+            ));
+        }
+        let nested: Vec<String> = (0..DEPTH).map(|k| format!("Y{k}")).collect();
+        src.push_str(&format!(
+            "fmod TOP is protecting M{DEPTH} . sort T . vars {} : T . endfm\n",
+            nested.join(" ")
+        ));
+        let (db, views, mut i) = db_of(&src);
+        let flat = flatten("TOP", &db, &views, &mut i).expect("flatten");
+        let sides: Vec<_> = flat.statements.iter().map(|st| eq_sides(st, &i)).collect();
+        assert_eq!(sides.len(), DEPTH + 1, "{sides:?}");
+        // Imports donate deepest first: levels 0..DEPTH-1 from the renamed bundles, then M{DEPTH}'s own.
+        for (level, (lhs, _)) in sides.iter().enumerate() {
+            let variable = if level < DEPTH {
+                format!("Y{level}:S{level}")
+            } else {
+                format!("Y{level}")
+            };
+            assert!(lhs.contains(&variable), "level {level}: {lhs:?}");
+        }
+    }
+
+    /// An alternating chain: each `Mk` renames `Wk-1`, which plainly imports `Mk-1`, with a statement and
+    /// its own variable at every module. A renamed bundle's statements then also come from a home other
+    /// than the bundle root (`Mk-1`). That home's scope is collected without scopes of its own, so the
+    /// chain flattens in polynomial time, and every nested statement keeps its home variable under an
+    /// importer re-declaring them all.
+    #[test]
+    fn alternating_renaming_chain_keeps_each_home_variable() {
+        const DEPTH: usize = 16;
+        let mut src = String::from(
+            "fmod M0 is sort S0 . ops a0 b0 : -> S0 . op f0 : S0 -> S0 . var X0 : S0 . \
+             eq f0(X0) = a0 . endfm\n",
+        );
+        for k in 1..=DEPTH {
+            let p = k - 1;
+            src.push_str(&format!(
+                "fmod W{p} is protecting M{p} . op g{p} : S{p} -> S{p} . var Z{p} : S{p} . \
+                 eq g{p}(Z{p}) = a{p} . endfm\n\
+                 fmod M{k} is protecting W{p} * (op b{p} to c{p}) . sort S{k} . ops a{k} b{k} : -> S{k} . \
+                 op f{k} : S{k} -> S{k} . var X{k} : S{k} . eq f{k}(X{k}) = a{k} . endfm\n"
+            ));
+        }
+        let nested: Vec<String> = (0..DEPTH)
+            .flat_map(|k| [format!("X{k}"), format!("Z{k}")])
+            .collect();
+        src.push_str(&format!(
+            "fmod TOP is protecting M{DEPTH} . sort T . vars {} : T . endfm\n",
+            nested.join(" ")
+        ));
+        let (db, views, mut i) = db_of(&src);
+        let flat = flatten("TOP", &db, &views, &mut i).expect("flatten");
+        let sides: Vec<_> = flat.statements.iter().map(|st| eq_sides(st, &i)).collect();
+        assert_eq!(sides.len(), 2 * DEPTH + 1, "{sides:?}");
+        for (lhs, _) in &sides {
+            let (op, level) = lhs[0].split_at(1);
+            let level: usize = level.parse().expect("level");
+            let variable = match op {
+                "f" if level == DEPTH => format!("X{level}"),
+                "f" => format!("X{level}:S{level}"),
+                _ => format!("Z{level}:S{level}"),
+            };
+            assert!(lhs.contains(&variable), "{lhs:?}");
+        }
+    }
+
+    /// A renaming that turns a constant into the spelling of a home variable (`op n to m` with `var m`):
+    /// the variable is inlined before renaming, so the renamed constant stays a constant, also once an
+    /// enclosing renaming renames its sort (and sort-qualifies it, `( m ) .Truth`).
+    #[test]
+    fn renamed_constant_spelled_like_home_variable_stays_a_constant() {
+        let (db, views, mut i) = db_of(
+            "fmod H is sort Tv . ops n p : -> Tv . op f : Tv -> Tv . var m : Tv . eq f(m) = n . endfm\n\
+             fmod R1 is protecting H * (op n to m) . endfm\n\
+             fmod R2 is protecting R1 * (sort Tv to Truth) . endfm\n",
+        );
+        for (module, sort, constant) in [
+            ("R1", "Tv", &["m"][..]),
+            ("R2", "Truth", &["(", "m", ")", ".Truth"][..]),
+        ] {
+            let flat = flatten(module, &db, &views, &mut i).expect("flatten");
+            let sides: Vec<_> = flat.statements.iter().map(|st| eq_sides(st, &i)).collect();
+            assert_eq!(sides.len(), 1, "{module}: {sides:?}");
+            let (lhs, rhs) = &sides[0];
+            assert!(lhs.contains(&format!("m:{sort}")), "{module}: {lhs:?}");
+            assert_eq!(rhs, constant, "{module}");
+        }
+    }
+
+    /// An instantiated renamed module `(M * R){V}` donates its plain imports' statements without a home.
+    /// The importer's own `A` does not re-bind the imported equation's `A`.
+    #[test]
+    fn instantiated_renamed_module_keeps_home_variables() {
+        let (db, views, mut i) = db_of(
+            "fmod TVB is sort Tv . ops tt ff : -> Tv . op _&_ : Tv Tv -> Tv . var A : Tv . \
+             eq tt & A = A . endfm\n\
+             fth T1 is sort Elt . endfth\n\
+             fmod BOX{X :: T1} is protecting TVB . sort Box{X} . op box : X$Elt -> Box{X} . endfm\n\
+             fmod ELT is sort E . op e : -> E . endfm\n\
+             view VE from T1 to ELT is sort Elt to E . endv\n\
+             fmod USE is protecting (BOX * (sort Box{X} to Crate{X})){VE} . sort Other . \
+             var A : Other . endfm\n",
+        );
+        let flat = flatten("USE", &db, &views, &mut i).expect("flatten");
+        let sides: Vec<_> = flat.statements.iter().map(|st| eq_sides(st, &i)).collect();
+        assert_eq!(sides.len(), 1, "{sides:?}");
+        assert!(sides[0].0.contains(&"A:Tv".to_string()), "{sides:?}");
+        assert_eq!(sides[0].1, ["A:Tv"]);
     }
 }

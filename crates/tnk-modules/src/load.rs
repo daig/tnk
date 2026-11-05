@@ -1084,6 +1084,50 @@ mod tests {
         assert!(importer.built.eq_traces.is_empty() && importer.built.mb_traces.is_empty());
     }
 
+    /// A plain-imported equation is reparsed in its home grammar, where its right side `none` is a
+    /// constant overloaded across two kinds. The right side is parsed in the left side's home kind, so the
+    /// statement keeps its home variable `X : B` when the importer declares `X` at an unrelated sort, at a
+    /// subsort of `B`, or after merging the two kinds.
+    #[test]
+    fn imported_overloaded_constant_rhs_keeps_home_variables() {
+        assert_program_results(
+            "fmod OVL-HOME is\n\
+               sorts A B .\n\
+               op none : -> A .\n\
+               op none : -> B .\n\
+               op b : -> B .\n\
+               op get : B -> A .\n\
+               var X : B .\n\
+               eq get(X) = none .\n\
+             endfm\n\
+             fmod OVL-UNRELATED is\n\
+               protecting OVL-HOME .\n\
+               sort C .\n\
+               var X : C .\n\
+             endfm\n\
+             red get(b) .\n\
+             fmod OVL-SUBSORT is\n\
+               protecting OVL-HOME .\n\
+               sort C .\n\
+               subsort C < B .\n\
+               var X : C .\n\
+             endfm\n\
+             red get(b) .\n\
+             fmod OVL-MERGED is\n\
+               protecting OVL-HOME .\n\
+               subsort A < B .\n\
+               sort C .\n\
+               var X : C .\n\
+             endfm\n\
+             red get(b) .\n",
+            &[
+                e("A", "(none).A", 1),
+                e("A", "(none).A", 1),
+                e("A", "(none).A", 1),
+            ],
+        );
+    }
+
     /// A view sort map targeting a nonexistent sort fails to load with a precise source/target diagnostic.
     #[test]
     fn bad_view_rejected_by_load() {
