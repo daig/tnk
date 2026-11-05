@@ -1229,6 +1229,47 @@ fn prelude_meta_through_repl() {
     );
 }
 
+/// META-MODULE renames `QID-SET * (op empty to none, op _,_ to _;_)`. Every copied `SET{Qid}` equation
+/// survives in the META tower (the argument commas of `insert(E, S)` and the like stay separators), so
+/// the QidSet operations reduce there.
+#[test]
+fn prelude_meta_qidset_operations_reduce() {
+    let mut r = repl();
+    let prelude = r.eval(conformance_file!("prelude-meta.maude")).output;
+    for module in ["META-VIEW", "META-MODULE", "META-LEVEL"] {
+        assert!(
+            !prelude.contains(&format!("warning: module `{module}`")),
+            "{module} keeps its renamed QID-SET statements:\n{prelude}"
+        );
+    }
+    let out = r
+        .eval(
+            "red in META-LEVEL : insert('a, 'b ; 'c) .\n\
+             red in META-LEVEL : delete('a, 'a ; 'b) .\n\
+             red in META-LEVEL : | 'a ; 'b ; 'c | .\n\
+             red in META-LEVEL : union('a ; 'b, 'c) .\n\
+             red in META-LEVEL : intersection('a ; 'b, 'b ; 'c) .\n\
+             red in META-LEVEL : ('a ; 'b) \\ 'b .",
+        )
+        .output;
+    let results: Vec<&str> = out
+        .lines()
+        .filter(|line| line.starts_with("result "))
+        .collect();
+    assert_eq!(
+        results,
+        [
+            "result NeSortSet: 'a ; 'b ; 'c",
+            "result Sort: 'b",
+            "result NzNat: 3",
+            "result NeSortSet: 'a ; 'b ; 'c",
+            "result Sort: 'b",
+            "result Sort: 'a",
+        ],
+        "{out}"
+    );
+}
+
 /// Exercise LEXICAL tokenization, punctuation/backquote canonicalization, and byte-level token printing.
 #[test]
 fn lexical_token_hooks_through_repl() {
@@ -1572,6 +1613,82 @@ fn view_opmap_through_repl() {
     assert!(
         out.contains("result F: box(f0)"),
         "op->op over op->term: {out}"
+    );
+}
+
+/// Operator renamings and view operator maps reach rule rewrite-condition fragments and strategy
+/// `such that` conditions: a renamed mixfix operator in `crl … if X & b => Y` keeps the rule, and the
+/// `match`/`matchrew` tests still succeed after a renaming and in an instance through a fixity-changing
+/// view map (previously silently `No solution.`).
+#[test]
+fn renamed_and_view_mapped_rule_and_strategy_conditions() {
+    let out = repl()
+        .eval(
+            "smod RS-SRC is\n\
+               sort S .\n\
+               ops a b c : -> S [ctor] .\n\
+               op _&_ : S S -> S .\n\
+               op step : S -> S .\n\
+               vars X Y : S .\n\
+               eq a & a = b .\n\
+               rl [r] : a => c .\n\
+               rl [sum] : a & b => c .\n\
+               crl [st] : step(X) => Y if X & b => Y .\n\
+               strat viaMatch @ S .\n\
+               strat viaMatchrew @ S .\n\
+               sd viaMatch := (match X such that X & X = b) ; r .\n\
+               sd viaMatchrew := matchrew X such that X & X = b by X using r .\n\
+             endsm\n\
+             smod RS-REN is\n\
+               protecting RS-SRC * (op _&_ to _#_) .\n\
+             endsm\n\
+             rew [1] in RS-REN : step(a) .\n\
+             srew in RS-REN : a using viaMatch .\n\
+             srew in RS-REN : a using viaMatchrew .\n\
+             fth PTH is\n\
+               sorts Elt Tv .\n\
+               op tt : -> Tv .\n\
+               op lt : Elt Elt -> Tv .\n\
+             endfth\n\
+             mod PNUM is\n\
+               sorts Num Tv .\n\
+               ops n1 n2 n3 : -> Num [ctor] .\n\
+               op tt : -> Tv [ctor] .\n\
+               op _<<_ : Num Num -> Tv .\n\
+               eq n1 << n2 = tt .\n\
+               rl [up] : n1 => n3 .\n\
+             endm\n\
+             view PV from PTH to PNUM is\n\
+               sort Elt to Num .\n\
+               sort Tv to Tv .\n\
+               op lt to _<<_ .\n\
+             endv\n\
+             smod PSTRAT{X :: PTH} is\n\
+               vars E F : X$Elt .\n\
+               strat below : X$Elt @ X$Elt .\n\
+               strat belowRew : X$Elt @ X$Elt .\n\
+               sd below(F) := (match E such that lt(E, F) = tt) ; all .\n\
+               sd belowRew(F) := matchrew E such that lt(E, F) = tt by E using all .\n\
+             endsm\n\
+             smod PSTRAT-NUM is\n\
+               protecting PSTRAT{PV} .\n\
+             endsm\n\
+             srew in PSTRAT-NUM : n1 using below(n2) .\n\
+             srew in PSTRAT-NUM : n1 using belowRew(n2) .\n",
+        )
+        .output;
+    assert!(
+        !out.contains("warning:") && !out.contains("error:"),
+        "every statement survives: {out}"
+    );
+    assert!(
+        out.contains("rewrite [1] in RS-REN : step(a) .\nrewrites: 1\nresult S: a # b"),
+        "renamed rewrite condition: {out}"
+    );
+    assert_eq!(
+        strategy_solutions(&out),
+        vec!["c", "c", "n3", "n3"],
+        "strategy conditions: {out}"
     );
 }
 

@@ -15,7 +15,8 @@ use crate::cfparser::{ParseEffort, earley, forest};
 use crate::grammar::build::build_grammar;
 use crate::grammar::{Action, GSym, Nt};
 use crate::lex::{Frag, Interner, TokKind, Token, split_mixfix};
-use crate::sig::build_sig::{build_module, canonical_name};
+use crate::load::{ConditionPiece, condition_pieces};
+use crate::sig::build_sig::{build_module, canonical_name, resolve_sort};
 use crate::sig::syntax::BuiltModule;
 use crate::surface::ast::PreModule;
 use std::collections::{HashMap, HashSet};
@@ -221,17 +222,39 @@ pub fn rewrite_op_hook_signature(
     maps: &[ViewOpMap],
     interner: &mut Interner,
 ) -> Vec<Token> {
+    rewrite_op_hook_signature_by(
+        signature,
+        maps,
+        |(expected_domain, expected_range), domain, range| {
+            expected_domain == domain && expected_range == range
+        },
+        interner,
+    )
+}
+
+/// [`rewrite_op_hook_signature`], with `selects(profile, domain, range)` deciding whether a
+/// signature-qualified map's profile selects the referenced declaration `name : domain -> range`. A
+/// selecting signature-qualified map takes precedence over a plain map of the same name, as in
+/// [`ViewOpSubst`]'s statement rewrite.
+pub fn rewrite_op_hook_signature_by(
+    signature: &[Token],
+    maps: &[ViewOpMap],
+    selects: impl Fn(&(Vec<String>, String), &[String], &str) -> bool,
+    interner: &mut Interner,
+) -> Vec<Token> {
     let Some((name, domain, range, colon)) = hook_signature_parts(signature, interner) else {
         return signature.to_vec();
     };
-    let Some(map) = maps.iter().find(|map| {
+    let qualified = maps.iter().find(|map| {
         map.source == name
             && map
                 .dom_range
                 .as_ref()
-                .is_none_or(|(expected_domain, expected_range)| {
-                    expected_domain == &domain && expected_range == &range
-                })
+                .is_some_and(|profile| selects(profile, &domain, &range))
+    });
+    let Some(map) = qualified.or_else(|| {
+        maps.iter()
+            .find(|map| map.source == name && map.dom_range.is_none())
     }) else {
         return signature.to_vec();
     };
@@ -325,7 +348,9 @@ pub struct ViewOpSubst {
     /// Plain maps apply to every overload of their canonical source name.
     name_targets: HashMap<String, ReconTarget>,
     /// A token-local fallback for mixfix occurrences inside compound bubbles the standalone term parser
-    /// cannot accept (notably juxtaposed object configurations and `if` branches).
+    /// cannot accept (notably juxtaposed object configurations and `if` branches). Only sources with a
+    /// literal fragment are registered: an all-hole source such as `__` would match every adjacent token
+    /// pair.
     fallbacks: Vec<LexicalFallback>,
 }
 
@@ -399,8 +424,11 @@ impl ViewOpSubst {
                 let has_hole = fragments
                     .iter()
                     .any(|fragment| matches!(fragment, Frag::Hole));
+                let has_literal = fragments
+                    .iter()
+                    .any(|fragment| matches!(fragment, Frag::Tok(_)));
                 let changes = !matches!(&map.target, ReconTarget::Op(name) if name == &map.source);
-                (has_hole && changes).then(|| LexicalFallback {
+                (has_hole && has_literal && changes).then(|| LexicalFallback {
                     source: fragments,
                     target: map.target.clone(),
                 })
@@ -421,18 +449,94 @@ impl ViewOpSubst {
             .or_else(|| self.name_targets.get(name))
     }
 
+    /// Whether a signature-qualified map's `profile` selects the same-named source declaration
+    /// `domain -> range`: whether that declaration belongs to the overload family (§1.2) the profile names,
+    /// with the same arity and each domain sort and the range in the profile's kinds. This is the family
+    /// whose applications the statement rewrite reconstructs through its source symbol.
+    pub fn selects_family(
+        &self,
+        (profile_domain, profile_range): &(Vec<String>, String),
+        domain: &[String],
+        range: &str,
+    ) -> bool {
+        profile_domain.len() == domain.len()
+            && profile_domain
+                .iter()
+                .zip(domain)
+                .all(|(selector, sort)| self.same_kind(selector, sort))
+            && self.same_kind(profile_range, range)
+    }
+
+    /// Whether two sort names, or kind names such as `[S]`, lie in one kind of the source module. A name the
+    /// source module does not declare matches only its own spelling.
+    fn same_kind(&self, left: &str, right: &str) -> bool {
+        let kind = |name: &str| {
+            resolve_sort(&self.built.engine, &self.built.sorts, name)
+                .ok()
+                .map(|sort| self.built.engine.sorts().kind_of(sort))
+        };
+        left == right || matches!((kind(left), kind(right)), (Some(l), Some(r)) if l == r)
+    }
+
     /// Rewrite one term bubble. Grammar reconstruction handles arbitrary argument terms. If the bubble is
     /// not a standalone term (for example a juxtaposed object configuration), a conservative lexical path
-    /// still rewrites non-disambiguated mixfix occurrences whose arguments are single tokens.
+    /// still rewrites non-disambiguated, literal-anchored mixfix occurrences whose arguments are single
+    /// tokens. See [`Self::rewrite_checked`].
     pub fn rewrite(&self, bubble: &[Token], interner: &mut Interner) -> Vec<Token> {
+        self.rewrite_checked(bubble, interner).0
+    }
+
+    /// [`Self::rewrite`], also reporting whether every mapped occurrence was reconstructed from the source
+    /// parse. Callers with token-level fallbacks of their own must not apply them to such a result: a
+    /// remaining source spelling there is not an occurrence (a variable, an argument separator, or another
+    /// map's reconstructed target).
+    ///
+    /// The lexical path runs only on a bubble that does not parse as a term. A parsed bubble needs no
+    /// lexical pass, because reconstruction has already rewritten every mapped occurrence, and a lexical
+    /// pass cannot tell an operator fragment from an argument separator spelled the same way: under
+    /// `op _,_ to _;_` it would turn the comma of `insert(E, S)` into an application. An ambiguous bubble
+    /// is reconstructed only when its two extracted readings give the same tokens; otherwise it is
+    /// returned unchanged.
+    pub fn rewrite_checked(&self, bubble: &[Token], interner: &mut Interner) -> (Vec<Token>, bool) {
         if bubble.is_empty() {
-            return bubble.to_vec();
+            return (Vec::new(), false);
         }
-        let rewritten = match parse_term(bubble, &self.grammar, interner) {
-            Ok(tree) => self.emit(&tree, bubble, interner),
-            Err(_) => bubble.to_vec(),
+        let parsed = match parse_forest(bubble, &self.grammar, interner) {
+            Ok(parsed) => parsed,
+            Err(_) => return (self.rewrite_lexical(bubble, interner), false),
         };
-        self.rewrite_lexical(&rewritten, interner)
+        let rewritten = self.emit(&parsed.tree, bubble, interner);
+        if !parsed.ambiguous {
+            return (rewritten, true);
+        }
+        let reading_independent = parsed.alternative.is_some_and(|alternative| {
+            let other = self.emit(&alternative, bubble, interner);
+            other
+                .iter()
+                .map(|t| t.sym)
+                .eq(rewritten.iter().map(|t| t.sym))
+        });
+        if reading_independent {
+            (rewritten, true)
+        } else {
+            (bubble.to_vec(), false)
+        }
+    }
+
+    /// Rewrite a condition bubble term by term. A whole condition is not a term, so [`Self::rewrite`] would
+    /// reconstruct none of its operator applications. The bubble is split exactly as the condition parser
+    /// splits it ([`condition_pieces`]); each term is rewritten as a term bubble, and the connectives and a
+    /// sort test's sort are kept as written.
+    pub fn rewrite_condition(&self, bubble: &[Token], interner: &mut Interner) -> Vec<Token> {
+        let mut out = Vec::with_capacity(bubble.len());
+        for piece in condition_pieces(bubble, interner) {
+            match piece {
+                ConditionPiece::Term(term) => out.extend(self.rewrite(term, interner)),
+                ConditionPiece::Sort(sort) => out.extend_from_slice(sort),
+                ConditionPiece::Separator(token) => out.push(token),
+            }
+        }
+        out
     }
 
     fn rewrite_lexical(&self, bubble: &[Token], interner: &mut Interner) -> Vec<Token> {
@@ -671,13 +775,22 @@ pub fn literal_frags(name: &str, interner: &mut Interner) -> Vec<String> {
         .collect()
 }
 
-/// Parse a term token bubble to its first parse tree (the statement/pattern path, sans build).
-fn parse_term(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Result<PTree, String> {
+/// Parse a term token bubble at the universal start symbol (the statement/pattern path, sans build),
+/// keeping the second reading of an ambiguous bubble.
+fn parse_forest(
+    tokens: &[Token],
+    g: &CompiledGrammar,
+    i: &Interner,
+) -> Result<forest::Parse, String> {
     let mut effort = ParseEffort::default();
     let chart = earley::parse(g, tokens, Nt::Term, i, &mut effort)
         .map_err(|e| format!("parse effort limit exceeded at token {}", e.at))?;
-    let parsed = forest::extract(g, &chart, tokens.len(), Nt::Term, &mut effort)
-        .map_err(|e| e.to_string())?;
+    forest::extract(g, &chart, tokens.len(), Nt::Term, &mut effort).map_err(|e| e.to_string())
+}
+
+/// Parse a term token bubble to its unique parse tree.
+fn parse_term(tokens: &[Token], g: &CompiledGrammar, i: &Interner) -> Result<PTree, String> {
+    let parsed = parse_forest(tokens, g, i)?;
     if parsed.ambiguous {
         return Err("ambiguous".into());
     }
@@ -735,5 +848,177 @@ mod tests {
         let rewritten = mapper.rewrite(&bubble, &mut i);
         let text: String = rewritten.iter().map(|t| i.resolve(t.sym)).collect();
         assert_eq!(text, "h^1000000(a)");
+    }
+
+    fn source_module(source: &str, i: &mut Interner) -> PreModule {
+        let source = tokenize(source, i);
+        Parser::new(&source, i)
+            .parse_source()
+            .expect("parse source")
+            .modules
+            .remove(0)
+    }
+
+    fn op_map(source: &str, target: &str) -> ViewOpMap {
+        ViewOpMap {
+            source: source.into(),
+            dom_range: None,
+            target: ReconTarget::Op(target.into()),
+        }
+    }
+
+    /// Rewrite `bubble` and render the result with spaces between tokens, plus the reconstruction flag.
+    fn substituted(mapper: &ViewOpSubst, bubble: &str, i: &mut Interner) -> (String, bool) {
+        let bubble = tokenize(bubble, i);
+        let (rewritten, reconstructed) = mapper.rewrite_checked(&bubble, i);
+        let text = rewritten
+            .iter()
+            .map(|t| i.resolve(t.sym))
+            .collect::<Vec<_>>()
+            .join(" ");
+        (text, reconstructed)
+    }
+
+    /// `op _,_ to _;_` rewrites only parsed `_,_` applications. A prefix application's argument separator
+    /// is the same token, so no lexical pass may run over a parsed bubble.
+    #[test]
+    fn view_substitution_keeps_prefix_argument_separators() {
+        let mut i = Interner::new();
+        let pm = source_module(
+            "fmod COMMA-SRC is sorts E S . subsort E < S . op e : -> E [ctor] . \
+             op _,_ : S S -> S [ctor assoc comm] . op ins : E S -> S . \
+             var X : E . var Y : S . endfm",
+            &mut i,
+        );
+        let mapper = ViewOpSubst::new(&pm, &[op_map("_,_", "_;_")], &mut i)
+            .expect("build")
+            .expect("mapper");
+        assert_eq!(
+            substituted(&mapper, "ins(X, Y)", &mut i),
+            ("ins ( X , Y )".into(), true)
+        );
+        assert_eq!(
+            substituted(&mapper, "X, Y", &mut i),
+            ("( ( X ) ; ( Y ) )".into(), true)
+        );
+        assert_eq!(
+            substituted(&mapper, "ins(X, (X, Y))", &mut i),
+            ("ins ( X , ( ( ( X ) ; ( Y ) ) ) )".into(), true)
+        );
+    }
+
+    /// A bubble that is ambiguous at the universal start symbol (here `f` and `p` have one overload per
+    /// kind) is still a term, so the lexical pass must not run on it. Its reconstruction is kept when both
+    /// readings agree and the bubble is left unchanged when they do not.
+    #[test]
+    fn ambiguous_bubble_keeps_only_reading_independent_reconstruction() {
+        let mut i = Interner::new();
+        let pm = source_module(
+            "fmod AMBIGUOUS-SRC is sorts A B C . op b : -> B . \
+             op _+_ : B B -> B . op _,_ : B B -> B [assoc] . \
+             op f : B -> A . op f : B -> C . op p : B B -> A . op p : B B -> C . \
+             vars X Y : B . endfm",
+            &mut i,
+        );
+        let mapper = ViewOpSubst::new(&pm, &[op_map("_+_", "_*_"), op_map("_,_", "_;_")], &mut i)
+            .expect("build")
+            .expect("mapper");
+        assert_eq!(
+            substituted(&mapper, "p(X, Y)", &mut i),
+            ("p ( X , Y )".into(), true)
+        );
+        assert_eq!(
+            substituted(&mapper, "f(X + Y)", &mut i),
+            ("f ( ( ( X ) * ( Y ) ) )".into(), true)
+        );
+
+        let selective = ViewOpSubst::new(
+            &pm,
+            &[ViewOpMap {
+                source: "f".into(),
+                dom_range: Some((vec!["B".into()], "A".into())),
+                target: ReconTarget::Op("g".into()),
+            }],
+            &mut i,
+        )
+        .expect("build")
+        .expect("mapper");
+        assert_eq!(
+            substituted(&selective, "f(X)", &mut i),
+            ("f ( X )".into(), false),
+            "the readings disagree on whether the mapped overload occurs"
+        );
+    }
+
+    /// A condition is not a term, so it is rewritten term by term, split as the condition parser splits
+    /// it: every side of `=`, `:=`, and `=>`, a sort test's subject, and a bare Boolean fragment are
+    /// reconstructed, while the connectives and a sort test's sort are kept.
+    #[test]
+    fn view_substitution_rewrites_condition_terms() {
+        let mut i = Interner::new();
+        let pm = source_module(
+            "mod COND-SRC is sorts S B . ops a b : -> S [ctor] . op tt : -> B . \
+             op lt : S S -> B . op _+_ : S S -> S . var X : S . endm",
+            &mut i,
+        );
+        let mapper = ViewOpSubst::new(&pm, &[op_map("lt", "_<<_"), op_map("_+_", "plus")], &mut i)
+            .expect("build")
+            .expect("mapper");
+        let bubble = tokenize(
+            "lt(X, a) = tt /\\ X := a + b /\\ a + X : S /\\ lt(a, b) /\\ X + a => b",
+            &mut i,
+        );
+        let rewritten = mapper.rewrite_condition(&bubble, &mut i);
+        let text = rewritten
+            .iter()
+            .map(|t| i.resolve(t.sym))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            text,
+            "( ( X ) << ( a ) ) = tt /\\ X := plus ( a , b ) /\\ plus ( a , X ) : S /\\ \
+             ( ( a ) << ( b ) ) /\\ plus ( X , a ) => b"
+        );
+        let unchanged = tokenize("a = b /\\ X : S", &mut i);
+        assert!(
+            mapper
+                .rewrite_condition(&unchanged, &mut i)
+                .iter()
+                .map(|t| t.sym)
+                .eq(unchanged.iter().map(|t| t.sym)),
+            "a condition without mapped operators keeps its tokens"
+        );
+    }
+
+    /// An all-hole source such as `__` has no literal anchor, so it registers no lexical fallback. Parsed
+    /// juxtapositions are still reconstructed, while a bubble that is not a term is left unchanged rather
+    /// than having every adjacent token pair rewritten. A literal-anchored map keeps its fallback.
+    #[test]
+    fn juxtaposition_map_has_no_lexical_fallback() {
+        let mut i = Interner::new();
+        let pm = source_module(
+            "fmod JUXT-SRC is sort S . ops a b c : -> S [ctor] . \
+             op __ : S S -> S [ctor assoc] . op _+_ : S S -> S . op g : S S -> S . endfm",
+            &mut i,
+        );
+        let juxtaposition = ViewOpSubst::new(&pm, &[op_map("__", "_;_")], &mut i)
+            .expect("build")
+            .expect("mapper");
+        assert_eq!(
+            substituted(&juxtaposition, "a b", &mut i),
+            ("( ( a ) ; ( b ) )".into(), true)
+        );
+        assert_eq!(
+            substituted(&juxtaposition, "g(a, b) = c", &mut i),
+            ("g ( a , b ) = c".into(), false)
+        );
+
+        let plus = ViewOpSubst::new(&pm, &[op_map("_+_", "_*_")], &mut i)
+            .expect("build")
+            .expect("mapper");
+        assert_eq!(
+            substituted(&plus, "a + b = c", &mut i),
+            ("( ( a ) * ( b ) ) = c".into(), false)
+        );
     }
 }

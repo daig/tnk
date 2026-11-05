@@ -175,7 +175,11 @@ pub(crate) fn strip_outer_parens<'a>(toks: &'a [Token], i: &Interner) -> &'a [To
 /// Resolve a sort name, including the kind form `[S]`, which denotes the error sort of S's connected
 /// component. Plain names use direct lookup. Kind resolution requires closed sorts, so callers use this
 /// for operator profiles and variables after subsorts have been resolved.
-fn resolve_sort(engine: &Engine, sorts: &HashMap<String, SortId>, name: &str) -> R<SortId> {
+pub(crate) fn resolve_sort(
+    engine: &Engine,
+    sorts: &HashMap<String, SortId>,
+    name: &str,
+) -> R<SortId> {
     if let Some(inner) = name.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
         // A bracket can contain one sort (`[S]`) or several (`[A, B]`) naming the same connected
         // component. Resolve the first complete sort name; depth-aware splitting keeps a structured sort

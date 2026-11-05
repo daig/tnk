@@ -1797,6 +1797,47 @@ fn connective_candidates<'a>(
     candidates
 }
 
+/// One piece of a condition bubble, as [`condition_pieces`] splits it.
+#[derive(Debug, Clone, Copy)]
+pub enum ConditionPiece<'a> {
+    /// A term: a side of `=`, `:=`, or `=>`, the subject of a sort test, or a bare Boolean fragment.
+    Term(&'a [Token]),
+    /// The sort of a sort test `t : s`.
+    Sort(&'a [Token]),
+    /// A top-level `/\` or a fragment's connective.
+    Separator(Token),
+}
+
+/// Split a condition bubble on each top-level `/\`, then at each fragment's first top-level connective, the
+/// split [`parse_condition`] tries first. Concatenating the pieces in order gives back `bubble`, so a caller
+/// that rewrites the terms one by one reassembles a condition that splits the same way. When the first
+/// split does not build and the parser takes a later connective instead (connective text inside an
+/// operator name, such as object syntax `< O : C | ... >`), these pieces straddle that term.
+pub fn condition_pieces<'a>(bubble: &'a [Token], i: &Interner) -> Vec<ConditionPiece<'a>> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    for (index, fragment) in split_on_text(bubble, "/\\", i).into_iter().enumerate() {
+        if index > 0 {
+            pieces.push(ConditionPiece::Separator(bubble[start - 1]));
+        }
+        start += fragment.len() + 1;
+        match connective_candidates(fragment, i).into_iter().next() {
+            Some((left, connective, right)) => {
+                pieces.push(ConditionPiece::Term(left));
+                pieces.push(ConditionPiece::Separator(fragment[left.len()]));
+                pieces.push(match connective {
+                    Connective::Sort => ConditionPiece::Sort(right),
+                    Connective::Match | Connective::Eq | Connective::Rewrite => {
+                        ConditionPiece::Term(right)
+                    }
+                });
+            }
+            None => pieces.push(ConditionPiece::Term(fragment)),
+        }
+    }
+    pieces
+}
+
 /// Whether a statement is `[nonexec]` (a proof obligation not applied during execution).
 fn stmt_is_nonexec(s: &Statement) -> bool {
     match s {

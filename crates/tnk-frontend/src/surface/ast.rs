@@ -137,10 +137,10 @@ pub enum ModuleExpr {
 }
 
 /// One mapping inside a renaming `* (…)`. Operator renaming uses canonical mixfix names (`_,_ to _;_`).
-/// Optional `[ … ]` attributes override the target declaration, for example `[prec 43]`. An
-/// arity-disambiguated rename `op f : A B -> C to g` stores the selecting domain and range in
-/// [`dom_range`](RenameItem::Op::dom_range), so only that overload is renamed. A `label l to m` item
-/// renames a statement label.
+/// Optional `[ … ]` attributes override the target declaration, for example `[prec 43]`. A
+/// signature-qualified rename `op f : A B -> C to g` stores the selecting domain and range in
+/// [`dom_range`](RenameItem::Op::dom_range), so only the overload family that profile names is renamed.
+/// A `label l to m` item renames a statement label.
 // Renames are short-lived parser ASTs; retaining attributes inline avoids one allocation per op mapping.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -152,8 +152,9 @@ pub enum RenameItem {
     Op {
         from: String,
         to: String,
-        /// `Some((domain, range))` for a disambiguated rename `op f : A B -> C to g` — selects the single
-        /// overload of `from` whose signature matches; `None` renames every overload of the name.
+        /// `Some((domain, range))` for a disambiguated rename `op f : A B -> C to g` — selects the overload
+        /// family of `from` that this declared profile belongs to (the same arity, every sort in the same
+        /// kind); `None` renames every overload of the name.
         dom_range: Option<(Vec<String>, String)>,
         attrs: Attrs,
     },

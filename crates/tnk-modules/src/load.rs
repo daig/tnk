@@ -409,6 +409,368 @@ mod tests {
         );
     }
 
+    /// `op _,_ to _;_` renames only `_,_` applications. The argument commas of the imported `ins(E, S)`
+    /// and `pair(E, E')` stay separators, so both equations keep their arity; the importer's unary `pair`
+    /// must not acquire the binary equation.
+    #[test]
+    fn comma_rename_keeps_prefix_argument_separators() {
+        assert_program_results(
+            "fmod COMMA-ELTS is\n\
+               sorts Elt Set .\n\
+               subsort Elt < Set .\n\
+               ops a b c : -> Elt [ctor] .\n\
+               op empty : -> Set [ctor] .\n\
+               op _,_ : Set Set -> Set [ctor assoc comm id: empty] .\n\
+               op ins : Elt Set -> Set .\n\
+               op pair : Elt Elt -> Set .\n\
+               vars E E' : Elt .\n\
+               var S : Set .\n\
+               eq ins(E, S) = E, S .\n\
+               eq pair(E, E') = E, E' .\n\
+             endfm\n\
+             fmod COMMA-RENAMED is\n\
+               protecting COMMA-ELTS * (op _,_ to _;_) .\n\
+               op pair : Set -> Set .\n\
+             endfm\n\
+             red ins(a, b ; c) .\n\
+             red pair(a, b) .\n\
+             red pair(a ; b) .\n",
+            &[
+                e("Set", "a ; b ; c", 1),
+                e("Set", "a ; b", 1),
+                e("Set", "pair(a ; b)", 0),
+            ],
+        );
+    }
+
+    /// Each operator map applies once, to the source term: swaps and chains of prefix and mixfix
+    /// renames, and a profile-qualified rename that leaves another kind's same-arity overload alone.
+    #[test]
+    fn renaming_applies_each_operator_map_once() {
+        assert_program_results(
+            "fmod SWAP-SRC is\n\
+               sorts S T .\n\
+               ops a b : -> S [ctor] .\n\
+               ops c d : -> T [ctor] .\n\
+               ops f g : S -> S .\n\
+               op f : T -> T .\n\
+               ops _+_ _*_ : S S -> S .\n\
+               eq f(a) = g(b) .\n\
+               eq a + b = a * b .\n\
+               eq f(c) = d .\n\
+             endfm\n\
+             fmod SWAP-OPS is\n\
+               protecting SWAP-SRC * (op f to g, op g to f, op _+_ to _*_, op _*_ to _+_) .\n\
+             endfm\n\
+             red g(a) .\n\
+             red a * b .\n\
+             red g(c) .\n\
+             fmod CHAIN-OPS is\n\
+               protecting SWAP-SRC * (op f to g, op g to h) .\n\
+             endfm\n\
+             red g(a) .\n\
+             fmod PROFILE-SWAP is\n\
+               protecting SWAP-SRC * (op f : S -> S to g, op g : S -> S to f) .\n\
+             endfm\n\
+             red g(a) .\n\
+             red f(c) .\n",
+            &[
+                e("S", "f(b)", 1),
+                e("S", "a + b", 1),
+                e("T", "d", 1),
+                e("S", "h(b)", 1),
+                e("S", "f(b)", 1),
+                e("T", "d", 1),
+            ],
+        );
+    }
+
+    /// A juxtaposition source `__` has no literal fragment to anchor a token-level match. Renaming it, or
+    /// mapping it in a view, rewrites only real juxtapositions and keeps every other statement intact,
+    /// including the instance's conditional `sel` equation. The view path rewrites the condition `P = Q`
+    /// term by term; when it took the whole condition to the token-level fallback, an all-hole `__`
+    /// fallback made it `( ( P ) ; ( = ) ) Q` and dropped the `ceq`. The fallback itself is pinned on a
+    /// non-term bubble by `juxtaposition_map_has_no_lexical_fallback` in `tnk-frontend`.
+    #[test]
+    fn juxtaposition_rename_and_view_map_preserve_statements() {
+        assert_program_results(
+            "fmod JX is\n\
+               sort S .\n\
+               ops a b c : -> S [ctor] .\n\
+               op __ : S S -> S [ctor assoc] .\n\
+               op f : S -> S .\n\
+               op g : S S -> S .\n\
+               eq f(a b) = c .\n\
+               eq g(a, b) = c .\n\
+             endfm\n\
+             fmod JX-RENAMED is\n\
+               including JX * (op __ to _;_) .\n\
+             endfm\n\
+             red f(a ; b) .\n\
+             red g(a, b) .\n\
+             fth JUXT is\n\
+               sort Elt .\n\
+               op __ : Elt Elt -> Elt .\n\
+             endfth\n\
+             fmod CAT is\n\
+               sort Cat .\n\
+               ops p q : -> Cat [ctor] .\n\
+               op _;_ : Cat Cat -> Cat [ctor assoc] .\n\
+             endfm\n\
+             view JuxtCat from JUXT to CAT is\n\
+               sort Elt to Cat .\n\
+               op __ to _;_ .\n\
+             endv\n\
+             fmod TWICE{X :: JUXT} is\n\
+               op twice : X$Elt -> X$Elt .\n\
+               op swap : X$Elt X$Elt -> X$Elt .\n\
+               op sel : X$Elt X$Elt -> X$Elt .\n\
+               vars P Q : X$Elt .\n\
+               eq twice(P) = P P .\n\
+               eq swap(P, Q) = Q P .\n\
+               ceq sel(P, Q) = P P if P = Q .\n\
+               eq sel(P, Q) = Q [owise] .\n\
+             endfm\n\
+             fmod TWICE-CAT is\n\
+               including TWICE{JuxtCat} .\n\
+             endfm\n\
+             red twice(p) .\n\
+             red swap(p, q) .\n\
+             red sel(p, p) .\n",
+            &[
+                e("S", "c", 1),
+                e("S", "c", 1),
+                e("Cat", "p ; p", 1),
+                e("Cat", "q ; p", 1),
+                e("Cat", "p ; p", 1),
+            ],
+        );
+    }
+
+    /// A renaming rewrites operator applications inside conditions structurally, term by term: in every
+    /// fragment form (equality, matching, sort test, bare Boolean) and in a membership condition, for a
+    /// mixfix map and a profile-qualified map. Each map applies once, so swapped mixfix operators inside a
+    /// condition do not end up naming each other.
+    #[test]
+    fn renaming_rewrites_condition_terms_structurally() {
+        assert_program_results(
+            "fmod COND-SRC is\n\
+               sorts Bool S T .\n\
+               subsort S < T .\n\
+               op true : -> Bool [ctor special (id-hook SystemTrue)] .\n\
+               ops a b c : -> S [ctor] .\n\
+               ops _+_ _*_ : S S -> S .\n\
+               op ok : S -> Bool .\n\
+               op dbl : S -> T .\n\
+               ops eqf matchf sortf boolf memf : S -> S .\n\
+               vars X Y : S .\n\
+               eq a + a = b .\n\
+               eq ok(b) = true .\n\
+               ceq eqf(X) = c if X + X = b .\n\
+               ceq matchf(X) = Y if Y := X + X .\n\
+               ceq sortf(X) = c if X + X : S .\n\
+               ceq boolf(X) = c if ok(X + X) .\n\
+               cmb dbl(X) : S if X + X = b .\n\
+               ceq memf(X) = c if dbl(X) : S .\n\
+             endfm\n\
+             fmod COND-MIXFIX is\n\
+               protecting COND-SRC * (op _+_ to _#_) .\n\
+             endfm\n\
+             red eqf(a) .\n\
+             red matchf(a) .\n\
+             red sortf(a) .\n\
+             red boolf(a) .\n\
+             red memf(a) .\n\
+             fmod COND-PROFILE is\n\
+               protecting COND-SRC * (op _+_ : S S -> S to plus) .\n\
+             endfm\n\
+             red eqf(a) .\n\
+             red memf(a) .\n\
+             fmod COND-SWAP is\n\
+               protecting COND-SRC * (op a to b, op b to a, op _+_ to _*_, op _*_ to _+_) .\n\
+             endfm\n\
+             red eqf(b) .\n\
+             red memf(b) .\n",
+            &[
+                e("S", "c", 2),
+                e("S", "b", 2),
+                e("S", "c", 2),
+                e("S", "c", 3),
+                e("S", "c", 3),
+                e("S", "c", 2),
+                e("S", "c", 3),
+                e("S", "c", 2),
+                e("S", "c", 3),
+            ],
+        );
+    }
+
+    /// A view operator map that changes fixity (`op lt to _<<_`) applies inside the instance's equation
+    /// and membership conditions, which are rewritten term by term.
+    #[test]
+    fn view_map_rewrites_condition_terms_structurally() {
+        assert_program_results(
+            "fth TORD is\n\
+               sorts Elt Tv .\n\
+               op tt : -> Tv .\n\
+               op lt : Elt Elt -> Tv .\n\
+             endfth\n\
+             fmod TNUM is\n\
+               sorts Num Tv .\n\
+               ops n1 n2 : -> Num [ctor] .\n\
+               op tt : -> Tv [ctor] .\n\
+               op _<<_ : Num Num -> Tv .\n\
+               eq n1 << n2 = tt .\n\
+             endfm\n\
+             view TV from TORD to TNUM is\n\
+               sort Elt to Num .\n\
+               sort Tv to Tv .\n\
+               op lt to _<<_ .\n\
+             endv\n\
+             fmod TPICK{X :: TORD} is\n\
+               sorts Pair{X} Sorted{X} .\n\
+               subsort Sorted{X} < Pair{X} .\n\
+               op pr : X$Elt X$Elt -> Pair{X} [ctor] .\n\
+               ops pick first : X$Elt X$Elt -> X$Elt .\n\
+               vars A B : X$Elt .\n\
+               ceq pick(A, B) = A if lt(A, B) = tt .\n\
+               eq pick(A, B) = B [owise] .\n\
+               cmb pr(A, B) : Sorted{X} if lt(A, B) = tt .\n\
+               ceq first(A, B) = A if pr(A, B) : Sorted{X} .\n\
+             endfm\n\
+             fmod TPICK-NUM is\n\
+               protecting TPICK{TV} .\n\
+             endfm\n\
+             red pick(n1, n2) .\n\
+             red pick(n2, n1) .\n\
+             red first(n1, n2) .\n",
+            &[e("Num", "n1", 2), e("Num", "n1", 1), e("Num", "n1", 3)],
+        );
+    }
+
+    /// A profile-qualified operator renaming moves the whole overload family its profile names: the
+    /// declarations, the statements over the family, and `op-hook` references written with another
+    /// member's profile (`-_ : NzNat ~> Int` under `op -_ : Int -> Int to ~_`, so the renamed built-in
+    /// arithmetic still computes). For the family it selects, a profile map takes precedence over a
+    /// plain map of the same name, whatever the item order.
+    #[test]
+    fn profile_renaming_moves_the_overload_family() {
+        assert_program_results(
+            "fmod BASH is\n\
+               sorts Foo Bar .\n\
+               subsort Foo < Bar .\n\
+               op f : Foo -> Foo .\n\
+               op f : Bar -> Bar .\n\
+               op x : -> Foo .\n\
+               op y : -> Bar .\n\
+               var B : Bar .\n\
+               eq f(B) = y .\n\
+             endfm\n\
+             fmod BASH-G is\n\
+               protecting BASH * (op f : Foo -> Foo to g) .\n\
+             endfm\n\
+             red g(x) .\n\
+             red g(y) .\n\
+             fmod TWO-KINDS is\n\
+               sorts Foo Baz .\n\
+               op f : Foo -> Foo .\n\
+               op f : Baz -> Baz .\n\
+               ops x x' : -> Foo .\n\
+               ops z z' : -> Baz .\n\
+               eq f(x) = x' .\n\
+               eq f(z) = z' .\n\
+             endfm\n\
+             fmod PLAIN-FIRST is\n\
+               protecting TWO-KINDS * (op f to h, op f : Foo -> Foo to g) .\n\
+             endfm\n\
+             red g(x) .\n\
+             red h(z) .\n\
+             fmod PROFILE-FIRST is\n\
+               protecting TWO-KINDS * (op f : Foo -> Foo to g, op f to h) .\n\
+             endfm\n\
+             red g(x) .\n\
+             red h(z) .\n\
+             fmod MINI-INT is\n\
+               sorts Zero NzNat Nat NzInt Int .\n\
+               subsorts Zero NzNat < Nat .\n\
+               subsort NzNat < NzInt .\n\
+               subsorts Nat NzInt < Int .\n\
+               op 0 : -> Zero [ctor] .\n\
+               op s_ : Nat -> NzNat [ctor iter special (id-hook SuccSymbol term-hook zeroTerm (0))] .\n\
+               op -_ : NzNat -> NzInt [ctor special (id-hook MinusSymbol\n\
+                 op-hook succSymbol (s_ : Nat ~> NzNat)\n\
+                 op-hook minusSymbol (-_ : NzNat ~> Int))] .\n\
+               op -_ : NzInt -> NzInt [ditto] .\n\
+               op -_ : Int -> Int [ditto] .\n\
+               op _+_ : Int Int -> Int [assoc comm prec 33 special (id-hook ACU_NumberOpSymbol (+)\n\
+                 op-hook succSymbol (s_ : Nat ~> NzNat)\n\
+                 op-hook minusSymbol (-_ : NzNat ~> Int))] .\n\
+             endfm\n\
+             fmod NEG-RENAMED is\n\
+               protecting MINI-INT * (op -_ : Int -> Int to ~_) .\n\
+             endfm\n\
+             red ~ 2 + 5 .\n\
+             red 2 + ~ 5 .\n\
+             red ~ (~ 3) .\n",
+            &[
+                e("Bar", "y", 1),
+                e("Bar", "y", 1),
+                e("Foo", "x'", 1),
+                e("Baz", "z'", 1),
+                e("Foo", "x'", 1),
+                e("Baz", "z'", 1),
+                e("NzNat", "3", 1),
+                e("NzInt", "~ 3", 1),
+                e("NzNat", "3", 1),
+            ],
+        );
+    }
+
+    /// The renaming's source parse starts at the universal term symbol, where a right side that the home
+    /// module parses in its left side's kind can be ambiguous (`f` has one overload per kind). Such a
+    /// bubble is still a term: it is reconstructed from its readings, never rewritten token by token.
+    #[test]
+    fn ambiguous_source_bubbles_rename_structurally() {
+        assert_program_results(
+            "fmod AMB-COMMA is\n\
+               sorts A B C .\n\
+               op b : -> B .\n\
+               op _,_ : B B -> B [assoc] .\n\
+               op f : B B -> A .\n\
+               op f : B B -> C .\n\
+               op g : B B -> A .\n\
+               vars X Y : B .\n\
+               eq g(X, Y) = f(X, Y) .\n\
+             endfm\n\
+             fmod AMB-COMMA-RENAMED is\n\
+               protecting AMB-COMMA * (op _,_ to _;_) .\n\
+             endfm\n\
+             red g(b, b) .\n\
+             fmod AMB-PLUS is\n\
+               sorts A B C .\n\
+               op b : -> B .\n\
+               op h : B -> B .\n\
+               op _+_ : B B -> B .\n\
+               op f : B -> A .\n\
+               op f : B -> C .\n\
+               ops g k : B -> A .\n\
+               var X : B .\n\
+               eq g(X) = f(X + X) .\n\
+               eq k(X) = f(h(X) + X) .\n\
+             endfm\n\
+             fmod AMB-PLUS-RENAMED is\n\
+               protecting AMB-PLUS * (op _+_ to _*_) .\n\
+             endfm\n\
+             red g(b) .\n\
+             red k(b) .\n",
+            &[
+                e("A", "(f(b, b)).A", 1),
+                e("A", "(f(b * b)).A", 1),
+                e("A", "(f(h(b) * b)).A", 1),
+            ],
+        );
+    }
+
     /// A theory builds its signature like a module, but a `[nonexec]` axiom remains a proof obligation
     /// and never fires; an ordinary theory equation remains executable.
     #[test]

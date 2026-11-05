@@ -1060,41 +1060,50 @@ fn rewrite_strategy_bubbles(
     expr: &mut StratExpr,
     rewrite: &mut impl FnMut(&[Token]) -> Vec<Token>,
 ) {
+    rewrite_strategy_bubbles_with(expr, &mut |bubble, _is_condition| rewrite(bubble));
+}
+
+/// [`rewrite_strategy_bubbles`], also telling `rewrite` whether a bubble is a `such that` condition
+/// (`true`) rather than a term (`false`).
+fn rewrite_strategy_bubbles_with(
+    expr: &mut StratExpr,
+    rewrite: &mut impl FnMut(&[Token], bool) -> Vec<Token>,
+) {
     match expr {
         StratExpr::Idle | StratExpr::Fail | StratExpr::All => {}
         StratExpr::Apply {
             subst, substrats, ..
         } => {
             for (variable, value) in subst {
-                *variable = rewrite(variable);
-                *value = rewrite(value);
+                *variable = rewrite(variable, false);
+                *value = rewrite(value, false);
             }
             for child in substrats {
-                rewrite_strategy_bubbles(child, rewrite);
+                rewrite_strategy_bubbles_with(child, rewrite);
             }
         }
         StratExpr::Top(child)
         | StratExpr::One(child)
         | StratExpr::Star(child)
         | StratExpr::Plus(child)
-        | StratExpr::Normalize(child) => rewrite_strategy_bubbles(child, rewrite),
+        | StratExpr::Normalize(child) => rewrite_strategy_bubbles_with(child, rewrite),
         StratExpr::Seq(left, right) | StratExpr::Union(left, right) => {
-            rewrite_strategy_bubbles(left, rewrite);
-            rewrite_strategy_bubbles(right, rewrite);
+            rewrite_strategy_bubbles_with(left, rewrite);
+            rewrite_strategy_bubbles_with(right, rewrite);
         }
         StratExpr::Branch {
             test,
             success,
             failure,
         } => {
-            rewrite_strategy_bubbles(test, rewrite);
-            rewrite_strategy_bubbles(success, rewrite);
-            rewrite_strategy_bubbles(failure, rewrite);
+            rewrite_strategy_bubbles_with(test, rewrite);
+            rewrite_strategy_bubbles_with(success, rewrite);
+            rewrite_strategy_bubbles_with(failure, rewrite);
         }
         StratExpr::Test { pattern, cond, .. } => {
-            *pattern = rewrite(pattern);
+            *pattern = rewrite(pattern, false);
             if let Some(cond) = cond {
-                *cond = rewrite(cond);
+                *cond = rewrite(cond, true);
             }
         }
         StratExpr::MatchRew {
@@ -1103,23 +1112,23 @@ fn rewrite_strategy_bubbles(
             subs,
             ..
         } => {
-            *pattern = rewrite(pattern);
+            *pattern = rewrite(pattern, false);
             if let Some(cond) = cond {
-                *cond = rewrite(cond);
+                *cond = rewrite(cond, true);
             }
             for (variable, child) in subs {
-                *variable = rewrite(variable);
-                rewrite_strategy_bubbles(child, rewrite);
+                *variable = rewrite(variable, false);
+                rewrite_strategy_bubbles_with(child, rewrite);
             }
         }
         StratExpr::Sugar { args, .. } => {
             for child in args {
-                rewrite_strategy_bubbles(child, rewrite);
+                rewrite_strategy_bubbles_with(child, rewrite);
             }
         }
         StratExpr::Call { args, .. } => {
             for arg in args {
-                *arg = rewrite(arg);
+                *arg = rewrite(arg, false);
             }
         }
     }
@@ -1130,8 +1139,8 @@ fn rewrite_strategy_bubbles(
 /// parameter-theory operators and the module's variables are in scope) and re-emit each mapped operator
 /// application in the target operator's syntax ([`ViewOpSubst`]). Runs on the *source* bubbles (bare
 /// variables, source ops), so the subsequent [`instantiate_decls`] pass still inlines variables/sorts and
-/// applies the textual `op_subst`. Condition fragments that do not parse as single terms remain unchanged;
-/// mixfix maps inside those fragments are not reconstructed.
+/// applies the textual `op_subst`. Statement, strategy-definition, and `such that` conditions are rewritten
+/// term by term ([`ViewOpSubst::rewrite_condition`]).
 fn apply_view_op_recon(
     d: &mut FlatDecls,
     mname: &str,
@@ -1181,13 +1190,13 @@ fn apply_view_op_recon(
                 *lhs = mapper.rewrite(lhs, interner);
                 *rhs = mapper.rewrite(rhs, interner);
                 if let Some(c) = cond {
-                    *c = mapper.rewrite(c, interner);
+                    *c = mapper.rewrite_condition(c, interner);
                 }
             }
             Statement::Mb { lhs, cond, .. } => {
                 *lhs = mapper.rewrite(lhs, interner);
                 if let Some(c) = cond {
-                    *c = mapper.rewrite(c, interner);
+                    *c = mapper.rewrite_condition(c, interner);
                 }
             }
         }
@@ -1196,11 +1205,15 @@ fn apply_view_op_recon(
         for param in &mut def.params {
             *param = mapper.rewrite(param, interner);
         }
-        rewrite_strategy_bubbles(&mut def.body, &mut |bubble| {
-            mapper.rewrite(bubble, interner)
+        rewrite_strategy_bubbles_with(&mut def.body, &mut |bubble, is_condition| {
+            if is_condition {
+                mapper.rewrite_condition(bubble, interner)
+            } else {
+                mapper.rewrite(bubble, interner)
+            }
         });
         if let Some(cond) = &mut def.cond {
-            *cond = mapper.rewrite(cond, interner);
+            *cond = mapper.rewrite_condition(cond, interner);
         }
     }
     Ok(())

@@ -2187,13 +2187,13 @@ Renaming applies structurally to declarations and applications. It is not a text
 - special-hook references;
 - required sort annotations.
 
-A profile can select one overload:
+A profile selects one overload family:
 
 ```text
 op f : A B -> C to g
 ```
 
-Without a profile, the name map applies to all matching declarations. Optional attributes on the target operator override the renamed attributes.
+The family is every declaration of `f` with that arity whose sorts lie in the kinds of `A`, `B`, and `C`, so subsort-overloaded declarations such as `f : Nat Nat -> Nat` and `f : Int Int -> Int` move together, while an overload of `f` in other kinds keeps its name. The profile must spell the sorts of one declared overload. Without a profile, the name map applies to all matching declarations. Optional attributes on the target operator override the renamed attributes.
 
 Sort, operator, label, class, attribute, and message renamings are supported. Strategy names are not ordinary operator names and do not follow ordinary operator renaming.
 
@@ -2240,7 +2240,7 @@ A failed definition preserves the prior database, prior built dependents, curren
 
 1. Split the typed expression language from Lab B into signature, environment, and evaluator modules.
 2. Build a diamond and inspect the flattened module.
-3. Rename only one overloaded profile.
+3. Rename one overload family by profile, and check that an overload of the same name in other kinds keeps its name.
 4. Create a recursive import and explain why no partial module should be installed.
 
 ## Chapter 13 — Theories, views, and parameters

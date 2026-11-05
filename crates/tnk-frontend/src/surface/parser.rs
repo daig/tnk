@@ -2221,7 +2221,7 @@ impl<'a> Parser<'a> {
     }
 
     /// A renaming `( sort A to B , op f to g , label l to m , … )`. An `op f : dom -> range to g` selects
-    /// one overload by signature (arity-disambiguated). OO renaming items (`class`/`attr`/`msg to`) desugar
+    /// one overload family by signature. OO renaming items (`class`/`attr`/`msg to`) desugar
     /// to the sort/op maps the OO desugaring produces (`class C to D` ⇒ sort *and* class-constant rename).
     fn renaming(&mut self) -> PResult<Vec<RenameItem>> {
         self.eat("(")?;
@@ -2313,8 +2313,8 @@ impl<'a> Parser<'a> {
     }
 
     /// One `op … to …` renaming item. The from-name is a full mixfix name (may contain `,`, e.g. `_,_`):
-    /// collect its tokens up to the standalone `to` keyword or the disambiguating `:`. An arity-disambiguated
-    /// `op f : dom -> range to g` records the signature so only the matching overload is renamed.
+    /// collect its tokens up to the standalone `to` keyword or the disambiguating `:`. A signature-qualified
+    /// `op f : dom -> range to g` records the signature so only the overload family it names is renamed.
     fn op_rename_item(&mut self) -> PResult<RenameItem> {
         let from_toks = self.collect_until(&["to", ":"]);
         let dom_range = if self.at(":") {
